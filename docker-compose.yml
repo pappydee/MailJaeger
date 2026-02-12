@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  # Ollama AI Service
+  ollama:
+    image: ollama/ollama:latest
+    container_name: mailjaeger-ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+    # Uncomment for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # MailJaeger Application
+  mailjaeger:
+    build: .
+    container_name: mailjaeger-app
+    ports:
+      - "8000:8000"
+    environment:
+      # IMAP Configuration
+      - IMAP_HOST=${IMAP_HOST}
+      - IMAP_PORT=${IMAP_PORT:-993}
+      - IMAP_USERNAME=${IMAP_USERNAME}
+      - IMAP_PASSWORD=${IMAP_PASSWORD}
+      
+      # AI Configuration
+      - AI_ENDPOINT=http://ollama:11434
+      - AI_MODEL=${AI_MODEL:-mistral:7b-instruct-q4_0}
+      
+      # Database
+      - DATABASE_URL=sqlite:///./data/mailjaeger.db
+      
+      # Processing
+      - SPAM_THRESHOLD=${SPAM_THRESHOLD:-0.7}
+      - MAX_EMAILS_PER_RUN=${MAX_EMAILS_PER_RUN:-200}
+      
+      # Scheduling
+      - SCHEDULE_TIME=${SCHEDULE_TIME:-08:00}
+      - SCHEDULE_TIMEZONE=${SCHEDULE_TIMEZONE:-Europe/Berlin}
+      
+      # Learning
+      - LEARNING_ENABLED=${LEARNING_ENABLED:-true}
+      - LEARNING_CONFIDENCE_THRESHOLD=${LEARNING_CONFIDENCE_THRESHOLD:-0.8}
+      
+      # Storage
+      - STORE_EMAIL_BODY=${STORE_EMAIL_BODY:-true}
+      - STORE_ATTACHMENTS=${STORE_ATTACHMENTS:-false}
+      
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    
+    volumes:
+      - mailjaeger_data:/app/data
+      - mailjaeger_logs:/app/logs
+      - mailjaeger_search:/app/search_index
+      - mailjaeger_attachments:/app/attachments
+    
+    depends_on:
+      - ollama
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  ollama_data:
+    driver: local
+  mailjaeger_data:
+    driver: local
+  mailjaeger_logs:
+    driver: local
+  mailjaeger_search:
+    driver: local
+  mailjaeger_attachments:
+    driver: local
