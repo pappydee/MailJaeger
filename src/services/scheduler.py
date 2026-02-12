@@ -108,7 +108,7 @@ class SchedulerService:
         try:
             hour, minute = self.settings.schedule_time.split(':')
             return int(hour), int(minute)
-        except:
+        except (ValueError, AttributeError) as e:
             logger.warning(f"Invalid schedule time: {self.settings.schedule_time}, using default 08:00")
             return 8, 0
     

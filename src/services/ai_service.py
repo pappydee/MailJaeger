@@ -88,7 +88,8 @@ class AIService:
             # Clean up whitespace
             lines = (line.strip() for line in text.splitlines())
             return '\n'.join(line for line in lines if line)
-        except:
+        except Exception as e:
+            logger.warning(f"Failed to extract text from HTML: {e}")
             return html
     
     def _create_analysis_prompt(self, content: str) -> str:

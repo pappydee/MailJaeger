@@ -11,7 +11,7 @@ def test_extract_sender_pattern():
     
     # Email addresses
     assert learning_service._extract_sender_pattern("user@example.com") == "@example.com"
-    assert learning_service._extract_sender_pattern("name <user@example.com>") == "@example.com>"
+    assert learning_service._extract_sender_pattern("name <user@example.com>") == "@example.com"
     
     # No email
     assert learning_service._extract_sender_pattern("No Email") == "no email"

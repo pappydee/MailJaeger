@@ -122,7 +122,8 @@ class IMAPService:
             if date_str:
                 try:
                     email_date = parsedate_to_datetime(date_str)
-                except:
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Failed to parse date '{date_str}': {e}")
                     email_date = datetime.utcnow()
             else:
                 email_date = datetime.utcnow()
@@ -137,13 +138,13 @@ class IMAPService:
                     if content_type == "text/plain":
                         try:
                             body_plain += part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        except:
-                            pass
+                        except (UnicodeDecodeError, AttributeError) as e:
+                            logger.warning(f"Failed to decode plain text part: {e}")
                     elif content_type == "text/html":
                         try:
                             body_html += part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        except:
-                            pass
+                        except (UnicodeDecodeError, AttributeError) as e:
+                            logger.warning(f"Failed to decode HTML part: {e}")
             else:
                 content_type = msg.get_content_type()
                 try:
@@ -152,8 +153,8 @@ class IMAPService:
                         body_plain = payload
                     elif content_type == "text/html":
                         body_html = payload
-                except:
-                    pass
+                except (UnicodeDecodeError, AttributeError) as e:
+                    logger.warning(f"Failed to decode email body: {e}")
             
             # Calculate integrity hash
             integrity_hash = hashlib.sha256(raw_email).hexdigest()

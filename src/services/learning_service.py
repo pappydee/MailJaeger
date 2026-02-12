@@ -3,7 +3,7 @@ Learning service for adaptive folder suggestions
 """
 import logging
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
@@ -127,7 +127,8 @@ class LearningService:
         if '@' in sender:
             parts = sender.split('@')
             if len(parts) > 1:
-                return f"@{parts[-1].split('>')[0].strip()}"
+                domain = parts[-1].split('>')[0].strip()
+                return f"@{domain}"
         
         return sender.lower()
     
@@ -204,6 +205,3 @@ class LearningService:
         except Exception as e:
             logger.error(f"Failed to get pattern statistics: {e}")
             return {}
-
-
-from datetime import timedelta
