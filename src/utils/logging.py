@@ -17,11 +17,16 @@ class SensitiveDataFilter(logging.Filter):
     # Patterns to redact
     SENSITIVE_PATTERNS = [
         (re.compile(r'(password["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(username["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(user["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
         (re.compile(r'(api[_-]?key["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
         (re.compile(r'(bearer\s+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
-        (re.compile(r'(authorization["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(authorization["\s:=\s]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
         (re.compile(r'(token["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
         (re.compile(r'(secret["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        # Authorization headers in various formats
+        (re.compile(r'Authorization:\s*Bearer\s+[^\s,}\]]+', re.IGNORECASE), r'Authorization: Bearer [REDACTED]'),
+        (re.compile(r'Authorization:\s*[^\s,}\]]+', re.IGNORECASE), r'Authorization: [REDACTED]'),
         # Email body patterns (to avoid logging full email content)
         # Using [\s\S] to match any character including newlines
         (re.compile(r'(body_plain["\s:=]+)[\s\S]{200,}', re.IGNORECASE), r'\1[EMAIL_BODY_REDACTED]'),

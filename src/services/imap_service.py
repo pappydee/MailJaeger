@@ -37,7 +37,7 @@ class IMAPService:
                 self.settings.imap_username,
                 self.settings.imap_password
             )
-            logger.info(f"Connected to IMAP server: {self.settings.imap_host} (user: {self.settings.imap_username})")
+            logger.info(f"Connected to IMAP server: {self.settings.imap_host}")
             return True
         except Exception as e:
             logger.error(f"Failed to connect to IMAP server {self.settings.imap_host}: {e}")

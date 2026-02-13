@@ -383,14 +383,14 @@ async function markAsResolved(emailId) {
     try {
         const response = await fetch(`${API_BASE}/api/emails/${emailId}/resolve`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: getAuthHeaders(),
             body: JSON.stringify({
                 email_id: emailId,
                 resolved: true
             })
         });
+        
+        if (handleAuthError(response)) return;
         
         if (response.ok) {
             closeModal();
