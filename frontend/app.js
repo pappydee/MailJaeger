@@ -9,9 +9,21 @@ let currentFilters = {
     priority: '',
     action_required: ''
 };
+let apiKey = '';
 
 // Initialize dashboard
 document.addEventListener('DOMContentLoaded', async () => {
+    // Check for API key in localStorage or prompt
+    apiKey = localStorage.getItem('mailjaeger_api_key') || '';
+    
+    // Check if authentication is required
+    const authRequired = await checkAuthRequired();
+    
+    if (authRequired && !apiKey) {
+        promptForApiKey();
+        return;
+    }
+    
     await loadDashboard();
     await loadEmails();
     setupEventListeners();
@@ -19,6 +31,59 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Refresh dashboard every 30 seconds
     setInterval(loadDashboard, 30000);
 });
+
+// Check if authentication is required
+async function checkAuthRequired() {
+    try {
+        const response = await fetch(`${API_BASE}/api/health`);
+        if (response.status === 401) {
+            return true;
+        }
+        // Try dashboard to be sure
+        const dashResponse = await fetch(`${API_BASE}/api/dashboard`);
+        return dashResponse.status === 401;
+    } catch (error) {
+        console.error('Error checking auth:', error);
+        return false;
+    }
+}
+
+// Prompt user for API key
+function promptForApiKey() {
+    const key = prompt('API-Schlüssel erforderlich:\n\nBitte geben Sie Ihren API-Schlüssel ein (Bearer Token):');
+    if (key) {
+        apiKey = key.trim();
+        localStorage.setItem('mailjaeger_api_key', apiKey);
+        location.reload();
+    } else {
+        showError('Authentifizierung erforderlich. Bitte Seite neu laden und API-Schlüssel eingeben.');
+    }
+}
+
+// Get headers with authentication
+function getAuthHeaders() {
+    const headers = {
+        'Content-Type': 'application/json'
+    };
+    
+    if (apiKey) {
+        headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+    
+    return headers;
+}
+
+// Handle authentication errors
+function handleAuthError(response) {
+    if (response.status === 401) {
+        localStorage.removeItem('mailjaeger_api_key');
+        apiKey = '';
+        showError('Authentifizierung fehlgeschlagen. Bitte Seite neu laden.');
+        setTimeout(() => location.reload(), 2000);
+        return true;
+    }
+    return false;
+}
 
 // Setup event listeners
 function setupEventListeners() {
@@ -37,7 +102,16 @@ function setupEventListeners() {
 // Load dashboard data
 async function loadDashboard() {
     try {
-        const response = await fetch(`${API_BASE}/api/dashboard`);
+        const response = await fetch(`${API_BASE}/api/dashboard`, {
+            headers: getAuthHeaders()
+        });
+        
+        if (handleAuthError(response)) return;
+        
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
         const data = await response.json();
         
         updateDashboardStats(data);
@@ -120,9 +194,7 @@ async function loadEmails() {
     try {
         const response = await fetch(`${API_BASE}/api/emails/list`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: getAuthHeaders(),
             body: JSON.stringify({
                 page: 1,
                 page_size: 50,
@@ -131,6 +203,12 @@ async function loadEmails() {
                 ...currentFilters
             })
         });
+        
+        if (handleAuthError(response)) return;
+        
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
         
         allEmails = await response.json();
         renderEmailList(allEmails);
@@ -190,7 +268,16 @@ async function showEmailDetail(emailId) {
     modalBody.innerHTML = '<div class="loading">Lade Details...</div>';
     
     try {
-        const response = await fetch(`${API_BASE}/api/emails/${emailId}`);
+        const response = await fetch(`${API_BASE}/api/emails/${emailId}`, {
+            headers: getAuthHeaders()
+        });
+        
+        if (handleAuthError(response)) return;
+        
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
         const email = await response.json();
         
         document.getElementById('modalSubject').textContent = email.subject || 'Kein Betreff';
@@ -320,13 +407,17 @@ async function triggerProcessing() {
     try {
         const response = await fetch(`${API_BASE}/api/processing/trigger`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: getAuthHeaders(),
             body: JSON.stringify({
                 trigger_type: 'MANUAL'
             })
         });
+        
+        if (handleAuthError(response)) {
+            button.disabled = false;
+            button.textContent = 'Jetzt verarbeiten';
+            return;
+        }
         
         const result = await response.json();
         

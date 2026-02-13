@@ -1,18 +1,33 @@
 # MailJaeger
 
-**MailJaeger** is a fully local, privacy-first AI email processing system that autonomously analyzes, structures, prioritizes, archives, and organizes incoming emails. It operates continuously with minimal manual oversight and functions as a structured decision-support layer above a standard IMAP mailbox.
+**MailJaeger** is a fully local, privacy-first, **secure-by-default** AI email processing system that autonomously analyzes, structures, prioritizes, archives, and organizes incoming emails. It operates continuously with minimal manual oversight and functions as a structured decision-support layer above a standard IMAP mailbox.
 
 ## Key Features
 
 - **🔒 100% Local & Private**: All processing occurs locally, no cloud AI services or telemetry
+- **🛡️ Secure by Default**: Token-based authentication, localhost-only binding, safe mode enabled
 - **🤖 AI-Powered Analysis**: Automatic email categorization, priority assessment, and task extraction
-- **🎯 Smart Filtering**: Intelligent spam detection and action-required identification
+- **🎯 Smart Filtering**: Intelligent spam detection and action-required identification  
 - **📊 Structured Organization**: Automatic archiving with learned folder suggestions
 - **🧠 Continuous Learning**: Adapts to your behavior and improves over time
 - **🔍 Powerful Search**: Full-text and semantic search with filtering
 - **📅 Automated Processing**: Scheduled daily runs with manual trigger option
 - **🌐 Web Dashboard**: Modern web interface for email management and monitoring
 - **🛠️ RESTful API**: Complete API for custom integrations
+
+## 🔐 Security Features
+
+MailJaeger is designed with security as a core principle:
+
+- ✅ **API Authentication**: Token-based authentication protects all endpoints
+- ✅ **Localhost Binding**: Server binds to 127.0.0.1 by default (not publicly accessible)
+- ✅ **Restrictive CORS**: No wildcard origins, configurable allowed origins
+- ✅ **Safe Mode**: Dry-run mode prevents destructive IMAP actions by default
+- ✅ **Credential Protection**: Passwords and tokens never logged or exposed in responses
+- ✅ **Input Validation**: Strict validation of AI responses and user inputs
+- ✅ **Data Minimization**: Email bodies NOT stored by default (privacy-first)
+- ✅ **Quarantine Folder**: Suspected spam goes to quarantine, not deleted
+- ✅ **Error Sanitization**: Internal errors never exposed to API responses
 
 ## System Requirements
 
@@ -25,7 +40,7 @@
 - Use **Mistral 7B Q4** (4GB RAM) or **Phi-3-mini** (2-3GB RAM) for optimal performance
 - Install on SSD for better performance than SD card
 
-## Installation
+## Quick Start
 
 ### 1. Install System Dependencies
 
@@ -40,93 +55,90 @@ sudo apt install -y python3.11 python3.11-venv python3-pip git
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-### 2. Clone Repository
+### 2. Clone and Setup
 
 ```bash
+# Clone repository
 git clone https://github.com/pappydee/MailJaeger.git
 cd MailJaeger
-```
 
-### 3. Setup Python Environment
-
-```bash
 # Create virtual environment
 python3.11 -m venv venv
 source venv/bin/activate
 
-# Install Python dependencies
+# Install dependencies
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 4. Install and Configure Local LLM
-
-Choose one of the following models based on your preference:
+### 3. Configure Local LLM
 
 ```bash
-# Option 1: Mistral 7B Q4 (recommended for best quality, ~4GB RAM)
-ollama pull mistral:7b-instruct-q4_0
-
-# Option 2: Phi-3-mini (most efficient, ~2-3GB RAM)
-ollama pull phi3:mini
-
-# Option 3: Llama 3.2 3B (good alternative, ~2-3GB RAM)
-ollama pull llama3.2:3b
+# Pull AI model (choose one)
+ollama pull mistral:7b-instruct-q4_0  # Recommended for Raspberry Pi 5
 
 # Start Ollama service
 ollama serve
 ```
 
-### 5. Configure Environment
+### 4. Configure Environment
 
 ```bash
 # Copy example configuration
 cp .env.example .env
 
-# Edit configuration with your settings
+# Edit configuration
 nano .env
 ```
 
-**Required Configuration:**
+**Essential Configuration:**
+
 ```env
+# SECURITY: Generate an API key for authentication
+# Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'
+API_KEY=your_secure_api_key_here
+
 # IMAP Settings (example for Gmail)
 IMAP_HOST=imap.gmail.com
 IMAP_PORT=993
 IMAP_USERNAME=your_email@gmail.com
-IMAP_PASSWORD=your_app_password  # Use app-specific password for Gmail
+IMAP_PASSWORD=your_app_password
 
-# AI Model (choose one you pulled)
+# AI Model
 AI_MODEL=mistral:7b-instruct-q4_0
 
-# Adjust other settings as needed
+# SAFE MODE: Start with true, set to false after testing
+SAFE_MODE=true
 ```
 
-**For Gmail:** You need to create an [App Password](https://support.google.com/accounts/answer/185833)
+**For Gmail:** Create an [App Password](https://support.google.com/accounts/answer/185833)
 
-### 6. Initialize Database
-
-```bash
-# The database will be created automatically on first run
-python -m src.main
-```
-
-## Usage
-
-### Start the Application
+### 5. Start the Application
 
 ```bash
 # Activate virtual environment
 source venv/bin/activate
 
-# Start the application
+# Start MailJaeger
+python -m uvicorn src.main:app --host 127.0.0.1 --port 8000
+
+# Or use the simpler command:
 python -m src.main
 ```
 
-The application will be available at `http://localhost:8000`
+The application will be available at **http://localhost:8000**
+
+### 6. First Login
+
+When you open the dashboard, you'll be prompted for your API key:
+- Enter the `API_KEY` value from your `.env` file
+- The key is stored securely in your browser's localStorage
+
+## Usage
 
 ### Web Dashboard
 
-Access the web dashboard at: **http://localhost:8000**
+Access the dashboard at **http://localhost:8000**
 
 The dashboard provides:
 - 📊 Real-time statistics (total emails, action required, spam filtered)
@@ -135,22 +147,106 @@ The dashboard provides:
 - ⚡ Manual processing trigger
 - 💚 System health monitoring
 
+### API Access
+
+For API access, include your API key in requests:
+
+```bash
+# Example: Trigger processing
+curl -X POST http://localhost:8000/api/processing/trigger \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
 ### API Documentation
 
-Interactive API documentation available at:
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
+Interactive API documentation:
+- **Swagger UI**: http://localhost:8000/api/docs
+- **ReDoc**: http://localhost:8000/api/redoc
 
-### Key Endpoints
+## 🔒 Security Configuration
 
-- `GET /` - Web Dashboard (NEW!)
-- `GET /api/dashboard` - Overview dashboard with statistics
-- `POST /api/emails/list` - List emails with filters
-- `GET /api/emails/{id}` - Get email details
-- `POST /api/emails/search` - Search emails
-- `POST /api/processing/trigger` - Manually trigger processing
-- `GET /api/processing/runs` - Get processing history
-- `GET /api/health` - System health check
+### Default Security Settings
+
+MailJaeger ships with secure defaults optimized for local deployment:
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `API_KEY` | Empty | **CRITICAL**: Set this for authentication |
+| `SERVER_HOST` | `127.0.0.1` | Localhost-only (not publicly accessible) |
+| `CORS_ORIGINS` | `localhost:8000,127.0.0.1:8000` | Restrictive CORS policy |
+| `SAFE_MODE` | `true` | No destructive IMAP actions (dry-run) |
+| `STORE_EMAIL_BODY` | `false` | Data minimization (privacy) |
+| `MARK_AS_READ` | `false` | Keeps emails unread |
+| `DELETE_SPAM` | `false` | Moves to quarantine instead of deletion |
+
+### Production Checklist
+
+Before using MailJaeger in production:
+
+- [ ] **Generate API Key**: `python -c 'import secrets; print(secrets.token_urlsafe(32))'`
+- [ ] **Set API_KEY in .env**: Never leave empty
+- [ ] **Test with SAFE_MODE=true**: Verify processing works
+- [ ] **Disable SAFE_MODE**: Set to `false` after testing
+- [ ] **Review Quarantine Folder**: Check `QUARANTINE_FOLDER` location
+- [ ] **Privacy Settings**: Decide on `STORE_EMAIL_BODY` setting
+- [ ] **Backup Strategy**: Plan for database backups
+
+### External Access (Optional)
+
+⚠️ **WARNING**: Only expose MailJaeger externally if you understand the security implications.
+
+To expose externally:
+
+1. **REQUIRED**: Set a strong `API_KEY` (32+ characters)
+2. Set `SERVER_HOST=0.0.0.0` in `.env`
+3. Update `CORS_ORIGINS` to include your domain
+4. Use reverse proxy (nginx/Caddy) with HTTPS
+5. Configure firewall rules
+6. Consider VPN or Tailscale for secure access
+
+**Example for Docker external access:**
+```yaml
+# docker-compose.yml
+ports:
+  - "8000:8000"  # Instead of "127.0.0.1:8000:8000"
+environment:
+  - API_KEY=your_very_secure_random_generated_key_here
+  - SERVER_HOST=0.0.0.0
+  - CORS_ORIGINS=https://mail.yourdomain.com
+```
+
+### Authentication
+
+All API endpoints (except `/api/health`) require authentication:
+
+```bash
+# Include Bearer token in requests
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+  http://localhost:8000/api/dashboard
+```
+
+The web dashboard will prompt for the API key on first access and store it securely in your browser's localStorage.
+
+### Security Features
+
+**Built-in Protection:**
+- ✅ Token-based authentication on all endpoints
+- ✅ Localhost binding by default (127.0.0.1)
+- ✅ Restrictive CORS (no wildcard origins)
+- ✅ Credential filtering in all logs
+- ✅ Error message sanitization
+- ✅ Strict input validation
+- ✅ Safe mode for IMAP actions
+- ✅ Complete audit trail
+
+**Privacy Protection:**
+- ✅ No cloud services (100% local)
+- ✅ No telemetry or external tracking
+- ✅ Data minimization (bodies not stored by default)
+- ✅ Local AI processing only
+- ✅ Secure credential handling
 
 ## How It Works
 
@@ -166,10 +262,12 @@ Interactive API documentation available at:
    - Extracted tasks with due dates
    - Suggested folder
 3. **Spam Classification**: Combines AI analysis with heuristics
-4. **Mailbox Actions**: 
-   - Spam → Moved to Spam folder
-   - Non-spam → Marked read, moved to Archive
-   - Action required → Flagged
+4. **Mailbox Actions** (respects SAFE_MODE setting):
+   - **Safe Mode ON** (default): Analysis only, no destructive actions
+   - **Safe Mode OFF**:
+     - Spam → Moved to Quarantine folder (unless DELETE_SPAM=true)
+     - Non-spam → Optionally marked read (if MARK_AS_READ=true), moved to Archive
+     - Action required → Flagged
 5. **Persistence**: Stored in local database with full audit trail
 6. **Learning**: System learns from folder movements and improves suggestions
 
