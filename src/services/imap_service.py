@@ -40,7 +40,11 @@ class IMAPService:
             logger.info(f"Connected to IMAP server: {self.settings.imap_host}")
             return True
         except Exception as e:
-            logger.error(f"Failed to connect to IMAP server {self.settings.imap_host}: {e}")
+            error_type = type(e).__name__
+            if self.settings.debug:
+                logger.error(f"Failed to connect to IMAP server {self.settings.imap_host}: {e}")
+            else:
+                logger.error(f"Failed to connect to IMAP server {self.settings.imap_host}: {error_type}")
             return False
     
     def disconnect(self):
@@ -50,7 +54,11 @@ class IMAPService:
                 self.client.logout()
                 logger.info("Disconnected from IMAP server")
             except Exception as e:
-                logger.warning(f"Error during IMAP disconnect: {e}")
+                error_type = type(e).__name__
+                if self.settings.debug:
+                    logger.warning(f"Error during IMAP disconnect: {e}")
+                else:
+                    logger.warning(f"Error during IMAP disconnect: {error_type}")
             finally:
                 self.client = None
     
@@ -95,13 +103,21 @@ class IMAPService:
                     if email_data:
                         emails.append(email_data)
                 except Exception as e:
-                    logger.error(f"Failed to parse email UID {uid}: {e}")
+                    error_type = type(e).__name__
+                    if self.settings.debug:
+                        logger.error(f"Failed to parse email UID {uid}: {e}")
+                    else:
+                        logger.error(f"Failed to parse email UID {uid}: {error_type}")
                     continue
             
             return emails
             
         except Exception as e:
-            logger.error(f"Failed to retrieve unread emails: {e}")
+            error_type = type(e).__name__
+            if self.settings.debug:
+                logger.error(f"Failed to retrieve unread emails: {e}")
+            else:
+                logger.error(f"Failed to retrieve unread emails: {error_type}")
             return []
     
     def _parse_email(self, uid: int, message_data: Dict) -> Optional[Dict[str, Any]]:
@@ -173,7 +189,11 @@ class IMAPService:
             }
             
         except Exception as e:
-            logger.error(f"Failed to parse email: {e}")
+            error_type = type(e).__name__
+            if self.settings.debug:
+                logger.error(f"Failed to parse email: {e}")
+            else:
+                logger.error(f"Failed to parse email: {error_type}")
             return None
     
     def _decode_header(self, header: str) -> str:
@@ -202,7 +222,11 @@ class IMAPService:
             self.client.add_flags([uid], [imapclient.SEEN])
             return True
         except Exception as e:
-            logger.error(f"Failed to mark email {uid} as read: {e}")
+            error_type = type(e).__name__
+            if self.settings.debug:
+                logger.error(f"Failed to mark email {uid} as read: {e}")
+            else:
+                logger.error(f"Failed to mark email {uid} as read: {error_type}")
             return False
     
     def move_to_folder(self, uid: int, folder: str) -> bool:
@@ -219,7 +243,11 @@ class IMAPService:
             logger.debug(f"Moved email {uid} to {folder}")
             return True
         except Exception as e:
-            logger.error(f"Failed to move email {uid} to {folder}: {e}")
+            error_type = type(e).__name__
+            if self.settings.debug:
+                logger.error(f"Failed to move email {uid} to {folder}: {e}")
+            else:
+                logger.error(f"Failed to move email {uid} to {folder}: {error_type}")
             return False
     
     def add_flag(self, uid: int) -> bool:
@@ -231,7 +259,11 @@ class IMAPService:
             self.client.add_flags([uid], [imapclient.FLAGGED])
             return True
         except Exception as e:
-            logger.error(f"Failed to flag email {uid}: {e}")
+            error_type = type(e).__name__
+            if self.settings.debug:
+                logger.error(f"Failed to flag email {uid}: {e}")
+            else:
+                logger.error(f"Failed to flag email {uid}: {error_type}")
             return False
     
     def _ensure_folder_exists(self, folder: str):
@@ -242,7 +274,11 @@ class IMAPService:
                 self.client.create_folder(folder)
                 logger.info(f"Created folder: {folder}")
         except Exception as e:
-            logger.warning(f"Could not ensure folder exists: {e}")
+            error_type = type(e).__name__
+            if self.settings.debug:
+                logger.warning(f"Could not ensure folder exists: {e}")
+            else:
+                logger.warning(f"Could not ensure folder exists: {error_type}")
     
     def check_health(self) -> Dict[str, Any]:
         """Check IMAP connection health"""
@@ -265,8 +301,13 @@ class IMAPService:
                     "message": "Failed to connect to IMAP server"
                 }
         except Exception as e:
+            error_type = type(e).__name__
+            if self.settings.debug:
+                error_msg = str(e)
+            else:
+                error_msg = error_type
             return {
                 "status": "unhealthy",
                 "connected": False,
-                "message": f"IMAP error: {str(e)}"
+                "message": f"IMAP error: {error_msg}"
             }
