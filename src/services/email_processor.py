@@ -126,8 +126,13 @@ class EmailProcessor:
             logger.info(f"Email already processed: {message_id}")
             return
         
-        # Step 2: AI Analysis
-        analysis = self.ai_service.analyze_email(email_data)
+        # Step 2: AI Analysis with safe fallback
+        try:
+            analysis = self.ai_service.analyze_email(email_data)
+        except Exception as e:
+            logger.error(f"AI analysis failed for {message_id}: {e}")
+            # Use fallback classification if AI fails
+            analysis = self.ai_service._fallback_classification(email_data)
         
         # Step 3: Spam Classification
         is_spam = self._classify_spam(email_data, analysis)
@@ -169,33 +174,47 @@ class EmailProcessor:
             )
             email_record.tasks.append(task)
         
-        # Step 5: Mailbox Actions
+        # Step 5: Mailbox Actions (with safe mode check)
         actions_taken = []
         
-        if is_spam:
-            # Move to spam folder
-            if imap.move_to_folder(uid, self.settings.spam_folder):
-                actions_taken.append("moved_to_spam")
-                email_record.is_archived = True
-                self.stats['spam'] += 1
-                logger.info(f"Moved spam email to {self.settings.spam_folder}")
+        if self.settings.safe_mode:
+            logger.info(f"SAFE MODE: Skipping IMAP actions for {message_id}")
+            actions_taken.append("safe_mode_skip")
         else:
-            # Mark as read
-            if imap.mark_as_read(uid):
-                actions_taken.append("marked_as_read")
-            
-            # Move to archive
-            if imap.move_to_folder(uid, self.settings.archive_folder):
-                actions_taken.append("moved_to_archive")
-                email_record.is_archived = True
-                self.stats['archived'] += 1
-            
-            # Flag if action required
-            if action_required:
-                if imap.add_flag(uid):
-                    actions_taken.append("flagged")
-                    email_record.is_flagged = True
-                self.stats['action_required'] += 1
+            if is_spam:
+                # Handle spam based on configuration
+                if self.settings.delete_spam:
+                    # Move to spam folder (not actual deletion for safety)
+                    if imap.move_to_folder(uid, self.settings.spam_folder):
+                        actions_taken.append("moved_to_spam")
+                        email_record.is_archived = True
+                        self.stats['spam'] += 1
+                        logger.info(f"Moved spam email to {self.settings.spam_folder}")
+                else:
+                    # Move to quarantine folder for review
+                    if imap.move_to_folder(uid, self.settings.quarantine_folder):
+                        actions_taken.append("moved_to_quarantine")
+                        email_record.is_archived = True
+                        self.stats['spam'] += 1
+                        logger.info(f"Moved spam email to quarantine: {self.settings.quarantine_folder}")
+            else:
+                # Mark as read if configured
+                if self.settings.mark_as_read:
+                    if imap.mark_as_read(uid):
+                        actions_taken.append("marked_as_read")
+                
+                # Move to archive
+                if imap.move_to_folder(uid, self.settings.archive_folder):
+                    actions_taken.append("moved_to_archive")
+                    email_record.is_archived = True
+                    self.stats['archived'] += 1
+                
+                # Flag if action required
+                if action_required:
+                    if imap.add_flag(uid):
+                        actions_taken.append("flagged")
+                        email_record.is_flagged = True
+                    self.stats['action_required'] += 1
         
         email_record.actions_taken = {"actions": actions_taken}
         
@@ -206,11 +225,12 @@ class EmailProcessor:
         audit = AuditLog(
             event_type="EMAIL_PROCESSED",
             email_message_id=message_id,
-            description=f"Email processed: spam={is_spam}, action_required={action_required}",
+            description=f"Email processed: spam={is_spam}, action_required={action_required}, safe_mode={self.settings.safe_mode}",
             data={
                 "category": analysis['category'],
                 "priority": priority,
-                "actions": actions_taken
+                "actions": actions_taken,
+                "safe_mode": self.settings.safe_mode
             }
         )
         self.db.add(audit)
@@ -220,7 +240,8 @@ class EmailProcessor:
         
         logger.info(
             f"Email processed successfully: spam={is_spam}, "
-            f"action={action_required}, priority={priority}"
+            f"action={action_required}, priority={priority}, "
+            f"safe_mode={self.settings.safe_mode}"
         )
     
     def _classify_spam(self, email_data: Dict[str, Any], analysis: Dict[str, Any]) -> bool:

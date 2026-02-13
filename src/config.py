@@ -2,8 +2,8 @@
 Configuration management for MailJaeger
 """
 from pydantic_settings import BaseSettings
-from pydantic import Field, validator
-from typing import Optional
+from pydantic import Field, field_validator
+from typing import Optional, List
 import os
 from pathlib import Path
 
@@ -15,9 +15,28 @@ class Settings(BaseSettings):
     app_name: str = "MailJaeger"
     debug: bool = Field(default=False, description="Debug mode")
     
+    # Security
+    api_key: str = Field(
+        default="",
+        description="API authentication key - REQUIRED in production. Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+    )
+    
+    # Server Configuration
+    server_host: str = Field(
+        default="127.0.0.1",
+        description="Server bind address (use 127.0.0.1 for local-only, 0.0.0.0 for external)"
+    )
+    server_port: int = Field(default=8000, description="Server port")
+    
+    # CORS Configuration
+    cors_origins: str = Field(
+        default="http://localhost:8000,http://127.0.0.1:8000",
+        description="Comma-separated list of allowed CORS origins"
+    )
+    
     # Database
     database_url: str = Field(
-        default="sqlite:///./mailjaeger.db",
+        default="sqlite:///./data/mailjaeger.db",
         description="Database connection URL"
     )
     
@@ -78,23 +97,41 @@ class Settings(BaseSettings):
         description="Confidence threshold for automated folder routing"
     )
     
+    # Mail Action Safety
+    safe_mode: bool = Field(
+        default=True,
+        description="Safe mode - prevents destructive IMAP actions (dry-run)"
+    )
+    mark_as_read: bool = Field(
+        default=False,
+        description="Mark processed emails as read"
+    )
+    delete_spam: bool = Field(
+        default=False,
+        description="Delete spam emails (if false, moves to quarantine)"
+    )
+    quarantine_folder: str = Field(
+        default="Quarantine",
+        description="Quarantine folder for suspected spam"
+    )
+    
     # Storage
     store_email_body: bool = Field(
-        default=True,
-        description="Store full email body"
+        default=False,
+        description="Store full email body (PRIVACY: disabled by default)"
     )
     store_attachments: bool = Field(
         default=False,
         description="Store email attachments"
     )
     attachment_dir: Path = Field(
-        default=Path("./attachments"),
+        default=Path("./data/attachments"),
         description="Directory for attachment storage"
     )
     
     # Search
     search_index_dir: Path = Field(
-        default=Path("./search_index"),
+        default=Path("./data/search_index"),
         description="Directory for search index"
     )
     embeddings_model: str = Field(
@@ -105,9 +142,59 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = Field(default="INFO", description="Logging level")
     log_file: Optional[Path] = Field(
-        default=Path("./logs/mailjaeger.log"),
+        default=Path("./data/logs/mailjaeger.log"),
         description="Log file path"
     )
+    
+    @field_validator('cors_origins')
+    @classmethod
+    def validate_cors_origins(cls, v: str) -> List[str]:
+        """Validate and parse comma-separated CORS origins"""
+        if not v:
+            return ["http://localhost:8000", "http://127.0.0.1:8000"]
+        return [origin.strip() for origin in v.split(',') if origin.strip()]
+    
+    @field_validator('api_key')
+    @classmethod
+    def validate_api_key(cls, v: str) -> str:
+        """Validate API key in production mode"""
+        # Allow empty in debug mode, but warn
+        if not v:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "API_KEY not set! Authentication is DISABLED. "
+                "Generate one with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+            )
+        return v
+    
+    def validate_required_settings(self):
+        """Validate that required settings are present"""
+        errors = []
+        
+        # Check IMAP credentials
+        if not self.imap_host:
+            errors.append("IMAP_HOST is required")
+        if not self.imap_username:
+            errors.append("IMAP_USERNAME is required")
+        if not self.imap_password:
+            errors.append("IMAP_PASSWORD is required")
+        
+        # Check AI configuration
+        if not self.ai_endpoint:
+            errors.append("AI_ENDPOINT is required")
+        if not self.ai_model:
+            errors.append("AI_MODEL is required")
+        
+        # Security warnings (not errors)
+        if not self.api_key and not self.debug:
+            errors.append("API_KEY not set - authentication disabled (SECURITY RISK)")
+        
+        if self.server_host == "0.0.0.0" and not self.api_key:
+            errors.append("SERVER_HOST is 0.0.0.0 without API_KEY - publicly accessible without auth (CRITICAL SECURITY RISK)")
+        
+        if errors:
+            raise ValueError(f"Configuration validation failed:\n" + "\n".join(f"  - {err}" for err in errors))
     
     class Config:
         env_file = ".env"

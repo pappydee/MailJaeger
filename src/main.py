@@ -1,14 +1,16 @@
 """
 FastAPI application for MailJaeger
 """
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
 from pathlib import Path
+import sys
 
 from src.config import get_settings
 from src.database.connection import init_db, get_db
@@ -24,17 +26,34 @@ from src.services.ai_service import AIService
 from src.services.search_service import SearchService
 from src.services.learning_service import LearningService
 from src.services.email_processor import EmailProcessor
+from src.middleware.auth import require_authentication, AuthenticationError
 from src.utils.logging import setup_logging, get_logger
 
 # Setup logging
 setup_logging()
 logger = get_logger(__name__)
 
+# Settings with validation
+try:
+    settings = get_settings()
+    settings.validate_required_settings()
+except ValueError as e:
+    logger.error(f"Configuration validation failed: {e}")
+    print(f"\n❌ Configuration Error:\n{e}\n", file=sys.stderr)
+    print("Please check your .env file and environment variables.", file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    logger.error(f"Failed to load configuration: {e}")
+    print(f"\n❌ Configuration Error: {e}\n", file=sys.stderr)
+    sys.exit(1)
+
 # Create app
 app = FastAPI(
     title="MailJaeger",
-    description="Local AI-powered email processing system",
-    version="1.0.0"
+    description="Local AI-powered email processing system (Secure)",
+    version="1.0.0",
+    docs_url="/api/docs" if settings.api_key else "/docs",
+    redoc_url="/api/redoc" if settings.api_key else "/redoc"
 )
 
 # Mount static files (frontend)
@@ -42,23 +61,88 @@ frontend_dir = Path(__file__).parent.parent / "frontend"
 if frontend_dir.exists():
     app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
 
-# CORS
+# CORS - Restrictive configuration
+cors_origins = settings.cors_origins if isinstance(settings.cors_origins, list) else ["http://localhost:8000", "http://127.0.0.1:8000"]
+logger.info(f"CORS enabled for origins: {cors_origins}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    max_age=600,  # Cache preflight requests for 10 minutes
 )
 
-# Settings
-settings = get_settings()
+
+# Exception handlers for better error responses
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle validation errors with sanitized responses"""
+    logger.warning(f"Validation error on {request.url.path}: {exc.errors()}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": "Invalid request data",
+            "errors": exc.errors()
+        }
+    )
+
+
+@app.exception_handler(AuthenticationError)
+async def auth_exception_handler(request: Request, exc: AuthenticationError):
+    """Handle authentication errors"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle general exceptions with sanitized error messages"""
+    logger.error(f"Unhandled exception on {request.url.path}: {exc}", exc_info=True)
+    
+    # Don't leak internal details in production
+    detail = str(exc) if settings.debug else "An internal error occurred"
+    
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": detail}
+    )
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize application on startup"""
+    logger.info("=" * 60)
     logger.info("Starting MailJaeger...")
+    logger.info(f"Version: 1.0.0")
+    logger.info(f"Server: {settings.server_host}:{settings.server_port}")
+    logger.info(f"Debug mode: {settings.debug}")
+    logger.info(f"Safe mode: {settings.safe_mode}")
+    logger.info(f"API authentication: {'ENABLED' if settings.api_key else 'DISABLED (WARNING!)'}")
+    logger.info(f"CORS origins: {cors_origins}")
+    logger.info("=" * 60)
+    
+    # Create data directories
+    from pathlib import Path
+    from urllib.parse import urlparse
+    
+    # Extract database directory from URL
+    db_path = Path(settings.database_url.replace("sqlite:///", ""))
+    db_dir = db_path.parent if db_path.name else db_path
+    
+    for directory in [
+        db_dir,
+        settings.search_index_dir,
+        settings.attachment_dir,
+        settings.log_file.parent if settings.log_file else None
+    ]:
+        if directory:
+            directory.mkdir(parents=True, exist_ok=True)
+            logger.debug(f"Ensured directory exists: {directory}")
     
     # Initialize database
     init_db()
@@ -68,6 +152,7 @@ async def startup_event():
     scheduler = get_scheduler()
     scheduler.start()
     logger.info("Scheduler started")
+    logger.info("MailJaeger startup complete")
 
 
 @app.on_event("shutdown")
@@ -78,6 +163,7 @@ async def shutdown_event():
     # Stop scheduler
     scheduler = get_scheduler()
     scheduler.stop()
+    logger.info("MailJaeger shutdown complete")
 
 
 @app.get("/")
@@ -90,11 +176,12 @@ async def root():
         "name": "MailJaeger",
         "version": "1.0.0",
         "status": "running",
-        "message": "Frontend not found. Access API at /docs"
+        "message": "Frontend not found. Access API at /docs",
+        "authentication": "required" if settings.api_key else "disabled"
     }
 
 
-@app.get("/api/dashboard", response_model=DashboardResponse)
+@app.get("/api/dashboard", response_model=DashboardResponse, dependencies=[Depends(require_authentication)])
 async def get_dashboard(db: Session = Depends(get_db)):
     """Get dashboard overview"""
     try:
@@ -140,11 +227,14 @@ async def get_dashboard(db: Session = Depends(get_db)):
         )
     
     except Exception as e:
-        logger.error(f"Dashboard error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Dashboard error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, 
+            detail="Failed to load dashboard" if not settings.debug else str(e)
+        )
 
 
-@app.post("/api/emails/search", response_model=List[EmailResponse])
+@app.post("/api/emails/search", response_model=List[EmailResponse], dependencies=[Depends(require_authentication)])
 async def search_emails(
     request: SearchRequest,
     db: Session = Depends(get_db)
@@ -172,11 +262,14 @@ async def search_emails(
         return [EmailResponse.from_orm(email) for email in results['results']]
     
     except Exception as e:
-        logger.error(f"Search error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Search error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, 
+            detail="Search failed" if not settings.debug else str(e)
+        )
 
 
-@app.post("/api/emails/list", response_model=List[EmailResponse])
+@app.post("/api/emails/list", response_model=List[EmailResponse], dependencies=[Depends(require_authentication)])
 async def list_emails(
     request: EmailListRequest,
     db: Session = Depends(get_db)
@@ -221,11 +314,14 @@ async def list_emails(
         return [EmailResponse.from_orm(email) for email in emails]
     
     except Exception as e:
-        logger.error(f"List emails error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"List emails error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to list emails" if not settings.debug else str(e)
+        )
 
 
-@app.get("/api/emails/{email_id}", response_model=EmailDetailResponse)
+@app.get("/api/emails/{email_id}", response_model=EmailDetailResponse, dependencies=[Depends(require_authentication)])
 async def get_email(email_id: int, db: Session = Depends(get_db)):
     """Get email details"""
     email = db.query(ProcessedEmail).filter(ProcessedEmail.id == email_id).first()
@@ -236,7 +332,7 @@ async def get_email(email_id: int, db: Session = Depends(get_db)):
     return EmailDetailResponse.from_orm(email)
 
 
-@app.post("/api/emails/{email_id}/resolve")
+@app.post("/api/emails/{email_id}/resolve", dependencies=[Depends(require_authentication)])
 async def mark_email_resolved(
     email_id: int,
     request: MarkResolvedRequest,
@@ -259,7 +355,7 @@ async def mark_email_resolved(
     return {"success": True, "email_id": email_id, "resolved": request.resolved}
 
 
-@app.post("/api/processing/trigger")
+@app.post("/api/processing/trigger", dependencies=[Depends(require_authentication)])
 async def trigger_processing(
     request: TriggerRunRequest,
     db: Session = Depends(get_db)
@@ -275,11 +371,14 @@ async def trigger_processing(
             return {"success": False, "message": "Processing already in progress"}
     
     except Exception as e:
-        logger.error(f"Trigger processing error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Trigger processing error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to trigger processing" if not settings.debug else str(e)
+        )
 
 
-@app.get("/api/processing/runs", response_model=List[ProcessingRunResponse])
+@app.get("/api/processing/runs", response_model=List[ProcessingRunResponse], dependencies=[Depends(require_authentication)])
 async def get_processing_runs(
     limit: int = Query(default=10, ge=1, le=100),
     db: Session = Depends(get_db)
@@ -292,7 +391,7 @@ async def get_processing_runs(
     return [ProcessingRunResponse.from_orm(run) for run in runs]
 
 
-@app.get("/api/processing/runs/{run_id}", response_model=ProcessingRunResponse)
+@app.get("/api/processing/runs/{run_id}", response_model=ProcessingRunResponse, dependencies=[Depends(require_authentication)])
 async def get_processing_run(run_id: int, db: Session = Depends(get_db)):
     """Get specific processing run"""
     run = db.query(ProcessingRun).filter(ProcessingRun.id == run_id).first()
@@ -303,7 +402,7 @@ async def get_processing_run(run_id: int, db: Session = Depends(get_db)):
     return ProcessingRunResponse.from_orm(run)
 
 
-@app.get("/api/settings")
+@app.get("/api/settings", dependencies=[Depends(require_authentication)])
 async def get_settings_api():
     """Get current settings (sanitized)"""
     return {
@@ -318,11 +417,13 @@ async def get_settings_api():
         "learning_enabled": settings.learning_enabled,
         "learning_confidence_threshold": settings.learning_confidence_threshold,
         "store_email_body": settings.store_email_body,
-        "store_attachments": settings.store_attachments
+        "store_attachments": settings.store_attachments,
+        "safe_mode": settings.safe_mode,
+        "mark_as_read": settings.mark_as_read
     }
 
 
-@app.post("/api/settings")
+@app.post("/api/settings", dependencies=[Depends(require_authentication)])
 async def update_settings_api(request: SettingsUpdate):
     """Update settings (partial update)"""
     # Note: This would require reloading configuration
@@ -335,7 +436,7 @@ async def update_settings_api(request: SettingsUpdate):
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint (unauthenticated for monitoring)"""
     imap_service = IMAPService()
     ai_service = AIService()
     
@@ -352,4 +453,9 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host=settings.server_host,
+        port=settings.server_port,
+        log_level=settings.log_level.lower()
+    )
