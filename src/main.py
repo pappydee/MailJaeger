@@ -58,6 +58,32 @@ app = FastAPI(
     redoc_url="/api/redoc"
 )
 
+# Request size limit (10MB default for API requests)
+# This prevents large payload attacks
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
+
+class RequestSizeLimiterMiddleware(BaseHTTPMiddleware):
+    """Middleware to limit request body size"""
+    def __init__(self, app, max_size: int = 10 * 1024 * 1024):  # 10MB default
+        super().__init__(app)
+        self.max_size = max_size
+    
+    async def dispatch(self, request: StarletteRequest, call_next):
+        """Check request size before processing"""
+        # Check Content-Length header if present
+        content_length = request.headers.get("content-length")
+        if content_length:
+            if int(content_length) > self.max_size:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": f"Request body too large. Maximum size: {self.max_size} bytes"}
+                )
+        return await call_next(request)
+
+app.add_middleware(RequestSizeLimiterMiddleware, max_size=10 * 1024 * 1024)
+
 # Add security headers middleware
 app.add_middleware(SecurityHeadersMiddleware)
 

@@ -19,15 +19,38 @@
 
 MailJaeger is designed with security as a core principle:
 
-- ✅ **API Authentication**: Token-based authentication protects all endpoints
+**Authentication & Authorization:**
+- ✅ **Multi-Key API Authentication**: Support for multiple API keys with constant-time comparison
+- ✅ **Key Rotation**: Add/remove keys without downtime via comma-separated or file-based config
+- ✅ **Protected Routes**: All API and frontend routes require authentication by default
+- ✅ **Rate Limiting**: Configurable rate limits on login, API calls, and expensive operations
+
+**Network & Transport Security:**
 - ✅ **Localhost Binding**: Server binds to 127.0.0.1 by default (not publicly accessible)
-- ✅ **Restrictive CORS**: No wildcard origins, configurable allowed origins
-- ✅ **Safe Mode**: Dry-run mode prevents destructive IMAP actions by default
-- ✅ **Credential Protection**: Passwords and tokens never logged or exposed in responses
-- ✅ **Input Validation**: Strict validation of AI responses and user inputs
+- ✅ **Reverse Proxy Ready**: Full support for X-Forwarded-* headers with TRUST_PROXY setting
+- ✅ **Security Headers**: HSTS, X-Content-Type-Options, X-Frame-Options, CSP, Referrer-Policy
+- ✅ **Restrictive CORS**: No wildcard origins, explicit allowlist configuration
+
+**Data Protection:**
+- ✅ **Credential Protection**: Passwords, tokens, and API keys never logged or exposed
+- ✅ **Log Redaction**: Multi-layer sensitive data filtering in all log output
 - ✅ **Data Minimization**: Email bodies NOT stored by default (privacy-first)
+- ✅ **Docker Secrets**: Support for Docker secrets and file-based credential management
+
+**Application Security:**
+- ✅ **Input Validation**: Strict validation and sanitization of all AI outputs
+- ✅ **Safe Mode**: Dry-run mode prevents destructive IMAP actions by default
+- ✅ **Folder Allowlist**: AI can only suggest pre-approved folders (prevents prompt injection)
 - ✅ **Quarantine Folder**: Suspected spam goes to quarantine, not deleted
+- ✅ **Request Size Limits**: 10MB default limit prevents large payload attacks
 - ✅ **Error Sanitization**: Internal errors never exposed to API responses
+- ✅ **Session-Only Storage**: Frontend uses sessionStorage (not localStorage) for tokens
+
+**Monitoring & Auditability:**
+- ✅ **Audit Logging**: All email processing actions logged with safe mode status
+- ✅ **Structured Logs**: Timestamped, leveled logs with automatic redaction
+- ✅ **Health Endpoint**: Unauthenticated health check for monitoring systems
+- ✅ **Failed Auth Tracking**: All failed authentication attempts logged with source IP
 
 ## System Requirements
 
@@ -130,9 +153,10 @@ The application will be available at **http://localhost:8000**
 
 ### 6. First Login
 
-When you open the dashboard, you'll be prompted for your API key:
+When you open the dashboard, you'll see a secure login screen:
 - Enter the `API_KEY` value from your `.env` file
-- The key is stored securely in your browser's localStorage
+- The key is stored in sessionStorage (cleared when you close the tab/browser)
+- For added security, the key is never saved permanently on disk
 
 ## Usage
 
@@ -389,6 +413,83 @@ export LOG_LEVEL=DEBUG
 
 # Run with auto-reload
 uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+## 🚀 Production Deployment
+
+### Security Checklist
+
+Before deploying to production:
+
+- [ ] **API Key Set**: Generate with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`
+- [ ] **HTTPS Enabled**: Deploy behind reverse proxy with valid SSL
+- [ ] **Firewall Configured**: Block direct access to ports 8000 and 11434
+- [ ] **Safe Mode Tested**: Test with `SAFE_MODE=true` before enabling writes
+- [ ] **Credentials Secured**: Use Docker secrets or secure env files
+- [ ] **CORS Configured**: Set `CORS_ORIGINS` to your domain only
+- [ ] **Rate Limiting Active**: Verify with repeated requests
+- [ ] **Monitoring Setup**: Monitor logs and health endpoint
+
+### Production Docker Deployment
+
+```bash
+# Create secrets
+mkdir -p secrets && chmod 700 secrets
+python -c 'import secrets; print(secrets.token_urlsafe(32))' > secrets/api_key.txt
+chmod 600 secrets/api_key.txt
+
+# Deploy
+docker compose -f docker-compose.prod.yml up -d
+```
+
+### Reverse Proxy Setup
+
+See [docs/reverse-proxy-examples.md](docs/reverse-proxy-examples.md) for:
+- Nginx configuration with rate limiting  
+- Caddy configuration with auto-SSL
+- Traefik Docker configuration
+
+**Important:** Set `TRUST_PROXY=true` when behind a reverse proxy!
+
+### API Key Rotation
+
+```bash
+# Multiple keys (comma-separated)
+API_KEY=old_key,new_key,another_key
+
+# Or file-based
+API_KEY_FILE=/run/secrets/mailjaeger_api_keys
+```
+
+Rotation process:
+1. Add new key alongside old
+2. Deploy/restart
+3. Update clients to new key  
+4. Remove old key
+5. Deploy/restart again
+
+### Monitoring
+
+```bash
+# Health check
+curl http://localhost:8000/api/health
+
+# Logs
+docker logs mailjaeger-app -f
+
+# Check auth failures
+docker logs mailjaeger-app | grep "authentication"
+```
+
+### Backup
+
+```bash
+# Database
+cp data/mailjaeger.db data/mailjaeger.db.$(date +%Y%m%d)
+
+# Configuration (encrypt it!)
+tar -czf config-$(date +%Y%m%d).tar.gz .env secrets/
+gpg -c config-*.tar.gz
 ```
 
 ### Project Structure
