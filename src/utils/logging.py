@@ -1,8 +1,9 @@
 """
-Logging configuration for MailJaeger
+Logging configuration for MailJaeger with security filtering
 """
 import logging
 import sys
+import re
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -10,8 +11,45 @@ from datetime import datetime
 from src.config import get_settings
 
 
+class SensitiveDataFilter(logging.Filter):
+    """Filter to remove sensitive data from logs"""
+    
+    # Patterns to redact
+    SENSITIVE_PATTERNS = [
+        (re.compile(r'(password["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(api[_-]?key["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(bearer\s+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(authorization["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(token["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(secret["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        # Email body patterns (to avoid logging full email content)
+        (re.compile(r'(body_plain["\s:=]+)[^\s]{200,}', re.IGNORECASE), r'\1[EMAIL_BODY_REDACTED]'),
+        (re.compile(r'(body_html["\s:=]+)[^\s]{200,}', re.IGNORECASE), r'\1[EMAIL_BODY_REDACTED]'),
+    ]
+    
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Filter log record to remove sensitive data"""
+        if record.msg:
+            msg = str(record.msg)
+            for pattern, replacement in self.SENSITIVE_PATTERNS:
+                msg = pattern.sub(replacement, msg)
+            record.msg = msg
+        
+        # Also filter args if present
+        if record.args:
+            filtered_args = []
+            for arg in record.args if isinstance(record.args, tuple) else [record.args]:
+                arg_str = str(arg)
+                for pattern, replacement in self.SENSITIVE_PATTERNS:
+                    arg_str = pattern.sub(replacement, arg_str)
+                filtered_args.append(arg_str)
+            record.args = tuple(filtered_args) if len(filtered_args) > 1 else filtered_args[0] if filtered_args else ()
+        
+        return True
+
+
 def setup_logging(log_file: Optional[Path] = None, log_level: str = "INFO"):
-    """Setup logging configuration"""
+    """Setup logging configuration with security filtering"""
     settings = get_settings()
     
     # Use settings if not provided
@@ -24,7 +62,7 @@ def setup_logging(log_file: Optional[Path] = None, log_level: str = "INFO"):
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
     
-    # Create formatter
+    # Create formatter with structured logging
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
@@ -37,10 +75,14 @@ def setup_logging(log_file: Optional[Path] = None, log_level: str = "INFO"):
     # Remove existing handlers
     root_logger.handlers.clear()
     
+    # Add sensitive data filter
+    sensitive_filter = SensitiveDataFilter()
+    
     # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(getattr(logging, log_level.upper()))
     console_handler.setFormatter(formatter)
+    console_handler.addFilter(sensitive_filter)
     root_logger.addHandler(console_handler)
     
     # File handler
@@ -48,12 +90,14 @@ def setup_logging(log_file: Optional[Path] = None, log_level: str = "INFO"):
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(getattr(logging, log_level.upper()))
         file_handler.setFormatter(formatter)
+        file_handler.addFilter(sensitive_filter)
         root_logger.addHandler(file_handler)
     
     # Reduce noise from external libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
     
     return root_logger
 

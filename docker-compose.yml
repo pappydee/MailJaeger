@@ -8,7 +8,7 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"  # Bind to localhost only for security
     restart: unless-stopped
     # Uncomment for GPU support
     # deploy:
@@ -24,8 +24,19 @@ services:
     build: .
     container_name: mailjaeger-app
     ports:
-      - "8000:8000"
+      # Bind to localhost by default for security
+      # Change to "8000:8000" to expose externally (ensure API_KEY is set!)
+      - "127.0.0.1:8000:8000"
     environment:
+      # SECURITY: Set API_KEY for authentication
+      # Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'
+      - API_KEY=${API_KEY:-}
+      
+      # Server Configuration
+      - SERVER_HOST=0.0.0.0  # Inside container, bind to all interfaces
+      - SERVER_PORT=8000
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+      
       # IMAP Configuration
       - IMAP_HOST=${IMAP_HOST}
       - IMAP_PORT=${IMAP_PORT:-993}
@@ -43,6 +54,12 @@ services:
       - SPAM_THRESHOLD=${SPAM_THRESHOLD:-0.7}
       - MAX_EMAILS_PER_RUN=${MAX_EMAILS_PER_RUN:-200}
       
+      # Mail Action Safety
+      - SAFE_MODE=${SAFE_MODE:-true}
+      - MARK_AS_READ=${MARK_AS_READ:-false}
+      - DELETE_SPAM=${DELETE_SPAM:-false}
+      - QUARANTINE_FOLDER=${QUARANTINE_FOLDER:-Quarantine}
+      
       # Scheduling
       - SCHEDULE_TIME=${SCHEDULE_TIME:-08:00}
       - SCHEDULE_TIMEZONE=${SCHEDULE_TIMEZONE:-Europe/Berlin}
@@ -52,7 +69,7 @@ services:
       - LEARNING_CONFIDENCE_THRESHOLD=${LEARNING_CONFIDENCE_THRESHOLD:-0.8}
       
       # Storage
-      - STORE_EMAIL_BODY=${STORE_EMAIL_BODY:-true}
+      - STORE_EMAIL_BODY=${STORE_EMAIL_BODY:-false}
       - STORE_ATTACHMENTS=${STORE_ATTACHMENTS:-false}
       
       # Logging
@@ -61,9 +78,8 @@ services:
     
     volumes:
       - mailjaeger_data:/app/data
-      - mailjaeger_logs:/app/logs
-      - mailjaeger_search:/app/search_index
-      - mailjaeger_attachments:/app/attachments
+      # Optional: Mount .env file for secrets (alternative to environment variables)
+      # - ./.env:/app/.env:ro
     
     depends_on:
       - ollama
@@ -76,15 +92,12 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    
+    # Security: Run as non-root user
+    user: "1000:1000"
 
 volumes:
   ollama_data:
     driver: local
   mailjaeger_data:
-    driver: local
-  mailjaeger_logs:
-    driver: local
-  mailjaeger_search:
-    driver: local
-  mailjaeger_attachments:
     driver: local

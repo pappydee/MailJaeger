@@ -169,28 +169,62 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
             json_end = response.rfind('}') + 1
             
             if json_start == -1 or json_end == 0:
+                logger.warning("No JSON found in AI response, using fallback")
                 raise ValueError("No JSON found in response")
             
             json_str = response[json_start:json_end]
             data = json.loads(json_str)
             
-            # Validate and normalize
+            # Strict validation and normalization
             analysis = {
-                'summary': data.get('summary', ''),
+                'summary': self._validate_string(data.get('summary', ''), max_length=500),
                 'category': self._validate_category(data.get('category', 'Unklar')),
-                'spam_probability': float(data.get('spam_probability', 0.0)),
+                'spam_probability': self._validate_probability(data.get('spam_probability', 0.0)),
                 'action_required': bool(data.get('action_required', False)),
                 'priority': self._validate_priority(data.get('priority', 'LOW')),
                 'tasks': self._validate_tasks(data.get('tasks', [])),
-                'suggested_folder': data.get('suggested_folder', ''),
-                'reasoning': data.get('reasoning', '')
+                'suggested_folder': self._validate_string(data.get('suggested_folder', ''), max_length=100),
+                'reasoning': self._validate_string(data.get('reasoning', ''), max_length=500)
             }
+            
+            # Additional safety check: ensure all required fields present
+            required_fields = ['summary', 'category', 'spam_probability', 'action_required', 'priority']
+            for field in required_fields:
+                if field not in analysis or analysis[field] is None:
+                    logger.warning(f"Missing required field '{field}' in AI response")
+                    raise ValueError(f"Missing required field: {field}")
             
             return analysis
             
-        except Exception as e:
-            logger.error(f"Failed to parse AI response: {e}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON from AI response: {e}")
             raise
+        except Exception as e:
+            logger.error(f"Failed to validate AI response: {e}")
+            raise
+    
+    def _validate_string(self, value: Any, max_length: int = 1000) -> str:
+        """Validate and sanitize string values"""
+        if not value:
+            return ""
+        
+        # Convert to string and truncate if needed
+        str_value = str(value)[:max_length]
+        
+        # Basic sanitization - remove control characters except newlines/tabs
+        sanitized = ''.join(char for char in str_value if char.isprintable() or char in '\n\t')
+        
+        return sanitized.strip()
+    
+    def _validate_probability(self, value: Any) -> float:
+        """Validate probability value (0.0 to 1.0)"""
+        try:
+            prob = float(value)
+            # Clamp to valid range
+            return max(0.0, min(1.0, prob))
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid probability value: {value}, using 0.0")
+            return 0.0
     
     def _validate_category(self, category: str) -> str:
         """Validate category"""
@@ -205,14 +239,31 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
     def _validate_tasks(self, tasks: List[Dict]) -> List[Dict]:
         """Validate and normalize tasks"""
         validated = []
+        
+        # Limit number of tasks to prevent abuse
+        max_tasks = 10
+        tasks = tasks[:max_tasks] if isinstance(tasks, list) else []
+        
         for task in tasks:
-            if isinstance(task, dict) and task.get('description'):
-                validated.append({
-                    'description': task.get('description', ''),
-                    'due_date': task.get('due_date'),
-                    'context': task.get('context', ''),
-                    'confidence': float(task.get('confidence', 0.5))
-                })
+            if not isinstance(task, dict):
+                continue
+                
+            description = self._validate_string(task.get('description', ''), max_length=500)
+            if not description:
+                continue
+            
+            # Validate due_date if present
+            due_date = task.get('due_date')
+            if due_date and not isinstance(due_date, str):
+                due_date = None
+            
+            validated.append({
+                'description': description,
+                'due_date': due_date,
+                'context': self._validate_string(task.get('context', ''), max_length=200),
+                'confidence': self._validate_probability(task.get('confidence', 0.5))
+            })
+        
         return validated
     
     def _fallback_classification(self, email_data: Dict[str, Any]) -> Dict[str, Any]:

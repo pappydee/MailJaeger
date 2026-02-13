@@ -33,17 +33,22 @@ ENV PATH=/root/.local/bin:$PATH
 
 # Copy application code
 COPY src/ ./src/
+COPY frontend/ ./frontend/
 COPY cli.py .
 
-# Create necessary directories
-RUN mkdir -p /app/data /app/logs /app/search_index /app/attachments
+# Create necessary directories with restrictive permissions
+RUN mkdir -p /app/data /app/data/logs /app/data/search_index /app/data/attachments && \
+    chmod 700 /app/data
 
-# Expose port
+# Set Python path
+ENV PYTHONPATH=/app
+
+# Expose port (default localhost binding is in config)
 EXPOSE 8000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:8000/api/health || exit 1
 
-# Run application
-CMD ["python", "-m", "src.main"]
+# Run application using Python module syntax
+CMD ["python", "-m", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
