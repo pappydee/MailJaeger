@@ -11,7 +11,8 @@
 - **🧠 Continuous Learning**: Adapts to your behavior and improves over time
 - **🔍 Powerful Search**: Full-text and semantic search with filtering
 - **📅 Automated Processing**: Scheduled daily runs with manual trigger option
-- **🌐 Web Interface**: RESTful API for integration with any frontend
+- **🌐 Web Dashboard**: Modern web interface for email management and monitoring
+- **🛠️ RESTful API**: Complete API for custom integrations
 
 ## System Requirements
 
@@ -121,16 +122,28 @@ source venv/bin/activate
 python -m src.main
 ```
 
-The API will be available at `http://localhost:8000`
+The application will be available at `http://localhost:8000`
+
+### Web Dashboard
+
+Access the web dashboard at: **http://localhost:8000**
+
+The dashboard provides:
+- 📊 Real-time statistics (total emails, action required, spam filtered)
+- 📧 Email list with filtering and sorting
+- 🔍 Detailed email view with AI analysis and tasks
+- ⚡ Manual processing trigger
+- 💚 System health monitoring
 
 ### API Documentation
 
-Once running, access the interactive API documentation at:
+Interactive API documentation available at:
 - **Swagger UI**: http://localhost:8000/docs
 - **ReDoc**: http://localhost:8000/redoc
 
 ### Key Endpoints
 
+- `GET /` - Web Dashboard (NEW!)
 - `GET /api/dashboard` - Overview dashboard with statistics
 - `POST /api/emails/list` - List emails with filters
 - `GET /api/emails/{id}` - Get email details
