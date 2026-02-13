@@ -35,18 +35,20 @@ def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials]) -> bool:
         True if authenticated, False otherwise
     """
     settings = get_settings()
+    api_keys = settings.get_api_keys()
     
-    # If no API key is configured, allow access (with warning logged at startup)
-    if not settings.api_key:
+    # If no API keys configured, allow access (with warning logged at startup)
+    if not api_keys:
         return True
     
-    # Require credentials if API key is configured
+    # Require credentials if API keys are configured
     if not credentials:
         return False
     
-    # Verify token matches configured API key using constant-time comparison
+    # Verify token matches any configured API key using constant-time comparison
     # to prevent timing attacks
-    return secrets.compare_digest(credentials.credentials, settings.api_key)
+    token = credentials.credentials
+    return any(secrets.compare_digest(token, key) for key in api_keys)
 
 
 async def require_authentication(
@@ -62,15 +64,16 @@ async def require_authentication(
             ...
     """
     settings = get_settings()
+    api_keys = settings.get_api_keys()
     
-    # Skip auth check if no API key configured (already warned at startup)
-    if not settings.api_key:
+    # Skip auth check if no API keys configured (already warned at startup)
+    if not api_keys:
         return
     
     # Get credentials from header
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
-        logger.warning(f"Unauthenticated request to {request.url.path}")
+        logger.warning(f"Unauthenticated request to {request.url.path} from {request.client.host if request.client else 'unknown'}")
         raise AuthenticationError("Missing or invalid authentication token")
     
     # Extract token
@@ -79,9 +82,9 @@ async def require_authentication(
     except IndexError:
         raise AuthenticationError("Malformed authentication token")
     
-    # Verify token
-    if not secrets.compare_digest(token, settings.api_key):
-        logger.warning(f"Failed authentication attempt for {request.url.path}")
+    # Verify token against all valid API keys
+    if not any(secrets.compare_digest(token, key) for key in api_keys):
+        logger.warning(f"Failed authentication attempt for {request.url.path} from {request.client.host if request.client else 'unknown'}")
         raise AuthenticationError("Invalid authentication token")
     
     logger.debug(f"Authenticated request to {request.url.path}")

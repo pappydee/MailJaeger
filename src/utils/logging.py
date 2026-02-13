@@ -16,21 +16,36 @@ class SensitiveDataFilter(logging.Filter):
     
     # Patterns to redact
     SENSITIVE_PATTERNS = [
+        # Password patterns
         (re.compile(r'(password["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(passwd["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(pwd["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        
+        # Username patterns
         (re.compile(r'(username["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
-        (re.compile(r'(user["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(user["\s:=]+)([^\s,}\]]+@[^\s,}\]]+)', re.IGNORECASE), r'\1[REDACTED]'),
+        
+        # API key and token patterns
         (re.compile(r'(api[_-]?key["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
         (re.compile(r'(bearer\s+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
         (re.compile(r'(authorization["\s:=\s]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
         (re.compile(r'(token["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
         (re.compile(r'(secret["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(key["\s:=]+)[A-Za-z0-9_\-]{20,}', re.IGNORECASE), r'\1[REDACTED]'),
+        
         # Authorization headers in various formats
         (re.compile(r'Authorization:\s*Bearer\s+[^\s,}\]]+', re.IGNORECASE), r'Authorization: Bearer [REDACTED]'),
         (re.compile(r'Authorization:\s*[^\s,}\]]+', re.IGNORECASE), r'Authorization: [REDACTED]'),
+        (re.compile(r'"Authorization":\s*"[^"]*"', re.IGNORECASE), r'"Authorization": "[REDACTED]"'),
+        
+        # Email patterns in credentials context
+        (re.compile(r'(login|auth|credential)[^\n]*?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', re.IGNORECASE), r'\1...[REDACTED]'),
+        
         # Email body patterns (to avoid logging full email content)
         # Using [\s\S] to match any character including newlines
         (re.compile(r'(body_plain["\s:=]+)[\s\S]{200,}', re.IGNORECASE), r'\1[EMAIL_BODY_REDACTED]'),
         (re.compile(r'(body_html["\s:=]+)[\s\S]{200,}', re.IGNORECASE), r'\1[EMAIL_BODY_REDACTED]'),
+        (re.compile(r'(content["\s:=]+)[\s\S]{200,}', re.IGNORECASE), r'\1[CONTENT_REDACTED]'),
     ]
     
     def filter(self, record: logging.LogRecord) -> bool:

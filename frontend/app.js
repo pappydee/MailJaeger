@@ -9,18 +9,18 @@ let currentFilters = {
     priority: '',
     action_required: ''
 };
-let apiKey = '';
+let apiKey = '';  // Keep in memory only
 
 // Initialize dashboard
 document.addEventListener('DOMContentLoaded', async () => {
-    // Check for API key in localStorage or prompt
-    apiKey = localStorage.getItem('mailjaeger_api_key') || '';
+    // Check for API key in sessionStorage (session-only, not persistent)
+    apiKey = sessionStorage.getItem('mailjaeger_api_key') || '';
     
     // Check if authentication is required
     const authRequired = await checkAuthRequired();
     
     if (authRequired && !apiKey) {
-        promptForApiKey();
+        showLoginUI();
         return;
     }
     
@@ -35,34 +35,96 @@ document.addEventListener('DOMContentLoaded', async () => {
 // Check if authentication is required
 async function checkAuthRequired() {
     try {
+        // Health endpoint is unauthenticated for monitoring
         const response = await fetch(`${API_BASE}/api/health`);
-        if (response.status === 401) {
-            return true;
-        }
-        // Try dashboard to be sure
-        const dashResponse = await fetch(`${API_BASE}/api/dashboard`);
-        return dashResponse.status === 401;
+        
+        // Try to access root - if 401, auth is required
+        const rootResponse = await fetch(`${API_BASE}/`);
+        return rootResponse.status === 401;
     } catch (error) {
         console.error('Error checking auth:', error);
-        return false;
+        return true; // Assume auth required on error
     }
 }
 
-// Prompt user for API key
-function promptForApiKey() {
-    // Note: Using prompt() for simplicity. In production, consider a proper modal dialog.
-    // For self-hosted local deployment, this is acceptable as the key is only stored locally.
-    const key = prompt(
-        'API-Schlüssel erforderlich:\n\n' +
-        'Bitte geben Sie Ihren API-Schlüssel ein (Bearer Token):\n\n' +
-        'Hinweis: Der Schlüssel wird nur lokal in Ihrem Browser gespeichert.'
-    );
-    if (key) {
-        apiKey = key.trim();
-        localStorage.setItem('mailjaeger_api_key', apiKey);
-        location.reload();
-    } else {
-        showError('Authentifizierung erforderlich. Bitte Seite neu laden und API-Schlüssel eingeben.');
+// Show login UI
+function showLoginUI() {
+    document.body.innerHTML = `
+        <div style="display: flex; justify-content: center; align-items: center; min-height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+            <div style="background: white; padding: 40px; border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); max-width: 400px; width: 90%;">
+                <div style="text-align: center; margin-bottom: 30px;">
+                    <svg width="60" height="60" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin: 0 auto;">
+                        <rect width="40" height="40" rx="8" fill="#4F46E5"/>
+                        <path d="M12 14L20 22L28 14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M12 26H28" stroke="white" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                    <h1 style="margin: 20px 0 10px; color: #1a202c; font-size: 28px;">MailJaeger</h1>
+                    <p style="color: #718096; margin: 0;">Secure AI Email Processing</p>
+                </div>
+                <form id="loginForm" style="margin-top: 20px;">
+                    <div style="margin-bottom: 20px;">
+                        <label style="display: block; margin-bottom: 8px; color: #2d3748; font-weight: 500;">API Key</label>
+                        <input type="password" id="apiKeyInput" 
+                            placeholder="Enter your API key" 
+                            style="width: 100%; padding: 12px; border: 2px solid #e2e8f0; border-radius: 8px; font-size: 14px; box-sizing: border-box;"
+                            required
+                            autocomplete="off"
+                        />
+                        <p style="margin-top: 8px; font-size: 12px; color: #718096;">
+                            🔒 Stored for this session only
+                        </p>
+                    </div>
+                    <button type="submit" 
+                        style="width: 100%; padding: 12px; background: #4F46E5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s;"
+                        onmouseover="this.style.background='#4338ca'"
+                        onmouseout="this.style.background='#4F46E5'"
+                    >
+                        Sign In
+                    </button>
+                </form>
+                <div id="loginError" style="margin-top: 15px; padding: 12px; background: #fed7d7; color: #c53030; border-radius: 8px; display: none; font-size: 14px;"></div>
+            </div>
+        </div>
+    `;
+    
+    document.getElementById('loginForm').addEventListener('submit', handleLogin);
+}
+
+// Handle login
+async function handleLogin(e) {
+    e.preventDefault();
+    const keyInput = document.getElementById('apiKeyInput');
+    const errorDiv = document.getElementById('loginError');
+    const key = keyInput.value.trim();
+    
+    if (!key) {
+        errorDiv.textContent = 'Please enter an API key';
+        errorDiv.style.display = 'block';
+        return;
+    }
+    
+    // Test the key by trying to access dashboard
+    apiKey = key;
+    try {
+        const response = await fetch(`${API_BASE}/api/dashboard`, {
+            headers: getAuthHeaders()
+        });
+        
+        if (response.ok) {
+            // Store in sessionStorage (cleared when tab/browser closes)
+            sessionStorage.setItem('mailjaeger_api_key', key);
+            location.reload();
+        } else {
+            apiKey = '';
+            errorDiv.textContent = 'Invalid API key. Please try again.';
+            errorDiv.style.display = 'block';
+            keyInput.value = '';
+            keyInput.focus();
+        }
+    } catch (error) {
+        apiKey = '';
+        errorDiv.textContent = 'Connection error. Please try again.';
+        errorDiv.style.display = 'block';
     }
 }
 
@@ -82,9 +144,9 @@ function getAuthHeaders() {
 // Handle authentication errors
 function handleAuthError(response) {
     if (response.status === 401) {
-        localStorage.removeItem('mailjaeger_api_key');
+        sessionStorage.removeItem('mailjaeger_api_key');
         apiKey = '';
-        showError('Authentifizierung fehlgeschlagen. Bitte Seite neu laden.');
+        showError('Session expired. Reloading...');
         setTimeout(() => location.reload(), 2000);
         return true;
     }

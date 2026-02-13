@@ -27,6 +27,8 @@ from src.services.search_service import SearchService
 from src.services.learning_service import LearningService
 from src.services.email_processor import EmailProcessor
 from src.middleware.auth import require_authentication, AuthenticationError
+from src.middleware.security_headers import SecurityHeadersMiddleware
+from src.middleware.rate_limiting import limiter, rate_limit_exceeded_handler
 from src.utils.logging import setup_logging, get_logger
 
 # Setup logging
@@ -52,11 +54,17 @@ app = FastAPI(
     title="MailJaeger",
     description="Local AI-powered email processing system (Secure)",
     version="1.0.0",
-    docs_url="/api/docs" if settings.api_key else "/docs",
-    redoc_url="/api/redoc" if settings.api_key else "/redoc"
+    docs_url="/api/docs",
+    redoc_url="/api/redoc"
 )
 
-# Mount static files (frontend)
+# Add security headers middleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Add rate limiting state
+app.state.limiter = limiter
+
+# Mount static files (frontend) - will be protected by requiring auth for root
 frontend_dir = Path(__file__).parent.parent / "frontend"
 if frontend_dir.exists():
     app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
@@ -68,11 +76,16 @@ logger.info(f"CORS enabled for origins: {cors_origins}")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
-    allow_credentials=True,
+    allow_credentials=False,  # Don't use credentials with CORS (using Bearer tokens instead)
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     max_age=600,  # Cache preflight requests for 10 minutes
 )
+
+
+# Rate limit exceeded handler
+from slowapi.errors import RateLimitExceeded
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 
 
 # Exception handlers for better error responses
@@ -122,8 +135,16 @@ async def startup_event():
     logger.info(f"Server: {settings.server_host}:{settings.server_port}")
     logger.info(f"Debug mode: {settings.debug}")
     logger.info(f"Safe mode: {settings.safe_mode}")
-    logger.info(f"API authentication: {'ENABLED' if settings.api_key else 'DISABLED (WARNING!)'}")
+    
+    # Check API keys
+    api_keys = settings.get_api_keys()
+    if api_keys:
+        logger.info(f"API authentication: ENABLED ({len(api_keys)} key(s) configured)")
+    else:
+        logger.warning("API authentication: DISABLED - No API keys configured!")
+    
     logger.info(f"CORS origins: {cors_origins}")
+    logger.info(f"Trust proxy: {settings.trust_proxy}")
     logger.info("=" * 60)
     
     # Create data directories
@@ -167,17 +188,54 @@ async def shutdown_event():
 
 
 @app.get("/")
-async def root():
-    """Serve frontend dashboard"""
+async def root(request: Request):
+    """Serve frontend dashboard - requires authentication"""
+    settings = get_settings()
+    api_keys = settings.get_api_keys()
+    
+    # If auth is configured, check it
+    if api_keys:
+        # Check Authorization header
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            # Return 401 to prompt for authentication
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "detail": "Authentication required",
+                    "message": "Please provide a valid API key in the Authorization header"
+                },
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+        
+        # Verify token
+        try:
+            token = auth_header.split(" ", 1)[1]
+            import secrets
+            if not any(secrets.compare_digest(token, key) for key in api_keys):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid authentication token"},
+                    headers={"WWW-Authenticate": "Bearer"}
+                )
+        except IndexError:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Malformed authentication token"},
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+    
+    # Serve frontend
     frontend_file = Path(__file__).parent.parent / "frontend" / "index.html"
     if frontend_file.exists():
         return FileResponse(frontend_file)
+    
     return {
         "name": "MailJaeger",
         "version": "1.0.0",
         "status": "running",
-        "message": "Frontend not found. Access API at /docs",
-        "authentication": "required" if settings.api_key else "disabled"
+        "message": "Frontend not found. Access API at /api/docs",
+        "authentication": "required" if api_keys else "disabled"
     }
 
 
@@ -235,13 +293,15 @@ async def get_dashboard(db: Session = Depends(get_db)):
 
 
 @app.post("/api/emails/search", response_model=List[EmailResponse], dependencies=[Depends(require_authentication)])
+@limiter.limit("30/minute")  # Rate limit expensive search operations
 async def search_emails(
-    request: SearchRequest,
+    request: Request,
+    search_request: SearchRequest,
     db: Session = Depends(get_db)
 ):
     """Search emails with filters"""
     try:
-        if request.semantic:
+        if search_request.semantic:
             # Semantic search (placeholder for future implementation)
             # Would use sentence-transformers for embedding-based search
             logger.info("Semantic search requested (not yet implemented)")
@@ -249,14 +309,14 @@ async def search_emails(
         # Full-text search
         search_service = SearchService(db)
         results = search_service.search(
-            query=request.query,
-            category=request.category.value if request.category else None,
-            priority=request.priority.value if request.priority else None,
-            action_required=request.action_required,
-            date_from=request.date_from.isoformat() if request.date_from else None,
-            date_to=request.date_to.isoformat() if request.date_to else None,
-            page=request.page,
-            page_size=request.page_size
+            query=search_request.query,
+            category=search_request.category.value if search_request.category else None,
+            priority=search_request.priority.value if search_request.priority else None,
+            action_required=search_request.action_required,
+            date_from=search_request.date_from.isoformat() if search_request.date_from else None,
+            date_to=search_request.date_to.isoformat() if search_request.date_to else None,
+            page=search_request.page,
+            page_size=search_request.page_size
         )
         
         return [EmailResponse.from_orm(email) for email in results['results']]
@@ -270,8 +330,10 @@ async def search_emails(
 
 
 @app.post("/api/emails/list", response_model=List[EmailResponse], dependencies=[Depends(require_authentication)])
+@limiter.limit("60/minute")  # Rate limit list operations
 async def list_emails(
-    request: EmailListRequest,
+    request: Request,
+    email_request: EmailListRequest,
     db: Session = Depends(get_db)
 ):
     """List emails with filters"""
@@ -279,37 +341,37 @@ async def list_emails(
         query = db.query(ProcessedEmail)
         
         # Apply filters
-        if request.action_required is not None:
-            query = query.filter(ProcessedEmail.action_required == request.action_required)
-        if request.priority:
-            query = query.filter(ProcessedEmail.priority == request.priority.value)
-        if request.category:
-            query = query.filter(ProcessedEmail.category == request.category.value)
-        if request.is_spam is not None:
-            query = query.filter(ProcessedEmail.is_spam == request.is_spam)
-        if request.is_resolved is not None:
-            query = query.filter(ProcessedEmail.is_resolved == request.is_resolved)
-        if request.date_from:
-            query = query.filter(ProcessedEmail.date >= request.date_from)
-        if request.date_to:
-            query = query.filter(ProcessedEmail.date <= request.date_to)
+        if email_request.action_required is not None:
+            query = query.filter(ProcessedEmail.action_required == email_request.action_required)
+        if email_request.priority:
+            query = query.filter(ProcessedEmail.priority == email_request.priority.value)
+        if email_request.category:
+            query = query.filter(ProcessedEmail.category == email_request.category.value)
+        if email_request.is_spam is not None:
+            query = query.filter(ProcessedEmail.is_spam == email_request.is_spam)
+        if email_request.is_resolved is not None:
+            query = query.filter(ProcessedEmail.is_resolved == email_request.is_resolved)
+        if email_request.date_from:
+            query = query.filter(ProcessedEmail.date >= email_request.date_from)
+        if email_request.date_to:
+            query = query.filter(ProcessedEmail.date <= email_request.date_to)
         
         # Sorting
-        if request.sort_by == "date":
+        if email_request.sort_by == "date":
             sort_col = ProcessedEmail.date
-        elif request.sort_by == "priority":
+        elif email_request.sort_by == "priority":
             sort_col = ProcessedEmail.priority
         else:
             sort_col = ProcessedEmail.subject
         
-        if request.sort_order == "desc":
+        if email_request.sort_order == "desc":
             query = query.order_by(sort_col.desc())
         else:
             query = query.order_by(sort_col.asc())
         
         # Pagination
-        offset = (request.page - 1) * request.page_size
-        emails = query.offset(offset).limit(request.page_size).all()
+        offset = (email_request.page - 1) * email_request.page_size
+        emails = query.offset(offset).limit(email_request.page_size).all()
         
         return [EmailResponse.from_orm(email) for email in emails]
     
@@ -356,8 +418,10 @@ async def mark_email_resolved(
 
 
 @app.post("/api/processing/trigger", dependencies=[Depends(require_authentication)])
+@limiter.limit("5/minute")  # Strict rate limit on manual processing trigger
 async def trigger_processing(
-    request: TriggerRunRequest,
+    request: Request,
+    trigger_request: TriggerRunRequest,
     db: Session = Depends(get_db)
 ):
     """Manually trigger email processing"""
