@@ -44,7 +44,6 @@ RUN mkdir -p /app/data /app/data/logs /app/data/search_index /app/data/attachmen
 ENV PYTHONPATH=/app
 
 # Default server configuration (can be overridden via environment variables)
-ENV SERVER_HOST=0.0.0.0
 ENV SERVER_PORT=8000
 
 # Expose port (default localhost binding is in config)
