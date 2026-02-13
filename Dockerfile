@@ -54,4 +54,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:8000/api/health || exit 1
 
 # Run application using Python module syntax with configurable host/port
-CMD python -m uvicorn src.main:app --host ${SERVER_HOST} --port ${SERVER_PORT}
+# Default to localhost (127.0.0.1) if SERVER_HOST is not set for safety
+CMD python -m uvicorn src.main:app --host ${SERVER_HOST:-127.0.0.1} --port ${SERVER_PORT}

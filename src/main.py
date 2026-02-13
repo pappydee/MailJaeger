@@ -494,11 +494,10 @@ async def get_processing_run(run_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/settings", dependencies=[Depends(require_authentication)])
 async def get_settings_api():
-    """Get current settings (sanitized)"""
+    """Get current settings (sanitized - no sensitive credentials)"""
     return {
         "imap_host": settings.imap_host,
         "imap_port": settings.imap_port,
-        "imap_username": settings.imap_username,
         "spam_threshold": settings.spam_threshold,
         "ai_endpoint": settings.ai_endpoint,
         "ai_model": settings.ai_model,

@@ -37,9 +37,9 @@ def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials]) -> bool:
     settings = get_settings()
     api_keys = settings.get_api_keys()
     
-    # If no API keys configured, allow access (with warning logged at startup)
+    # Fail-closed: If no API keys configured, deny access
     if not api_keys:
-        return True
+        return False
     
     # Require credentials if API keys are configured
     if not credentials:
@@ -66,9 +66,19 @@ async def require_authentication(
     settings = get_settings()
     api_keys = settings.get_api_keys()
     
-    # Skip auth check if no API keys configured (already warned at startup)
-    if not api_keys:
+    # Define explicit allowlist of unauthenticated routes
+    UNAUTHENTICATED_ROUTES = {
+        "/api/health",
+    }
+    
+    # Allow unauthenticated access only to explicitly allowed routes
+    if request.url.path in UNAUTHENTICATED_ROUTES:
         return
+    
+    # Fail-closed: If no API keys configured, deny all access except allowlist
+    if not api_keys:
+        logger.error(f"No API keys configured - denying access to {request.url.path}")
+        raise AuthenticationError("Authentication required but no API keys configured")
     
     # Get credentials from header
     auth_header = request.headers.get("Authorization")
@@ -82,7 +92,7 @@ async def require_authentication(
     except IndexError:
         raise AuthenticationError("Malformed authentication token")
     
-    # Verify token against all valid API keys
+    # Verify token against all valid API keys using constant-time comparison
     if not any(secrets.compare_digest(token, key) for key in api_keys):
         logger.warning(f"Failed authentication attempt for {request.url.path} from {request.client.host if request.client else 'unknown'}")
         raise AuthenticationError("Invalid authentication token")
