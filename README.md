@@ -106,6 +106,22 @@ ollama serve
 
 ### 4. Configure Environment
 
+**Quick Security Setup (Recommended):**
+
+```bash
+# Run interactive security setup script
+./setup-security.sh
+```
+
+This will:
+- Generate a secure API key
+- Create `.env` file from template
+- Set up IMAP credentials
+- Create secrets directory for Docker
+- Set secure file permissions
+
+**Manual Configuration:**
+
 ```bash
 # Copy example configuration
 cp .env.example .env
@@ -113,6 +129,8 @@ cp .env.example .env
 # Edit configuration
 nano .env
 ```
+
+**For detailed security configuration, see [SECURITY_GUIDE.md](SECURITY_GUIDE.md)**
 
 **Essential Configuration:**
 
