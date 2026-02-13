@@ -3,9 +3,12 @@ FastAPI application for MailJaeger
 """
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
+from pathlib import Path
 
 from src.config import get_settings
 from src.database.connection import init_db, get_db
@@ -33,6 +36,11 @@ app = FastAPI(
     description="Local AI-powered email processing system",
     version="1.0.0"
 )
+
+# Mount static files (frontend)
+frontend_dir = Path(__file__).parent.parent / "frontend"
+if frontend_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
 
 # CORS
 app.add_middleware(
@@ -74,11 +82,15 @@ async def shutdown_event():
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
+    """Serve frontend dashboard"""
+    frontend_file = Path(__file__).parent.parent / "frontend" / "index.html"
+    if frontend_file.exists():
+        return FileResponse(frontend_file)
     return {
         "name": "MailJaeger",
         "version": "1.0.0",
-        "status": "running"
+        "status": "running",
+        "message": "Frontend not found. Access API at /docs"
     }
 
 

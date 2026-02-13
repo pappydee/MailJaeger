@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MailJaeger - AI Email Processing Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <rect width="40" height="40" rx="8" fill="#4F46E5"/>
+                    <path d="M12 14L20 22L28 14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M12 26H28" stroke="white" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+                <h1>MailJaeger</h1>
+            </div>
+            <div class="header-actions">
+                <button id="triggerProcessing" class="btn btn-primary">
+                    <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                        <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
+                        <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/>
+                    </svg>
+                    Jetzt verarbeiten
+                </button>
+                <div class="health-indicator" id="healthStatus">
+                    <span class="status-dot"></span>
+                    <span class="status-text">System-Check läuft...</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Dashboard Stats -->
+        <div class="dashboard-stats" id="dashboardStats">
+            <div class="stat-card">
+                <div class="stat-icon" style="background: #EEF2FF;">
+                    <svg width="24" height="24" fill="#4F46E5" viewBox="0 0 16 16">
+                        <path d="M0 4a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V4zm2-1a1 1 0 0 0-1 1v.217l7 4.2 7-4.2V4a1 1 0 0 0-1-1H2zm13 2.383-4.758 2.855L15 11.114v-5.73zm-.034 6.878L9.271 8.82 8 9.583 6.728 8.82l-5.694 3.44A1 1 0 0 0 2 13h12a1 1 0 0 0 .966-.739zM1 11.114l4.758-2.876L1 5.383v5.73z"/>
+                    </svg>
+                </div>
+                <div class="stat-content">
+                    <div class="stat-label">Emails gesamt</div>
+                    <div class="stat-value" id="totalEmails">-</div>
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-icon" style="background: #FEF3C7;">
+                    <svg width="24" height="24" fill="#D97706" viewBox="0 0 16 16">
+                        <path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/>
+                        <path d="M7.002 11a1 1 0 1 1 2 0 1 1 0 0 1-2 0zM7.1 4.995a.905.905 0 1 1 1.8 0l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 4.995z"/>
+                    </svg>
+                </div>
+                <div class="stat-content">
+                    <div class="stat-label">Aktion erforderlich</div>
+                    <div class="stat-value" id="actionRequired">-</div>
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-icon" style="background: #DBEAFE;">
+                    <svg width="24" height="24" fill="#2563EB" viewBox="0 0 16 16">
+                        <path d="M8 16a2 2 0 0 0 2-2H6a2 2 0 0 0 2 2zM8 1.918l-.797.161A4.002 4.002 0 0 0 4 6c0 .628-.134 2.197-.459 3.742-.16.767-.376 1.566-.663 2.258h10.244c-.287-.692-.502-1.49-.663-2.258C12.134 8.197 12 6.628 12 6a4.002 4.002 0 0 0-3.203-3.92L8 1.917zM14.22 12c.223.447.481.801.78 1H1c.299-.199.557-.553.78-1C2.68 10.2 3 6.88 3 6c0-2.42 1.72-4.44 4.005-4.901a1 1 0 1 1 1.99 0A5.002 5.002 0 0 1 13 6c0 .88.32 4.2 1.22 6z"/>
+                    </svg>
+                </div>
+                <div class="stat-content">
+                    <div class="stat-label">Unbearbeitet</div>
+                    <div class="stat-value" id="unresolvedCount">-</div>
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-icon" style="background: #FEE2E2;">
+                    <svg width="24" height="24" fill="#DC2626" viewBox="0 0 16 16">
+                        <path d="M2 2a2 2 0 0 0-2 2v8.01A2 2 0 0 0 2 14h5.5a.5.5 0 0 0 0-1H2a1 1 0 0 1-.966-.741l5.64-3.471L8 9.583l7-4.2V8.5a.5.5 0 0 0 1 0V4a2 2 0 0 0-2-2H2zm3.708 6.208L1 11.105V5.383l4.708 2.825zM1 4.217V4a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v.217l-7 4.2-7-4.2z"/>
+                        <path d="M14.247 14.269c1.01 0 1.587-.857 1.587-2.025v-.21C15.834 10.43 14.64 9 12.52 9h-.035C10.42 9 9 10.36 9 12.432v.214C9 14.82 10.438 16 12.358 16h.044c.594 0 1.018-.074 1.237-.175v-.73c-.245.11-.673.18-1.18.18h-.044c-1.334 0-2.571-.788-2.571-2.655v-.157c0-1.657 1.058-2.724 2.64-2.724h.04c1.535 0 2.484 1.05 2.484 2.326v.118c0 .975-.324 1.39-.639 1.39-.232 0-.41-.148-.41-.42v-2.19h-.906v.569h-.03c-.084-.298-.368-.63-.954-.63-.778 0-1.259.555-1.259 1.4v.528c0 .892.49 1.434 1.26 1.434.471 0 .896-.227 1.014-.643h.043c.118.42.617.648 1.12.648zm-2.453-1.588v-.227c0-.546.227-.791.573-.791.297 0 .572.192.572.708v.367c0 .573-.253.744-.564.744-.354 0-.581-.215-.581-.8z"/>
+                    </svg>
+                </div>
+                <div class="stat-content">
+                    <div class="stat-label">Spam gefiltert</div>
+                    <div class="stat-value" id="spamFiltered">-</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Last Run Info -->
+        <div class="info-section" id="lastRunInfo">
+            <div class="info-header">
+                <h2>Letzte Verarbeitung</h2>
+                <span class="info-time" id="lastRunTime">-</span>
+            </div>
+            <div class="info-details">
+                <div class="info-item">
+                    <span class="info-label">Status:</span>
+                    <span class="info-badge" id="lastRunStatus">-</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Verarbeitet:</span>
+                    <span id="lastRunProcessed">-</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Nächster Lauf:</span>
+                    <span id="nextRunTime">-</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Filters -->
+        <div class="filters">
+            <div class="filter-group">
+                <label>Filter nach:</label>
+                <select id="filterCategory" class="filter-select">
+                    <option value="">Alle Kategorien</option>
+                    <option value="Klinik">Klinik</option>
+                    <option value="Forschung">Forschung</option>
+                    <option value="Privat">Privat</option>
+                    <option value="Verwaltung">Verwaltung</option>
+                    <option value="Unklar">Unklar</option>
+                </select>
+                <select id="filterPriority" class="filter-select">
+                    <option value="">Alle Prioritäten</option>
+                    <option value="HIGH">Hoch</option>
+                    <option value="MEDIUM">Mittel</option>
+                    <option value="LOW">Niedrig</option>
+                </select>
+                <select id="filterAction" class="filter-select">
+                    <option value="">Alle</option>
+                    <option value="true">Aktion erforderlich</option>
+                    <option value="false">Keine Aktion</option>
+                </select>
+            </div>
+            <button id="applyFilters" class="btn btn-secondary">Filter anwenden</button>
+        </div>
+
+        <!-- Email List -->
+        <div class="email-list" id="emailList">
+            <div class="loading">Lade Emails...</div>
+        </div>
+
+        <!-- Email Detail Modal -->
+        <div class="modal" id="emailModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 id="modalSubject"></h2>
+                    <button class="modal-close" id="closeModal">&times;</button>
+                </div>
+                <div class="modal-body" id="modalBody">
+                    <!-- Email details will be loaded here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
