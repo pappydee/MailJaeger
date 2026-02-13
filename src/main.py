@@ -127,8 +127,15 @@ async def startup_event():
     logger.info("=" * 60)
     
     # Create data directories
+    from pathlib import Path
+    from urllib.parse import urlparse
+    
+    # Extract database directory from URL
+    db_path = Path(settings.database_url.replace("sqlite:///", ""))
+    db_dir = db_path.parent if db_path.name else db_path
+    
     for directory in [
-        Path(settings.database_url.replace("sqlite:///", "").replace("/mailjaeger.db", "")),
+        db_dir,
         settings.search_index_dir,
         settings.attachment_dir,
         settings.log_file.parent if settings.log_file else None

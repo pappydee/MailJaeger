@@ -50,7 +50,13 @@ async function checkAuthRequired() {
 
 // Prompt user for API key
 function promptForApiKey() {
-    const key = prompt('API-Schlüssel erforderlich:\n\nBitte geben Sie Ihren API-Schlüssel ein (Bearer Token):');
+    // Note: Using prompt() for simplicity. In production, consider a proper modal dialog.
+    // For self-hosted local deployment, this is acceptable as the key is only stored locally.
+    const key = prompt(
+        'API-Schlüssel erforderlich:\n\n' +
+        'Bitte geben Sie Ihren API-Schlüssel ein (Bearer Token):\n\n' +
+        'Hinweis: Der Schlüssel wird nur lokal in Ihrem Browser gespeichert.'
+    );
     if (key) {
         apiKey = key.trim();
         localStorage.setItem('mailjaeger_api_key', apiKey);

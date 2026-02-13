@@ -3,6 +3,7 @@ AI analysis service for email processing
 """
 import logging
 import json
+import re
 from typing import Dict, Any, Optional, List
 import httpx
 from bs4 import BeautifulSoup
@@ -212,7 +213,8 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
         str_value = str(value)[:max_length]
         
         # Basic sanitization - remove control characters except newlines/tabs
-        sanitized = ''.join(char for char in str_value if char.isprintable() or char in '\n\t')
+        # Using regex for better performance on large strings
+        sanitized = re.sub(r'[^\x20-\x7E\n\t]', '', str_value)
         
         return sanitized.strip()
     

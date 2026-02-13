@@ -94,6 +94,8 @@ services:
       start_period: 40s
     
     # Security: Run as non-root user
+    # Note: Adjust UID/GID if needed for your host system
+    # Use `id -u` and `id -g` on host to get your UID/GID
     user: "1000:1000"
 
 volumes:

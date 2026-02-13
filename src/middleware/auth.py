@@ -1,6 +1,7 @@
 """
 Authentication middleware for MailJaeger
 """
+import secrets
 from fastapi import Request, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
@@ -43,8 +44,9 @@ def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials]) -> bool:
     if not credentials:
         return False
     
-    # Verify token matches configured API key
-    return credentials.credentials == settings.api_key
+    # Verify token matches configured API key using constant-time comparison
+    # to prevent timing attacks
+    return secrets.compare_digest(credentials.credentials, settings.api_key)
 
 
 async def require_authentication(
@@ -78,7 +80,7 @@ async def require_authentication(
         raise AuthenticationError("Malformed authentication token")
     
     # Verify token
-    if token != settings.api_key:
+    if not secrets.compare_digest(token, settings.api_key):
         logger.warning(f"Failed authentication attempt for {request.url.path}")
         raise AuthenticationError("Invalid authentication token")
     

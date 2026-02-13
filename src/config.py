@@ -2,10 +2,9 @@
 Configuration management for MailJaeger
 """
 from pydantic_settings import BaseSettings
-from pydantic import Field, validator, field_validator
+from pydantic import Field, field_validator
 from typing import Optional, List
 import os
-import secrets
 from pathlib import Path
 
 
@@ -149,15 +148,15 @@ class Settings(BaseSettings):
     
     @field_validator('cors_origins')
     @classmethod
-    def parse_cors_origins(cls, v: str) -> List[str]:
-        """Parse comma-separated CORS origins"""
+    def validate_cors_origins(cls, v: str) -> List[str]:
+        """Validate and parse comma-separated CORS origins"""
         if not v:
             return ["http://localhost:8000", "http://127.0.0.1:8000"]
         return [origin.strip() for origin in v.split(',') if origin.strip()]
     
     @field_validator('api_key')
     @classmethod
-    def validate_api_key(cls, v: str, info) -> str:
+    def validate_api_key(cls, v: str) -> str:
         """Validate API key in production mode"""
         # Allow empty in debug mode, but warn
         if not v:

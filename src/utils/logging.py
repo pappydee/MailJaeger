@@ -23,29 +23,44 @@ class SensitiveDataFilter(logging.Filter):
         (re.compile(r'(token["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
         (re.compile(r'(secret["\s:=]+)[^\s,}\]]+', re.IGNORECASE), r'\1[REDACTED]'),
         # Email body patterns (to avoid logging full email content)
-        (re.compile(r'(body_plain["\s:=]+)[^\s]{200,}', re.IGNORECASE), r'\1[EMAIL_BODY_REDACTED]'),
-        (re.compile(r'(body_html["\s:=]+)[^\s]{200,}', re.IGNORECASE), r'\1[EMAIL_BODY_REDACTED]'),
+        # Using [\s\S] to match any character including newlines
+        (re.compile(r'(body_plain["\s:=]+)[\s\S]{200,}', re.IGNORECASE), r'\1[EMAIL_BODY_REDACTED]'),
+        (re.compile(r'(body_html["\s:=]+)[\s\S]{200,}', re.IGNORECASE), r'\1[EMAIL_BODY_REDACTED]'),
     ]
     
     def filter(self, record: logging.LogRecord) -> bool:
         """Filter log record to remove sensitive data"""
         if record.msg:
-            msg = str(record.msg)
-            for pattern, replacement in self.SENSITIVE_PATTERNS:
-                msg = pattern.sub(replacement, msg)
-            record.msg = msg
+            record.msg = self._redact_message(str(record.msg))
         
         # Also filter args if present
         if record.args:
+            record.args = self._redact_args(record.args)
+        
+        return True
+    
+    def _redact_message(self, msg: str) -> str:
+        """Redact sensitive patterns from message"""
+        for pattern, replacement in self.SENSITIVE_PATTERNS:
+            msg = pattern.sub(replacement, msg)
+        return msg
+    
+    def _redact_args(self, args):
+        """Redact sensitive patterns from log arguments"""
+        if isinstance(args, tuple):
             filtered_args = []
-            for arg in record.args if isinstance(record.args, tuple) else [record.args]:
+            for arg in args:
                 arg_str = str(arg)
                 for pattern, replacement in self.SENSITIVE_PATTERNS:
                     arg_str = pattern.sub(replacement, arg_str)
                 filtered_args.append(arg_str)
-            record.args = tuple(filtered_args) if len(filtered_args) > 1 else filtered_args[0] if filtered_args else ()
-        
-        return True
+            return tuple(filtered_args)
+        elif args:
+            arg_str = str(args)
+            for pattern, replacement in self.SENSITIVE_PATTERNS:
+                arg_str = pattern.sub(replacement, arg_str)
+            return arg_str
+        return args
 
 
 def setup_logging(log_file: Optional[Path] = None, log_level: str = "INFO"):
