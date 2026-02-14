@@ -59,57 +59,6 @@ app = FastAPI(
     redoc_url="/api/redoc"
 )
 
-# Request size limit (10MB default for API requests)
-# This prevents large payload attacks
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request as StarletteRequest
-from starlette.responses import Response as StarletteResponse
-
-class RequestSizeLimiterMiddleware(BaseHTTPMiddleware):
-    """Middleware to limit request body size"""
-    def __init__(self, app, max_size: int = 10 * 1024 * 1024):  # 10MB default
-        super().__init__(app)
-        self.max_size = max_size
-    
-    async def dispatch(self, request: StarletteRequest, call_next):
-        """Check request size before processing"""
-        # Check Content-Length header if present
-        content_length = request.headers.get("content-length")
-        if content_length:
-            if int(content_length) > self.max_size:
-                return JSONResponse(
-                    status_code=413,
-                    content={"detail": f"Request body too large. Maximum size: {self.max_size} bytes"}
-                )
-        return await call_next(request)
-
-app.add_middleware(RequestSizeLimiterMiddleware, max_size=10 * 1024 * 1024)
-
-# Add security headers middleware
-app.add_middleware(SecurityHeadersMiddleware)
-
-# Add rate limiting state
-app.state.limiter = limiter
-
-# Mount static files (frontend) - will be protected by global auth middleware
-frontend_dir = Path(__file__).parent.parent / "frontend"
-if frontend_dir.exists():
-    app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
-
-# CORS - Restrictive configuration
-cors_origins = settings.cors_origins if isinstance(settings.cors_origins, list) else ["http://localhost:8000", "http://127.0.0.1:8000"]
-logger.info(f"CORS enabled for origins: {cors_origins}")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=False,  # Don't use credentials with CORS (using Bearer tokens instead)
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
-    max_age=600,  # Cache preflight requests for 10 minutes
-)
-
-
 # Global authentication middleware (fail-closed)
 # This enforces authentication for ALL routes except explicit allowlist
 @app.middleware("http")
@@ -169,6 +118,57 @@ async def global_auth_middleware(request: Request, call_next):
     # Authentication successful, log and proceed
     logger.debug(f"Authenticated request to {request.url.path}")
     return await call_next(request)
+
+
+# Request size limit (10MB default for API requests)
+# This prevents large payload attacks
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
+
+class RequestSizeLimiterMiddleware(BaseHTTPMiddleware):
+    """Middleware to limit request body size"""
+    def __init__(self, app, max_size: int = 10 * 1024 * 1024):  # 10MB default
+        super().__init__(app)
+        self.max_size = max_size
+    
+    async def dispatch(self, request: StarletteRequest, call_next):
+        """Check request size before processing"""
+        # Check Content-Length header if present
+        content_length = request.headers.get("content-length")
+        if content_length:
+            if int(content_length) > self.max_size:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": f"Request body too large. Maximum size: {self.max_size} bytes"}
+                )
+        return await call_next(request)
+
+app.add_middleware(RequestSizeLimiterMiddleware, max_size=10 * 1024 * 1024)
+
+# Add security headers middleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Add rate limiting state
+app.state.limiter = limiter
+
+# Mount static files (frontend) - will be protected by global auth middleware
+frontend_dir = Path(__file__).parent.parent / "frontend"
+if frontend_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
+
+# CORS - Restrictive configuration
+cors_origins = settings.cors_origins if isinstance(settings.cors_origins, list) else ["http://localhost:8000", "http://127.0.0.1:8000"]
+logger.info(f"CORS enabled for origins: {cors_origins}")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=False,  # Don't use credentials with CORS (using Bearer tokens instead)
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    max_age=600,  # Cache preflight requests for 10 minutes
+)
 
 
 # Rate limit exceeded handler
