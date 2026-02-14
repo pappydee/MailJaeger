@@ -35,6 +35,10 @@ class Settings(BaseSettings):
         description="Server bind address (use 127.0.0.1 for local-only, 0.0.0.0 for external)"
     )
     server_port: int = Field(default=8000, description="Server port")
+    allowed_hosts: str = Field(
+        default="",
+        description="Comma-separated list of allowed host headers (leave empty for no restriction)"
+    )
     
     # CORS Configuration
     cors_origins: str = Field(
@@ -131,6 +135,10 @@ class Settings(BaseSettings):
         default=True,
         description="Safe mode - prevents destructive IMAP actions (dry-run)"
     )
+    require_approval: bool = Field(
+        default=False,
+        description="Require approval before applying IMAP actions - enqueues PendingActions instead of immediate execution"
+    )
     mark_as_read: bool = Field(
         default=False,
         description="Mark processed emails as read"
@@ -221,6 +229,21 @@ class Settings(BaseSettings):
     def validate_required_settings(self):
         """Validate that required settings are present"""
         errors = []
+        
+        # Check for production debug guard - prevent DEBUG=true in web-exposed deployments
+        # Web-exposed means: accessible from internet (0.0.0.0), behind proxy, or has allowed hosts set
+        is_web_exposed = (
+            self.server_host == "0.0.0.0" or 
+            self.trust_proxy or
+            (self.allowed_hosts and self.allowed_hosts.strip())
+        )
+        
+        if self.debug and is_web_exposed:
+            errors.append(
+                "DEBUG must be false in production/web-exposed deployments. "
+                "Running with DEBUG=true exposes sensitive information in logs and API responses. "
+                "Set DEBUG=false when SERVER_HOST=0.0.0.0, TRUST_PROXY=true, or ALLOWED_HOSTS is set."
+            )
         
         # Check IMAP credentials
         if not self.imap_host:

@@ -145,3 +145,38 @@ class SettingsUpdate(BaseModel):
     learning_confidence_threshold: Optional[float] = Field(None, ge=0.0, le=1.0)
     store_email_body: Optional[bool] = None
     store_attachments: Optional[bool] = None
+
+
+class PendingActionStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    APPLIED = "APPLIED"
+    FAILED = "FAILED"
+
+
+class PendingActionResponse(BaseModel):
+    id: int
+    email_id: int
+    action_type: str
+    target_folder: Optional[str] = None
+    status: str
+    created_at: datetime
+    approved_at: Optional[datetime] = None
+    applied_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
+
+
+class PendingActionWithEmailResponse(PendingActionResponse):
+    email: EmailResponse
+
+
+class ApproveActionRequest(BaseModel):
+    approve: bool = True
+
+
+class ApplyActionsRequest(BaseModel):
+    dry_run: bool = False

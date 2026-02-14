@@ -18,9 +18,11 @@ from src.database.connection import init_db, get_db
 from src.models.schemas import (
     EmailResponse, EmailDetailResponse, DashboardResponse,
     ProcessingRunResponse, EmailListRequest, SearchRequest,
-    MarkResolvedRequest, TriggerRunRequest, SettingsUpdate
+    MarkResolvedRequest, TriggerRunRequest, SettingsUpdate,
+    PendingActionResponse, PendingActionWithEmailResponse,
+    ApproveActionRequest, ApplyActionsRequest
 )
-from src.models.database import ProcessedEmail, ProcessingRun
+from src.models.database import ProcessedEmail, ProcessingRun, PendingAction
 from src.services.scheduler import get_scheduler
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
@@ -31,6 +33,7 @@ from src.middleware.auth import require_authentication, AuthenticationError
 from src.middleware.security_headers import SecurityHeadersMiddleware
 from src.middleware.rate_limiting import limiter, rate_limit_exceeded_handler
 from src.utils.logging import setup_logging, get_logger
+from src.utils.error_handling import sanitize_error
 
 # Setup logging
 setup_logging()
@@ -41,12 +44,16 @@ try:
     settings = get_settings()
     settings.validate_required_settings()
 except ValueError as e:
-    logger.error(f"Configuration validation failed: {e}")
+    # Use sanitize_error to prevent credential leakage in logs
+    sanitized = sanitize_error(e, debug=False)
+    logger.error("Configuration validation failed: %s", sanitized)
     print(f"\n❌ Configuration Error:\n{e}\n", file=sys.stderr)
     print("Please check your .env file and environment variables.", file=sys.stderr)
     sys.exit(1)
 except Exception as e:
-    logger.error(f"Failed to load configuration: {e}")
+    # Use sanitize_error to prevent credential leakage in logs
+    sanitized = sanitize_error(e, debug=False)
+    logger.error("Failed to load configuration: %s", sanitized)
     print(f"\n❌ Configuration Error: {e}\n", file=sys.stderr)
     sys.exit(1)
 
@@ -203,10 +210,17 @@ async def auth_exception_handler(request: Request, exc: AuthenticationError):
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
     """Handle general exceptions with sanitized error messages"""
-    logger.error(f"Unhandled exception on {request.url.path}: {exc}", exc_info=True)
+    # Use sanitized error in logs to prevent credential leakage
+    sanitized_error = sanitize_error(exc, settings.debug)
+    
+    # In debug mode, include full trace; in production, use safe logging
+    if settings.debug:
+        logger.error("Unhandled exception on %s: %s", request.url.path, sanitized_error, exc_info=True)
+    else:
+        logger.error("Unhandled exception on %s: %s", request.url.path, sanitized_error)
     
     # Don't leak internal details in production
-    detail = str(exc) if settings.debug else "An internal error occurred"
+    detail = sanitized_error if settings.debug else "Internal server error"
     
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -337,10 +351,14 @@ async def get_dashboard(db: Session = Depends(get_db)):
         )
     
     except Exception as e:
-        logger.error(f"Dashboard error: {e}", exc_info=True)
+        sanitized_error = sanitize_error(e, settings.debug)
+        if settings.debug:
+            logger.error(f"Dashboard error: {sanitized_error}", exc_info=True)
+        else:
+            logger.error(f"Dashboard error: {sanitized_error}")
         raise HTTPException(
             status_code=500, 
-            detail="Failed to load dashboard" if not settings.debug else str(e)
+            detail="Failed to load dashboard" if not settings.debug else sanitized_error
         )
 
 
@@ -374,10 +392,14 @@ async def search_emails(
         return [EmailResponse.from_orm(email) for email in results['results']]
     
     except Exception as e:
-        logger.error(f"Search error: {e}", exc_info=True)
+        sanitized_error = sanitize_error(e, settings.debug)
+        if settings.debug:
+            logger.error(f"Search error: {sanitized_error}", exc_info=True)
+        else:
+            logger.error(f"Search error: {sanitized_error}")
         raise HTTPException(
             status_code=500, 
-            detail="Search failed" if not settings.debug else str(e)
+            detail="Search failed" if not settings.debug else sanitized_error
         )
 
 
@@ -428,10 +450,14 @@ async def list_emails(
         return [EmailResponse.from_orm(email) for email in emails]
     
     except Exception as e:
-        logger.error(f"List emails error: {e}", exc_info=True)
+        sanitized_error = sanitize_error(e, settings.debug)
+        if settings.debug:
+            logger.error(f"List emails error: {sanitized_error}", exc_info=True)
+        else:
+            logger.error(f"List emails error: {sanitized_error}")
         raise HTTPException(
             status_code=500,
-            detail="Failed to list emails" if not settings.debug else str(e)
+            detail="Failed to list emails" if not settings.debug else sanitized_error
         )
 
 
@@ -487,10 +513,14 @@ async def trigger_processing(
             return {"success": False, "message": "Processing already in progress"}
     
     except Exception as e:
-        logger.error(f"Trigger processing error: {e}", exc_info=True)
+        sanitized_error = sanitize_error(e, settings.debug)
+        if settings.debug:
+            logger.error(f"Trigger processing error: {sanitized_error}", exc_info=True)
+        else:
+            logger.error(f"Trigger processing error: {sanitized_error}")
         raise HTTPException(
             status_code=500,
-            detail="Failed to trigger processing" if not settings.debug else str(e)
+            detail="Failed to trigger processing" if not settings.debug else sanitized_error
         )
 
 
@@ -534,6 +564,7 @@ async def get_settings_api():
         "store_email_body": settings.store_email_body,
         "store_attachments": settings.store_attachments,
         "safe_mode": settings.safe_mode,
+        "require_approval": settings.require_approval,
         "mark_as_read": settings.mark_as_read
     }
 
@@ -547,6 +578,399 @@ async def update_settings_api(request: SettingsUpdate):
         "success": True,
         "message": "Settings update requires restart to take effect"
     }
+
+
+# Pending Actions API endpoints
+@app.get("/api/pending-actions", response_model=List[PendingActionWithEmailResponse], dependencies=[Depends(require_authentication)])
+async def list_pending_actions(
+    status: Optional[str] = Query(None, description="Filter by status (PENDING, APPROVED, REJECTED, APPLIED, FAILED)"),
+    db: Session = Depends(get_db)
+):
+    """List all pending actions with optional status filter"""
+    query = db.query(PendingAction)
+    
+    if status:
+        query = query.filter(PendingAction.status == status.upper())
+    
+    actions = query.order_by(PendingAction.created_at.desc()).all()
+    
+    return actions
+
+
+# NOTE: Preview route MUST be defined BEFORE {action_id} route to avoid routing collision
+# FastAPI matches routes in order, so /preview would match /{action_id} if defined after
+@app.get("/api/pending-actions/preview", dependencies=[Depends(require_authentication)])
+async def preview_pending_actions(db: Session = Depends(get_db)):
+    """Preview all approved pending actions (dry-run)"""
+    actions = db.query(PendingAction).filter(
+        PendingAction.status == "APPROVED"
+    ).all()
+    
+    preview = []
+    for action in actions:
+        email = db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+        preview.append({
+            "action_id": action.id,
+            "email_id": action.email_id,
+            "email_subject": email.subject if email else "Unknown",
+            "email_sender": email.sender if email else "Unknown",
+            "action_type": action.action_type,
+            "target_folder": action.target_folder,
+            "created_at": action.created_at,
+            "approved_at": action.approved_at
+        })
+    
+    return {
+        "success": True,
+        "count": len(preview),
+        "actions": preview
+    }
+
+
+@app.get("/api/pending-actions/{action_id}", response_model=PendingActionWithEmailResponse, dependencies=[Depends(require_authentication)])
+async def get_pending_action(action_id: int, db: Session = Depends(get_db)):
+    """Get a single pending action by ID"""
+    action = db.query(PendingAction).filter(PendingAction.id == action_id).first()
+    
+    if not action:
+        raise HTTPException(status_code=404, detail="Pending action not found")
+    
+    return PendingActionWithEmailResponse.from_orm(action)
+
+
+@app.post("/api/pending-actions/{action_id}/approve", dependencies=[Depends(require_authentication)])
+async def approve_pending_action(
+    action_id: int,
+    request: ApproveActionRequest,
+    db: Session = Depends(get_db)
+):
+    """Approve or reject a pending action"""
+    action = db.query(PendingAction).filter(PendingAction.id == action_id).first()
+    
+    if not action:
+        raise HTTPException(status_code=404, detail="Pending action not found")
+    
+    if action.status != "PENDING":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot approve action with status {action.status}"
+        )
+    
+    if request.approve:
+        action.status = "APPROVED"
+        action.approved_at = datetime.utcnow()
+        logger.info(f"Pending action {action_id} approved")
+    else:
+        action.status = "REJECTED"
+        action.approved_at = datetime.utcnow()  # Set timestamp for rejection too
+        logger.info(f"Pending action {action_id} rejected")
+    
+    db.commit()
+    
+    return {
+        "success": True,
+        "action_id": action_id,
+        "status": action.status
+    }
+
+
+@app.post("/api/pending-actions/apply", dependencies=[Depends(require_authentication)])
+async def apply_all_approved_actions(
+    request: ApplyActionsRequest = ApplyActionsRequest(),
+    db: Session = Depends(get_db)
+):
+    """Apply all approved pending actions to IMAP mailboxes"""
+    # Check SAFE_MODE first - it always wins
+    if settings.safe_mode:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "SAFE_MODE enabled; no actions applied",
+                "applied": 0,
+                "failed": 0
+            }
+        )
+    
+    # Get all approved actions
+    actions = db.query(PendingAction).filter(
+        PendingAction.status == "APPROVED"
+    ).all()
+    
+    if not actions:
+        return {
+            "success": True,
+            "message": "No approved actions to apply",
+            "applied": 0,
+            "failed": 0,
+            "actions": []
+        }
+    
+    if request.dry_run:
+        # Preview mode - just return what would be done
+        preview = []
+        for action in actions:
+            email = db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+            preview.append({
+                "action_id": action.id,
+                "email_id": action.email_id,
+                "email_subject": email.subject if email else "Unknown",
+                "action_type": action.action_type,
+                "target_folder": action.target_folder
+            })
+        
+        return {
+            "success": True,
+            "dry_run": True,
+            "message": f"Would apply {len(preview)} actions",
+            "actions": preview
+        }
+    
+    # Apply actions - use context manager for IMAP connection
+    applied = 0
+    failed = 0
+    results = []
+    
+    try:
+        with IMAPService() as imap:
+            # Check if connection succeeded
+            if not imap.client:
+                # Connection failed - DO NOT change status from APPROVED to FAILED
+                # Return 503 without mutating database
+                sanitized_error = sanitize_error(
+                    Exception("IMAP connection failed"), 
+                    settings.debug
+                )
+                logger.error(f"IMAP connection failed for batch apply: {sanitized_error}")
+                
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "success": False,
+                        "message": "IMAP connection failed" if settings.debug else "Service temporarily unavailable",
+                        "applied": 0,
+                        "failed": 0,
+                        "actions": []
+                    }
+                )
+            
+            # Process each action
+            for action in actions:
+                try:
+                    email = db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+                    
+                    if not email or not email.uid:
+                        action.status = "FAILED"
+                        action.error_message = "Email or UID not found"
+                        failed += 1
+                        results.append({
+                            "action_id": action.id,
+                            "status": "FAILED",
+                            "error": action.error_message
+                        })
+                        continue
+                    
+                    uid = int(email.uid)
+                    success = False
+                    
+                    # Execute the IMAP action
+                    if action.action_type == "MOVE_FOLDER":
+                        success = imap.move_to_folder(uid, action.target_folder)
+                        if success:
+                            email.is_archived = True
+                    elif action.action_type == "MARK_READ":
+                        success = imap.mark_as_read(uid)
+                    elif action.action_type == "ADD_FLAG":
+                        success = imap.add_flag(uid)
+                        if success:
+                            email.is_flagged = True
+                    else:
+                        action.status = "FAILED"
+                        action.error_message = f"Unknown action type: {action.action_type}"
+                        failed += 1
+                        results.append({
+                            "action_id": action.id,
+                            "status": "FAILED",
+                            "error": action.error_message
+                        })
+                        continue
+                    
+                    if success:
+                        action.status = "APPLIED"
+                        action.applied_at = datetime.utcnow()
+                        applied += 1
+                        logger.info(f"Applied action {action.id}: {action.action_type} for email {email.message_id}")
+                        results.append({
+                            "action_id": action.id,
+                            "status": "APPLIED",
+                            "error": None
+                        })
+                    else:
+                        action.status = "FAILED"
+                        action.error_message = "IMAP operation failed"
+                        failed += 1
+                        logger.error(f"Failed to apply action {action.id}: {action.action_type}")
+                        results.append({
+                            "action_id": action.id,
+                            "status": "FAILED",
+                            "error": action.error_message
+                        })
+                    
+                except Exception as e:
+                    action.status = "FAILED"
+                    action.error_message = sanitize_error(e, settings.debug)
+                    failed += 1
+                    sanitized_error = sanitize_error(e, settings.debug)
+                    logger.error(f"Error applying action {action.id}: {sanitized_error}")
+                    results.append({
+                        "action_id": action.id,
+                        "status": "FAILED",
+                        "error": sanitized_error
+                    })
+            
+            # Commit all changes at once
+            db.commit()
+        
+    except Exception as e:
+        sanitized_error = sanitize_error(e, settings.debug)
+        logger.error(f"Error in apply_all_approved_actions: {sanitized_error}")
+        raise HTTPException(
+            status_code=500, 
+            detail="Failed to apply actions" if not settings.debug else f"Failed to apply actions: {sanitized_error}"
+        )
+    
+    return {
+        "success": True,
+        "applied": applied,
+        "failed": failed,
+        "actions": results
+    }
+
+
+@app.post("/api/pending-actions/{action_id}/apply", dependencies=[Depends(require_authentication)])
+async def apply_single_action(
+    action_id: int,
+    request: ApplyActionsRequest = ApplyActionsRequest(),
+    db: Session = Depends(get_db)
+):
+    """Apply a single approved pending action to IMAP mailbox"""
+    # Check SAFE_MODE first - it always wins
+    if settings.safe_mode:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "SAFE_MODE enabled; no actions applied"
+            }
+        )
+    
+    action = db.query(PendingAction).filter(PendingAction.id == action_id).first()
+    
+    if not action:
+        raise HTTPException(status_code=404, detail="Pending action not found")
+    
+    if action.status != "APPROVED":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot apply action with status {action.status}"
+        )
+    
+    email = db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+    
+    if not email or not email.uid:
+        raise HTTPException(status_code=404, detail="Email or UID not found")
+    
+    if request.dry_run:
+        # Preview mode
+        return {
+            "success": True,
+            "dry_run": True,
+            "action_id": action.id,
+            "email_id": action.email_id,
+            "email_subject": email.subject,
+            "action_type": action.action_type,
+            "target_folder": action.target_folder,
+            "message": "Dry run - action not applied"
+        }
+    
+    # Apply the action - use context manager for IMAP connection
+    try:
+        with IMAPService() as imap:
+            # Check if connection succeeded
+            if not imap.client:
+                # Connection failed - DO NOT change status from APPROVED to FAILED
+                # Return 503 without mutating database
+                sanitized_error = sanitize_error(
+                    Exception("IMAP connection failed"),
+                    settings.debug
+                )
+                logger.error(f"IMAP connection failed for action {action_id}: {sanitized_error}")
+                
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "success": False,
+                        "message": "IMAP connection failed" if settings.debug else "Service temporarily unavailable",
+                        "action_id": action_id,
+                        "status": "APPROVED"  # Status remains APPROVED, not FAILED
+                    }
+                )
+            
+            uid = int(email.uid)
+            success = False
+            
+            # Execute the IMAP action
+            if action.action_type == "MOVE_FOLDER":
+                success = imap.move_to_folder(uid, action.target_folder)
+                if success:
+                    email.is_archived = True
+            elif action.action_type == "MARK_READ":
+                success = imap.mark_as_read(uid)
+            elif action.action_type == "ADD_FLAG":
+                success = imap.add_flag(uid)
+                if success:
+                    email.is_flagged = True
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown action type: {action.action_type}"
+                )
+            
+            if success:
+                action.status = "APPLIED"
+                action.applied_at = datetime.utcnow()
+                db.commit()
+                logger.info(f"Applied action {action.id}: {action.action_type} for email {email.message_id}")
+                
+                return {
+                    "success": True,
+                    "action_id": action.id,
+                    "status": "APPLIED",
+                    "message": f"Action {action.action_type} applied successfully"
+                }
+            else:
+                action.status = "FAILED"
+                action.error_message = "IMAP operation failed"
+                db.commit()
+                logger.error(f"Failed to apply action {action.id}: {action.action_type}")
+                
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to apply IMAP action"
+                )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        action.status = "FAILED"
+        action.error_message = sanitize_error(e, settings.debug)
+        db.commit()
+        sanitized_error = sanitize_error(e, settings.debug)
+        logger.error(f"Error applying action {action.id}: {sanitized_error}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to apply action" if not settings.debug else f"Failed to apply action: {sanitized_error}"
+        )
 
 
 @app.get("/api/health")
