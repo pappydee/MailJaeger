@@ -1003,169 +1003,165 @@ async def apply_all_approved_actions(
     results = []
 
     try:
-        with IMAPService() as imap:
-            # Check if connection succeeded
-            if not imap.client:
-                # Connection failed - DO NOT mark token as used
-                # Return 503 without mutating database or consuming token
-                sanitized_error = sanitize_error(
-                    Exception("IMAP connection failed"), settings.debug
-                )
-                logger.error(
-                    f"IMAP connection failed for batch apply: {sanitized_error}"
-                )
-
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "success": False,
-                        "message": (
-                            "IMAP connection failed"
-                            if settings.debug
-                            else "Service temporarily unavailable"
-                        ),
-                        "applied": 0,
-                        "failed": 0,
-                        "actions": [],
-                    },
-                )
-
-            # Process each action
-            for action in actions:
-                try:
-                    email = (
-                        db.query(ProcessedEmail)
-                        .filter(ProcessedEmail.id == action.email_id)
-                        .first()
-                    )
-
-                    if not email or not email.uid:
-                        action.status = "FAILED"
-                        action.error_message = "Email or UID not found"
-                        failed += 1
-                        results.append(
-                            {
-                                "action_id": action.id,
-                                "status": "FAILED",
-                                "error": action.error_message,
-                            }
+        try:
+            with IMAPService() as imap:
+                # Process each action
+                for action in actions:
+                    try:
+                        email = (
+                            db.query(ProcessedEmail)
+                            .filter(ProcessedEmail.id == action.email_id)
+                            .first()
                         )
-                        continue
 
-                    # Safety check: Block DELETE unless explicitly enabled
-                    if action.action_type == "DELETE":
-                        if not settings.allow_destructive_imap:
-                            action.status = "REJECTED"
-                            action.error_message = (
-                                "DELETE blocked: ALLOW_DESTRUCTIVE_IMAP is false"
-                            )
+                        if not email or not email.uid:
+                            action.status = "FAILED"
+                            action.error_message = "Email or UID not found"
                             failed += 1
-                            logger.warning(
-                                f"Blocked DELETE action {action.id}: destructive operations disabled"
-                            )
                             results.append(
                                 {
                                     "action_id": action.id,
-                                    "status": "REJECTED",
+                                    "status": "FAILED",
                                     "error": action.error_message,
                                 }
                             )
                             continue
 
-                    # Safety check: Validate target folder against allowlist
-                    if action.action_type == "MOVE_FOLDER":
-                        if action.target_folder not in safe_folders:
+                        # Safety check: Block DELETE unless explicitly enabled
+                        if action.action_type == "DELETE":
+                            if not settings.allow_destructive_imap:
+                                action.status = "REJECTED"
+                                action.error_message = (
+                                    "DELETE blocked: ALLOW_DESTRUCTIVE_IMAP is false"
+                                )
+                                failed += 1
+                                logger.warning(
+                                    f"Blocked DELETE action {action.id}: destructive operations disabled"
+                                )
+                                results.append(
+                                    {
+                                        "action_id": action.id,
+                                        "status": "REJECTED",
+                                        "error": action.error_message,
+                                    }
+                                )
+                                continue
+
+                        # Safety check: Validate target folder against allowlist
+                        if action.action_type == "MOVE_FOLDER":
+                            if action.target_folder not in safe_folders:
+                                action.status = "FAILED"
+                                action.error_message = f"Target folder not in safe folder allowlist. Allowed: {', '.join(safe_folders)}"
+                                failed += 1
+                                logger.error(
+                                    f"Failed action {action.id}: target folder '{action.target_folder}' not in allowlist"
+                                )
+                                results.append(
+                                    {
+                                        "action_id": action.id,
+                                        "status": "FAILED",
+                                        "error": "Target folder not in safe folder allowlist",
+                                    }
+                                )
+                                continue
+
+                        uid = int(email.uid)
+                        success = False
+
+                        # Execute the IMAP action
+                        if action.action_type == "MOVE_FOLDER":
+                            success = imap.move_to_folder(uid, action.target_folder)
+                            if success:
+                                email.is_archived = True
+                        elif action.action_type == "MARK_READ":
+                            success = imap.mark_as_read(uid)
+                        elif action.action_type == "ADD_FLAG":
+                            success = imap.add_flag(uid)
+                            if success:
+                                email.is_flagged = True
+                        elif action.action_type == "DELETE":
+                            # DELETE is already checked above; should not reach here unless enabled
+                            success = (
+                                imap.delete_message(uid)
+                                if hasattr(imap, "delete_message")
+                                else False
+                            )
+                        else:
                             action.status = "FAILED"
-                            action.error_message = f"Target folder not in safe folder allowlist. Allowed: {', '.join(safe_folders)}"
+                            action.error_message = (
+                                f"Unknown action type: {action.action_type}"
+                            )
+                            failed += 1
+                            results.append(
+                                {
+                                    "action_id": action.id,
+                                    "status": "FAILED",
+                                    "error": action.error_message,
+                                }
+                            )
+                            continue
+
+                        if success:
+                            action.status = "APPLIED"
+                            action.applied_at = datetime.utcnow()
+                            applied += 1
+                            logger.info(
+                                f"Applied action {action.id}: {action.action_type} for email {email.message_id}"
+                            )
+                            results.append(
+                                {"action_id": action.id, "status": "APPLIED", "error": None}
+                            )
+                        else:
+                            action.status = "FAILED"
+                            action.error_message = "IMAP operation failed"
                             failed += 1
                             logger.error(
-                                f"Failed action {action.id}: target folder '{action.target_folder}' not in allowlist"
+                                f"Failed to apply action {action.id}: {action.action_type}"
                             )
                             results.append(
                                 {
                                     "action_id": action.id,
                                     "status": "FAILED",
-                                    "error": "Target folder not in safe folder allowlist",
+                                    "error": action.error_message,
                                 }
                             )
-                            continue
 
-                    uid = int(email.uid)
-                    success = False
-
-                    # Execute the IMAP action
-                    if action.action_type == "MOVE_FOLDER":
-                        success = imap.move_to_folder(uid, action.target_folder)
-                        if success:
-                            email.is_archived = True
-                    elif action.action_type == "MARK_READ":
-                        success = imap.mark_as_read(uid)
-                    elif action.action_type == "ADD_FLAG":
-                        success = imap.add_flag(uid)
-                        if success:
-                            email.is_flagged = True
-                    elif action.action_type == "DELETE":
-                        # DELETE is already checked above; should not reach here unless enabled
-                        success = (
-                            imap.delete_message(uid)
-                            if hasattr(imap, "delete_message")
-                            else False
-                        )
-                    else:
+                    except Exception as e:
                         action.status = "FAILED"
-                        action.error_message = (
-                            f"Unknown action type: {action.action_type}"
-                        )
+                        action.error_message = sanitize_error(e, settings.debug)
                         failed += 1
-                        results.append(
-                            {
-                                "action_id": action.id,
-                                "status": "FAILED",
-                                "error": action.error_message,
-                            }
-                        )
-                        continue
-
-                    if success:
-                        action.status = "APPLIED"
-                        action.applied_at = datetime.utcnow()
-                        applied += 1
-                        logger.info(
-                            f"Applied action {action.id}: {action.action_type} for email {email.message_id}"
-                        )
-                        results.append(
-                            {"action_id": action.id, "status": "APPLIED", "error": None}
-                        )
-                    else:
-                        action.status = "FAILED"
-                        action.error_message = "IMAP operation failed"
-                        failed += 1
+                        sanitized_error = sanitize_error(e, settings.debug)
                         logger.error(
-                            f"Failed to apply action {action.id}: {action.action_type}"
+                        f"Error applying action {action.id}: {sanitized_error}"
                         )
                         results.append(
-                            {
-                                "action_id": action.id,
-                                "status": "FAILED",
-                                "error": action.error_message,
-                            }
-                        )
-
-                except Exception as e:
-                    action.status = "FAILED"
-                    action.error_message = sanitize_error(e, settings.debug)
-                    failed += 1
-                    sanitized_error = sanitize_error(e, settings.debug)
-                    logger.error(
-                        f"Error applying action {action.id}: {sanitized_error}"
-                    )
-                    results.append(
                         {
                             "action_id": action.id,
                             "status": "FAILED",
                             "error": sanitized_error,
                         }
-                    )
+                        )
+
+        except RuntimeError as e:
+            # IMAP connection failed - DO NOT mark token as used
+            # Return 503 without mutating database or consuming token
+            sanitized_error = sanitize_error(e, debug=settings.debug)
+            logger.error(f"IMAP connection failed for batch apply: {sanitized_error}")
+
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "message": (
+                        "IMAP connection failed"
+                        if settings.debug
+                        else "Service temporarily unavailable"
+                    ),
+                    "applied": 0,
+                    "failed": 0,
+                    "actions": [],
+                },
+            )
 
             # Commit all changes at once
             db.commit()
@@ -1347,83 +1343,78 @@ async def apply_single_action(
 
     # Apply the action - use context manager for IMAP connection
     try:
-        with IMAPService() as imap:
-            # Check if connection succeeded
-            if not imap.client:
-                # Connection failed - DO NOT mark token as used
-                # Return 503 without mutating database or consuming token
-                sanitized_error = sanitize_error(
-                    Exception("IMAP connection failed"), settings.debug
-                )
-                logger.error(
-                    f"IMAP connection failed for action {action_id}: {sanitized_error}"
-                )
+        try:
+            with IMAPService() as imap:
+                uid = int(email.uid)
+                success = False
 
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "success": False,
-                        "message": (
-                            "IMAP connection failed"
-                            if settings.debug
-                            else "Service temporarily unavailable"
-                        ),
-                        "action_id": action_id,
-                        "status": "APPROVED",  # Status remains APPROVED, not FAILED
-                    },
-                )
+                # Execute the IMAP action
+                if action.action_type == "MOVE_FOLDER":
+                    success = imap.move_to_folder(uid, action.target_folder)
+                    if success:
+                        email.is_archived = True
+                elif action.action_type == "MARK_READ":
+                    success = imap.mark_as_read(uid)
+                elif action.action_type == "ADD_FLAG":
+                    success = imap.add_flag(uid)
+                    if success:
+                        email.is_flagged = True
+                else:
+                    raise HTTPException(
+                        status_code=400, detail=f"Unknown action type: {action.action_type}"
+                    )
 
-            uid = int(email.uid)
-            success = False
-
-            # Execute the IMAP action
-            if action.action_type == "MOVE_FOLDER":
-                success = imap.move_to_folder(uid, action.target_folder)
                 if success:
-                    email.is_archived = True
-            elif action.action_type == "MARK_READ":
-                success = imap.mark_as_read(uid)
-            elif action.action_type == "ADD_FLAG":
-                success = imap.add_flag(uid)
-                if success:
-                    email.is_flagged = True
-            else:
-                raise HTTPException(
-                    status_code=400, detail=f"Unknown action type: {action.action_type}"
-                )
+                    action.status = "APPLIED"
+                    action.applied_at = datetime.utcnow()
+                    db.commit()
 
-            if success:
-                action.status = "APPLIED"
-                action.applied_at = datetime.utcnow()
-                db.commit()
+                    # Mark token as used ONLY after successful application
+                    token_record.is_used = True
+                    token_record.used_at = datetime.utcnow()
+                    db.commit()
 
-                # Mark token as used ONLY after successful application
-                token_record.is_used = True
-                token_record.used_at = datetime.utcnow()
-                db.commit()
+                    logger.info(
+                        f"Applied action {action.id}: {action.action_type} for email {email.message_id}"
+                    )
 
-                logger.info(
-                    f"Applied action {action.id}: {action.action_type} for email {email.message_id}"
-                )
+                    return {
+                        "success": True,
+                        "action_id": action.id,
+                        "status": "APPLIED",
+                        "message": f"Action {action.action_type} applied successfully",
+                    }
+                else:
+                    action.status = "FAILED"
+                    action.error_message = "IMAP operation failed"
+                    db.commit()
+                    # DO NOT mark token as used on failure
+                    logger.error(
+                        f"Failed to apply action {action.id}: {action.action_type}"
+                    )
 
-                return {
-                    "success": True,
+                    raise HTTPException(
+                        status_code=500, detail="Failed to apply IMAP action"
+                    )
+
+        except RuntimeError as e:
+            # IMAP connection failed - DO NOT mark token as used or change action status
+            sanitized_error = sanitize_error(e, debug=settings.debug)
+            logger.error(f"IMAP connection failed for action {action.id}: {sanitized_error}")
+
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "message": (
+                        "IMAP connection failed"
+                        if settings.debug
+                        else "Service temporarily unavailable"
+                    ),
                     "action_id": action.id,
-                    "status": "APPLIED",
-                    "message": f"Action {action.action_type} applied successfully",
-                }
-            else:
-                action.status = "FAILED"
-                action.error_message = "IMAP operation failed"
-                db.commit()
-                # DO NOT mark token as used on failure
-                logger.error(
-                    f"Failed to apply action {action.id}: {action.action_type}"
-                )
-
-                raise HTTPException(
-                    status_code=500, detail="Failed to apply IMAP action"
-                )
+                    "status": "APPROVED",  # Status remains APPROVED, not FAILED
+                },
+            )
 
     except HTTPException:
         raise

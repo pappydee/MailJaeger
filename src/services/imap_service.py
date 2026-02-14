@@ -28,19 +28,39 @@ class IMAPService:
         self.client: Optional[IMAPClient] = None
 
     def connect(self) -> bool:
-        """Connect to IMAP server"""
+        """
+        Connect to IMAP server.
+        
+        Returns True only if authentication succeeds.
+        On failure, ensures self.client is None and performs best-effort cleanup.
+        """
+        temp_client = None
         try:
-            self.client = IMAPClient(
+            temp_client = IMAPClient(
                 self.settings.imap_host,
                 port=self.settings.imap_port,
                 ssl=self.settings.imap_use_ssl,
             )
             # Get password from settings (handles file-based secrets)
             password = self.settings.get_imap_password()
-            self.client.login(self.settings.imap_username, password)
+            temp_client.login(self.settings.imap_username, password)
+            
+            # Only set self.client if authentication succeeded
+            self.client = temp_client
             logger.info(f"Connected to IMAP server: {self.settings.imap_host}")
             return True
+            
         except Exception as e:
+            # Best-effort cleanup without raising new exceptions
+            if temp_client:
+                try:
+                    temp_client.logout()
+                except:
+                    pass  # Ignore cleanup errors
+            
+            # Ensure client is None on failure
+            self.client = None
+            
             sanitized_error = sanitize_error(e, debug=self.settings.debug)
             logger.error(
                 f"Failed to connect to IMAP server {self.settings.imap_host}: {sanitized_error}"
@@ -60,13 +80,20 @@ class IMAPService:
                 self.client = None
 
     def __enter__(self):
-        """Context manager entry"""
-        self.connect()
+        """
+        Context manager entry - fail-fast behavior.
+        
+        Raises RuntimeError if connection fails, ensuring no half-connected state.
+        """
+        if not self.connect():
+            raise RuntimeError("IMAP connection failed")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
+        """Context manager exit - always cleanup and reset client"""
         self.disconnect()
+        # Ensure client is None after exit
+        self.client = None
 
     def get_unread_emails(
         self, max_count: Optional[int] = None

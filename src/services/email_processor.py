@@ -66,35 +66,45 @@ class EmailProcessor:
 
         try:
             # Step 1: Retrieve emails
-            with self.imap_service as imap:
-                if not imap.client:
-                    raise Exception("Failed to connect to IMAP server")
+            try:
+                with self.imap_service as imap:
+                    emails = imap.get_unread_emails(
+                        max_count=self.settings.max_emails_per_run
+                    )
 
-                emails = imap.get_unread_emails(
-                    max_count=self.settings.max_emails_per_run
-                )
+                    if not emails:
+                        logger.info("No unread emails to process")
+                        run.status = "SUCCESS"
+                        run.completed_at = datetime.utcnow()
+                        self.db.commit()
+                        return run
 
-                if not emails:
-                    logger.info("No unread emails to process")
-                    run.status = "SUCCESS"
-                    run.completed_at = datetime.utcnow()
-                    self.db.commit()
-                    return run
+                    logger.info(f"Retrieved {len(emails)} emails for processing")
 
-                logger.info(f"Retrieved {len(emails)} emails for processing")
+                    # Process each email independently
+                    for email_data in emails:
+                        try:
+                            self._process_single_email(email_data, imap)
+                        except Exception as e:
+                            sanitized_error = sanitize_error(
+                                e, debug=self.settings.debug
+                            )
+                            logger.error(
+                                f"Failed to process email {email_data.get('message_id')}: {sanitized_error}"
+                            )
+                            self.stats["failed"] += 1
+                            # Continue with next email (error isolation)
+                            continue
 
-                # Process each email independently
-                for email_data in emails:
-                    try:
-                        self._process_single_email(email_data, imap)
-                    except Exception as e:
-                        sanitized_error = sanitize_error(e, debug=self.settings.debug)
-                        logger.error(
-                            f"Failed to process email {email_data.get('message_id')}: {sanitized_error}"
-                        )
-                        self.stats["failed"] += 1
-                        # Continue with next email (error isolation)
-                        continue
+            except RuntimeError as e:
+                # IMAP connection failed - fail closed
+                sanitized_error = sanitize_error(e, debug=self.settings.debug)
+                logger.error(f"IMAP connection failed: {sanitized_error}")
+                run.status = "FAILURE"
+                run.error_message = sanitize_error(e, debug=self.settings.debug)
+                run.completed_at = datetime.utcnow()
+                self.db.commit()
+                return run
 
             # Update run statistics
             run.emails_processed = self.stats["processed"]
