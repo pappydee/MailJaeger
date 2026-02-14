@@ -144,7 +144,6 @@ class TestStartupSanitization:
         sanitized = sanitize_error(exc, debug=True)
 
         assert sanitized == "Test error with details"
-        assert "Test error with details" in sanitized
 
     def test_startup_validation_error_sanitized_in_stderr(self):
         """Test that startup validation errors are sanitized in stderr output"""
