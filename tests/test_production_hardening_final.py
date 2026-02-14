@@ -6,7 +6,40 @@ import pytest
 from unittest.mock import patch, MagicMock
 import os
 import sys
+import importlib
 from io import StringIO
+import logging
+
+
+def build_fresh_app(env_dict):
+    """
+    Build a fresh app with the given environment variables.
+    
+    This helper ensures tests are deterministic by:
+    1. Patching os.environ with env_dict (clear=True)
+    2. Reloading src.config to get fresh settings
+    3. Reloading src.main to get a fresh app with new settings
+    4. Returning the new app object
+    
+    Args:
+        env_dict: Dictionary of environment variables
+    
+    Returns:
+        Fresh FastAPI app instance
+    """
+    # Import modules
+    import src.config
+    import src.main
+    
+    # Patch environment and reload
+    with patch.dict(os.environ, env_dict, clear=True):
+        # Reload config module to clear cached settings
+        importlib.reload(src.config)
+        
+        # Reload main module to get fresh app with new settings
+        importlib.reload(src.main)
+        
+        return src.main.app
 
 
 class TestDebugGuard:
@@ -238,3 +271,138 @@ class TestExceptionHandlerSanitization:
         assert "sk-secret-key-12345" not in sanitized
         assert "api_key=" not in sanitized
         assert sanitized == "RuntimeError"
+
+
+class TestCredentialLeakPrevention:
+    """Test that credentials NEVER leak, even in debug mode"""
+
+    def test_never_leaks_credentials_in_debug_false(self, caplog):
+        """Test that credentials never appear in responses or logs when DEBUG=false"""
+        from src.utils.error_handling import sanitize_error
+
+        # Create exception with ALL sensitive data
+        imap_username = "testuser@example.com"
+        imap_password = "super_secret_password_123"
+        bearer_token = "Bearer sk-test-token-abc123xyz"
+
+        exc = ValueError(
+            f"IMAP connection failed: username={imap_username} "
+            f"password={imap_password} auth_header={bearer_token}"
+        )
+
+        # Capture logs
+        with caplog.at_level(logging.ERROR):
+            sanitized = sanitize_error(exc, debug=False)
+
+        # Verify response doesn't contain secrets (production mode returns only type)
+        assert sanitized == "ValueError"
+        assert imap_username not in sanitized
+        assert imap_password not in sanitized
+        assert "sk-test-token-abc123xyz" not in sanitized
+        assert bearer_token not in sanitized
+
+        # Verify logs don't contain secrets
+        log_text = caplog.text
+        assert imap_username not in log_text
+        assert imap_password not in log_text
+        assert "sk-test-token-abc123xyz" not in log_text
+
+    def test_never_leaks_credentials_in_debug_true(self, caplog):
+        """Test that credentials never appear in responses or logs even when DEBUG=true"""
+        from src.utils.error_handling import sanitize_error
+
+        # Create exception with ALL sensitive data
+        imap_username = "testuser@example.com"
+        imap_password = "super_secret_password_123"
+        bearer_token = "Bearer sk-test-token-abc123xyz"
+
+        exc = ValueError(
+            f"IMAP connection failed: username={imap_username} "
+            f"password={imap_password} auth_header={bearer_token}"
+        )
+
+        # Capture logs
+        with caplog.at_level(logging.ERROR):
+            sanitized = sanitize_error(exc, debug=True)
+
+        # Verify response doesn't contain raw secrets (even in debug mode)
+        assert imap_username not in sanitized
+        assert imap_password not in sanitized
+        assert "sk-test-token-abc123xyz" not in sanitized
+        assert "super_secret_password_123" not in sanitized
+
+        # Verify secrets are redacted
+        assert "[REDACTED]" in sanitized
+
+        # Verify logs don't contain secrets
+        log_text = caplog.text
+        assert imap_password not in log_text
+        assert "sk-test-token-abc123xyz" not in log_text
+        assert "super_secret_password_123" not in log_text
+
+    def test_redacts_password_patterns(self):
+        """Test that password patterns are redacted"""
+        from src.utils.error_handling import sanitize_error
+
+        test_cases = [
+            "Error: password=mysecret123",
+            "Failed: passwd=abc123",
+            "Auth: Password: secret",
+            "Credentials: PASSWORD=TopSecret",
+        ]
+
+        for error_msg in test_cases:
+            exc = Exception(error_msg)
+            sanitized = sanitize_error(exc, debug=True)
+
+            # Should not contain the actual secret value
+            assert "mysecret123" not in sanitized
+            assert "abc123" not in sanitized
+            assert "secret" not in sanitized.replace("[REDACTED]", "")
+            assert "TopSecret" not in sanitized
+
+            # Should contain redaction marker
+            assert "[REDACTED]" in sanitized
+
+    def test_redacts_bearer_tokens(self):
+        """Test that Bearer tokens are redacted"""
+        from src.utils.error_handling import sanitize_error
+
+        exc = Exception("Authorization: Bearer sk-1234567890abcdef")
+        sanitized = sanitize_error(exc, debug=True)
+
+        assert "sk-1234567890abcdef" not in sanitized
+        assert "[REDACTED]" in sanitized
+
+    def test_redacts_actual_imap_credentials_from_settings(self):
+        """Test that actual IMAP credentials from settings are redacted"""
+        from src.utils.error_handling import sanitize_error
+
+        # Set up environment with specific credentials
+        with patch.dict(
+            os.environ,
+            {
+                "IMAP_HOST": "imap.test.com",
+                "IMAP_USERNAME": "actual_user@test.com",
+                "IMAP_PASSWORD": "actual_password_from_env",
+                "API_KEY": "testkey12345",
+                "AI_ENDPOINT": "http://localhost:11434",
+            },
+            clear=True,
+        ):
+            from src.config import reload_settings
+
+            settings = reload_settings()
+
+            # Create exception with actual credentials from settings
+            exc = Exception(
+                f"Connection failed for {settings.imap_username} "
+                f"with password {settings.get_imap_password()}"
+            )
+
+            sanitized = sanitize_error(exc, debug=True)
+
+            # Actual credentials should be redacted
+            assert "actual_user@test.com" not in sanitized
+            assert "actual_password_from_env" not in sanitized
+            assert "[REDACTED]" in sanitized

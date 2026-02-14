@@ -47,14 +47,18 @@ except ValueError as e:
     # Use sanitize_error to prevent credential leakage in logs
     sanitized = sanitize_error(e, debug=False)
     logger.error("Configuration validation failed: %s", sanitized)
-    print(f"\n❌ Configuration Error:\n{e}\n", file=sys.stderr)
+    # Redact stderr output even when showing user-facing error
+    stderr_msg = sanitize_error(e, debug=settings.debug if hasattr(settings, 'debug') else False)
+    print(f"\n❌ Configuration Error:\n{stderr_msg}\n", file=sys.stderr)
     print("Please check your .env file and environment variables.", file=sys.stderr)
     sys.exit(1)
 except Exception as e:
     # Use sanitize_error to prevent credential leakage in logs
     sanitized = sanitize_error(e, debug=False)
     logger.error("Failed to load configuration: %s", sanitized)
-    print(f"\n❌ Configuration Error: {e}\n", file=sys.stderr)
+    # Redact stderr output
+    stderr_msg = sanitize_error(e, debug=False)
+    print(f"\n❌ Configuration Error: {stderr_msg}\n", file=sys.stderr)
     sys.exit(1)
 
 # Create app
