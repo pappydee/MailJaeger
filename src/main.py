@@ -206,10 +206,17 @@ async def auth_exception_handler(request: Request, exc: AuthenticationError):
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
     """Handle general exceptions with sanitized error messages"""
-    logger.error(f"Unhandled exception on {request.url.path}: {exc}", exc_info=True)
+    # Use sanitized error in logs to prevent credential leakage
+    sanitized_error = sanitize_error(exc, settings.debug)
+    
+    # In debug mode, include full trace; in production, avoid raw exception text
+    if settings.debug:
+        logger.error(f"Unhandled exception on {request.url.path}: {sanitized_error}", exc_info=True)
+    else:
+        logger.error(f"Unhandled exception on {request.url.path}: {sanitized_error}")
     
     # Don't leak internal details in production
-    detail = str(exc) if settings.debug else "An internal error occurred"
+    detail = sanitized_error if settings.debug else "An internal error occurred"
     
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -340,10 +347,14 @@ async def get_dashboard(db: Session = Depends(get_db)):
         )
     
     except Exception as e:
-        logger.error(f"Dashboard error: {e}", exc_info=True)
+        sanitized_error = sanitize_error(e, settings.debug)
+        if settings.debug:
+            logger.error(f"Dashboard error: {sanitized_error}", exc_info=True)
+        else:
+            logger.error(f"Dashboard error: {sanitized_error}")
         raise HTTPException(
             status_code=500, 
-            detail="Failed to load dashboard" if not settings.debug else str(e)
+            detail="Failed to load dashboard" if not settings.debug else sanitized_error
         )
 
 
@@ -377,10 +388,14 @@ async def search_emails(
         return [EmailResponse.from_orm(email) for email in results['results']]
     
     except Exception as e:
-        logger.error(f"Search error: {e}", exc_info=True)
+        sanitized_error = sanitize_error(e, settings.debug)
+        if settings.debug:
+            logger.error(f"Search error: {sanitized_error}", exc_info=True)
+        else:
+            logger.error(f"Search error: {sanitized_error}")
         raise HTTPException(
             status_code=500, 
-            detail="Search failed" if not settings.debug else str(e)
+            detail="Search failed" if not settings.debug else sanitized_error
         )
 
 
@@ -431,10 +446,14 @@ async def list_emails(
         return [EmailResponse.from_orm(email) for email in emails]
     
     except Exception as e:
-        logger.error(f"List emails error: {e}", exc_info=True)
+        sanitized_error = sanitize_error(e, settings.debug)
+        if settings.debug:
+            logger.error(f"List emails error: {sanitized_error}", exc_info=True)
+        else:
+            logger.error(f"List emails error: {sanitized_error}")
         raise HTTPException(
             status_code=500,
-            detail="Failed to list emails" if not settings.debug else str(e)
+            detail="Failed to list emails" if not settings.debug else sanitized_error
         )
 
 
@@ -490,10 +509,14 @@ async def trigger_processing(
             return {"success": False, "message": "Processing already in progress"}
     
     except Exception as e:
-        logger.error(f"Trigger processing error: {e}", exc_info=True)
+        sanitized_error = sanitize_error(e, settings.debug)
+        if settings.debug:
+            logger.error(f"Trigger processing error: {sanitized_error}", exc_info=True)
+        else:
+            logger.error(f"Trigger processing error: {sanitized_error}")
         raise HTTPException(
             status_code=500,
-            detail="Failed to trigger processing" if not settings.debug else str(e)
+            detail="Failed to trigger processing" if not settings.debug else sanitized_error
         )
 
 
@@ -708,20 +731,13 @@ async def apply_all_approved_actions(
         with IMAPService() as imap:
             # Check if connection succeeded
             if not imap.client:
-                # Connection failed - mark all actions as FAILED
-                for action in actions:
-                    action.status = "FAILED"
-                    action.error_message = sanitize_error(
-                        Exception("IMAP connection failed"), 
-                        settings.debug
-                    )
-                    failed += 1
-                    results.append({
-                        "action_id": action.id,
-                        "status": "FAILED",
-                        "error": action.error_message
-                    })
-                db.commit()
+                # Connection failed - DO NOT change status from APPROVED to FAILED
+                # Return 503 without mutating database
+                sanitized_error = sanitize_error(
+                    Exception("IMAP connection failed"), 
+                    settings.debug
+                )
+                logger.error(f"IMAP connection failed for batch apply: {sanitized_error}")
                 
                 return JSONResponse(
                     status_code=503,
@@ -729,8 +745,8 @@ async def apply_all_approved_actions(
                         "success": False,
                         "message": "IMAP connection failed" if settings.debug else "Service temporarily unavailable",
                         "applied": 0,
-                        "failed": failed,
-                        "actions": results
+                        "failed": 0,
+                        "actions": []
                     }
                 )
             
@@ -878,12 +894,13 @@ async def apply_single_action(
         with IMAPService() as imap:
             # Check if connection succeeded
             if not imap.client:
-                action.status = "FAILED"
-                action.error_message = sanitize_error(
+                # Connection failed - DO NOT change status from APPROVED to FAILED
+                # Return 503 without mutating database
+                sanitized_error = sanitize_error(
                     Exception("IMAP connection failed"),
                     settings.debug
                 )
-                db.commit()
+                logger.error(f"IMAP connection failed for action {action_id}: {sanitized_error}")
                 
                 return JSONResponse(
                     status_code=503,
@@ -891,7 +908,7 @@ async def apply_single_action(
                         "success": False,
                         "message": "IMAP connection failed" if settings.debug else "Service temporarily unavailable",
                         "action_id": action_id,
-                        "status": "FAILED"
+                        "status": "APPROVED"  # Status remains APPROVED, not FAILED
                     }
                 )
             
