@@ -226,6 +226,19 @@ class Settings(BaseSettings):
         """Validate that required settings are present"""
         errors = []
         
+        # Check for production debug guard - prevent DEBUG=true in web-exposed deployments
+        is_web_exposed = (
+            self.server_host == "0.0.0.0" or 
+            self.trust_proxy
+        )
+        
+        if self.debug and is_web_exposed:
+            errors.append(
+                "DEBUG must be false in production/web-exposed deployments. "
+                "Running with DEBUG=true exposes sensitive information in logs and API responses. "
+                "Set DEBUG=false when SERVER_HOST=0.0.0.0 or TRUST_PROXY=true."
+            )
+        
         # Check IMAP credentials
         if not self.imap_host:
             errors.append("IMAP_HOST is required")

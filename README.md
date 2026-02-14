@@ -229,6 +229,7 @@ Before using MailJaeger in production:
 
 - [ ] **Generate API Key**: `python -c 'import secrets; print(secrets.token_urlsafe(32))'`
 - [ ] **Set API_KEY in .env**: Never leave empty
+- [ ] **Set DEBUG=false**: Required for production - app will refuse to start with DEBUG=true when web-exposed
 - [ ] **Test with SAFE_MODE=true**: Verify processing works
 - [ ] **Disable SAFE_MODE**: Set to `false` after testing
 - [ ] **Review Quarantine Folder**: Check `QUARANTINE_FOLDER` location
@@ -242,11 +243,12 @@ Before using MailJaeger in production:
 To expose externally:
 
 1. **REQUIRED**: Set a strong `API_KEY` (32+ characters)
-2. Set `SERVER_HOST=0.0.0.0` in `.env`
-3. Update `CORS_ORIGINS` to include your domain
-4. Use reverse proxy (nginx/Caddy) with HTTPS
-5. Configure firewall rules
-6. Consider VPN or Tailscale for secure access
+2. **REQUIRED**: Set `DEBUG=false` (app will fail to start if DEBUG=true with external access)
+3. Set `SERVER_HOST=0.0.0.0` in `.env`
+4. Update `CORS_ORIGINS` to include your domain
+5. Use reverse proxy (nginx/Caddy) with HTTPS
+6. Configure firewall rules
+7. Consider VPN or Tailscale for secure access
 
 **Example for Docker external access:**
 ```yaml
@@ -424,13 +426,15 @@ ps aux | grep python
 
 ### Running in Development Mode
 
+⚠️ **Note**: DEBUG mode is for local development only. The app will refuse to start with DEBUG=true when SERVER_HOST=0.0.0.0 or TRUST_PROXY=true to prevent accidental exposure of sensitive information.
+
 ```bash
-# Enable debug logging
+# Enable debug logging (LOCAL DEVELOPMENT ONLY)
 export DEBUG=true
 export LOG_LEVEL=DEBUG
 
-# Run with auto-reload
-uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+# Run with auto-reload on localhost (safe for DEBUG=true)
+uvicorn src.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 ## 🚀 Production Deployment

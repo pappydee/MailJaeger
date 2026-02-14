@@ -209,14 +209,14 @@ async def general_exception_handler(request: Request, exc: Exception):
     # Use sanitized error in logs to prevent credential leakage
     sanitized_error = sanitize_error(exc, settings.debug)
     
-    # In debug mode, include full trace; in production, avoid raw exception text
+    # In debug mode, include full trace; in production, use safe logging
     if settings.debug:
-        logger.error(f"Unhandled exception on {request.url.path}: {sanitized_error}", exc_info=True)
+        logger.error("Unhandled exception on %s: %s", request.url.path, sanitized_error, exc_info=True)
     else:
-        logger.error(f"Unhandled exception on {request.url.path}: {sanitized_error}")
+        logger.error("Unhandled exception on %s: %s", request.url.path, sanitized_error)
     
     # Don't leak internal details in production
-    detail = sanitized_error if settings.debug else "An internal error occurred"
+    detail = sanitized_error if settings.debug else "Internal server error"
     
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
