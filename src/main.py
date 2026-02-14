@@ -44,6 +44,7 @@ from src.services.learning_service import LearningService
 from src.services.email_processor import EmailProcessor
 from src.middleware.auth import require_authentication, AuthenticationError
 from src.middleware.security_headers import SecurityHeadersMiddleware
+from src.middleware.allowed_hosts import AllowedHostsMiddleware
 from src.middleware.rate_limiting import limiter, rate_limit_exceeded_handler
 from src.utils.logging import setup_logging, get_logger
 from src.utils.error_handling import sanitize_error
@@ -184,6 +185,9 @@ app.add_middleware(RequestSizeLimiterMiddleware, max_size=10 * 1024 * 1024)
 
 # Add security headers middleware
 app.add_middleware(SecurityHeadersMiddleware)
+
+# Add allowed hosts middleware (after security headers, before CORS)
+app.add_middleware(AllowedHostsMiddleware, settings=settings)
 
 # Add rate limiting state
 app.state.limiter = limiter
