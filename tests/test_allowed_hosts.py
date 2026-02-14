@@ -97,7 +97,9 @@ class TestAllowedHostsMiddleware:
             },
         )
         assert response.status_code == 400
-        assert "Invalid host header" in response.json()["detail"]
+        json_response = response.json()
+        assert json_response["success"] is False
+        assert json_response["message"] == "Invalid host"
 
     def test_allowed_host_with_port_succeeds(self):
         """Host with port should be stripped and matched"""
@@ -171,7 +173,9 @@ class TestAllowedHostsMiddleware:
             },
         )
         assert response.status_code == 400
-        assert "Invalid host header" in response.json()["detail"]
+        json_response = response.json()
+        assert json_response["success"] is False
+        assert json_response["message"] == "Invalid host"
 
     def test_trust_proxy_false_ignores_x_forwarded_host(self):
         """When trust_proxy=false, X-Forwarded-Host should be ignored"""

@@ -101,9 +101,10 @@ class AllowedHostsMiddleware:
             )
 
             # Return 400 Bad Request with minimal error
+            # Do not include request host value in response
             response = JSONResponse(
                 status_code=400,
-                content={"detail": "Invalid host header"},
+                content={"success": False, "message": "Invalid host"},
             )
             await response(scope, receive, send)
             return
