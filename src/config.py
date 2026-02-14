@@ -131,6 +131,10 @@ class Settings(BaseSettings):
         default=True,
         description="Safe mode - prevents destructive IMAP actions (dry-run)"
     )
+    require_approval: bool = Field(
+        default=False,
+        description="Require approval before applying IMAP actions - enqueues PendingActions instead of immediate execution"
+    )
     mark_as_read: bool = Field(
         default=False,
         description="Mark processed emails as read"

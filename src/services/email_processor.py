@@ -7,7 +7,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from src.config import get_settings
-from src.models.database import ProcessedEmail, EmailTask, ProcessingRun, AuditLog
+from src.models.database import ProcessedEmail, EmailTask, ProcessingRun, AuditLog, PendingAction
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
 from src.utils.logging import get_logger
@@ -174,12 +174,66 @@ class EmailProcessor:
             )
             email_record.tasks.append(task)
         
-        # Step 5: Mailbox Actions (with safe mode check)
+        # Step 5: Mailbox Actions (with safe mode and approval checks)
         actions_taken = []
         
+        # A) SAFE_MODE always wins - no IMAP actions taken
         if self.settings.safe_mode:
             logger.info(f"SAFE MODE: Skipping IMAP actions for {message_id}")
             actions_taken.append("safe_mode_skip")
+        
+        # B) REQUIRE_APPROVAL - enqueue PendingActions instead of executing
+        elif self.settings.require_approval:
+            logger.info(f"REQUIRE_APPROVAL: Enqueuing pending actions for {message_id}")
+            actions_taken.append("queued_pending_actions")
+            
+            # Ensure email_record has an id before creating PendingActions
+            self.db.add(email_record)
+            self.db.flush()
+            
+            # Enqueue PendingAction rows based on what would have been done
+            if is_spam:
+                # Always enqueue a MOVE to quarantine_folder (never delete)
+                pending_action = PendingAction(
+                    email_id=email_record.id,
+                    action_type="MOVE_FOLDER",
+                    target_folder=self.settings.quarantine_folder,
+                    status="PENDING"
+                )
+                self.db.add(pending_action)
+                self.stats['spam'] += 1
+                logger.info(f"Enqueued MOVE to {self.settings.quarantine_folder} for spam email")
+            else:
+                # Mark as read if configured
+                if self.settings.mark_as_read:
+                    pending_action = PendingAction(
+                        email_id=email_record.id,
+                        action_type="MARK_READ",
+                        status="PENDING"
+                    )
+                    self.db.add(pending_action)
+                
+                # Move to archive
+                pending_action = PendingAction(
+                    email_id=email_record.id,
+                    action_type="MOVE_FOLDER",
+                    target_folder=self.settings.archive_folder,
+                    status="PENDING"
+                )
+                self.db.add(pending_action)
+                self.stats['archived'] += 1
+                
+                # Flag if action required
+                if action_required:
+                    pending_action = PendingAction(
+                        email_id=email_record.id,
+                        action_type="ADD_FLAG",
+                        status="PENDING"
+                    )
+                    self.db.add(pending_action)
+                    self.stats['action_required'] += 1
+        
+        # C) Normal mode - execute IMAP actions immediately
         else:
             if is_spam:
                 # Handle spam based on configuration
@@ -225,12 +279,13 @@ class EmailProcessor:
         audit = AuditLog(
             event_type="EMAIL_PROCESSED",
             email_message_id=message_id,
-            description=f"Email processed: spam={is_spam}, action_required={action_required}, safe_mode={self.settings.safe_mode}",
+            description=f"Email processed: spam={is_spam}, action_required={action_required}, safe_mode={self.settings.safe_mode}, require_approval={self.settings.require_approval}",
             data={
                 "category": analysis['category'],
                 "priority": priority,
                 "actions": actions_taken,
-                "safe_mode": self.settings.safe_mode
+                "safe_mode": self.settings.safe_mode,
+                "require_approval": self.settings.require_approval
             }
         )
         self.db.add(audit)
@@ -241,7 +296,8 @@ class EmailProcessor:
         logger.info(
             f"Email processed successfully: spam={is_spam}, "
             f"action={action_required}, priority={priority}, "
-            f"safe_mode={self.settings.safe_mode}"
+            f"safe_mode={self.settings.safe_mode}, "
+            f"require_approval={self.settings.require_approval}"
         )
     
     def _classify_spam(self, email_data: Dict[str, Any], analysis: Dict[str, Any]) -> bool:

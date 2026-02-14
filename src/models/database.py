@@ -62,6 +62,7 @@ class ProcessedEmail(Base):
     # Relationships
     tasks = relationship("EmailTask", back_populates="email", cascade="all, delete-orphan")
     learning_signals = relationship("LearningSignal", back_populates="email", cascade="all, delete-orphan")
+    pending_actions = relationship("PendingAction", back_populates="email", cascade="all, delete-orphan")
     
     # Indexes
     __table_args__ = (
@@ -186,3 +187,34 @@ class AuditLog(Base):
     
     # Timestamp
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class PendingAction(Base):
+    """Pending IMAP actions awaiting approval"""
+    __tablename__ = "pending_actions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    email_id = Column(Integer, ForeignKey("processed_emails.id"), nullable=False)
+    
+    # Action details
+    action_type = Column(String(50), nullable=False, index=True)  # MOVE_FOLDER, MARK_READ, ADD_FLAG, DELETE
+    target_folder = Column(String(200))  # For MOVE_FOLDER actions
+    
+    # Status
+    status = Column(String(20), default="PENDING", index=True)  # PENDING, APPROVED, REJECTED, APPLIED, FAILED
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    approved_at = Column(DateTime)
+    applied_at = Column(DateTime)
+    
+    # Error tracking
+    error_message = Column(Text)
+    
+    # Relationships
+    email = relationship("ProcessedEmail", back_populates="pending_actions")
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_status_created', 'status', 'created_at'),
+    )
