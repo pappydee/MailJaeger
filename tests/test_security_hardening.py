@@ -117,7 +117,7 @@ class TestDockerfileHostDefault:
             "Dockerfile should not hardcode 0.0.0.0 as host"
 
 
-class TestProductionComposeSecur ity:
+class TestProductionComposeSecurity:
     """Test that production compose is secure by default"""
     
     def test_prod_compose_does_not_expose_ollama_port(self):
