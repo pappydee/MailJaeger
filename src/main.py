@@ -11,6 +11,7 @@ from typing import List, Optional
 from datetime import datetime
 from pathlib import Path
 import sys
+import secrets
 
 from src.config import get_settings
 from src.database.connection import init_db, get_db
@@ -90,7 +91,53 @@ app.add_middleware(SecurityHeadersMiddleware)
 # Add rate limiting state
 app.state.limiter = limiter
 
-# Mount static files (frontend) - will be protected by requiring auth for root
+# Authentication middleware for static files
+class StaticAuthMiddleware(BaseHTTPMiddleware):
+    """Middleware to require authentication for static files"""
+    async def dispatch(self, request: StarletteRequest, call_next):
+        # Only check static file routes
+        if request.url.path.startswith("/static/"):
+            # Check authentication
+            settings = get_settings()
+            api_keys = settings.get_api_keys()
+            
+            # Fail-closed: require auth for static files
+            if not api_keys:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized"},
+                    headers={"WWW-Authenticate": "Bearer"}
+                )
+            
+            auth_header = request.headers.get("Authorization")
+            if not auth_header or not auth_header.startswith("Bearer "):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized"},
+                    headers={"WWW-Authenticate": "Bearer"}
+                )
+            
+            # Verify token
+            try:
+                token = auth_header.split(" ", 1)[1]
+                if not any(secrets.compare_digest(token, key) for key in api_keys):
+                    return JSONResponse(
+                        status_code=401,
+                        content={"detail": "Unauthorized"},
+                        headers={"WWW-Authenticate": "Bearer"}
+                    )
+            except (IndexError, AttributeError):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized"},
+                    headers={"WWW-Authenticate": "Bearer"}
+                )
+        
+        return await call_next(request)
+
+app.add_middleware(StaticAuthMiddleware)
+
+# Mount static files (frontend) - protected by StaticAuthMiddleware
 frontend_dir = Path(__file__).parent.parent / "frontend"
 if frontend_dir.exists():
     app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
@@ -213,44 +260,9 @@ async def shutdown_event():
     logger.info("MailJaeger shutdown complete")
 
 
-@app.get("/")
+@app.get("/", dependencies=[Depends(require_authentication)])
 async def root(request: Request):
     """Serve frontend dashboard - requires authentication"""
-    settings = get_settings()
-    api_keys = settings.get_api_keys()
-    
-    # If auth is configured, check it
-    if api_keys:
-        # Check Authorization header
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            # Return 401 to prompt for authentication
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "detail": "Authentication required",
-                    "message": "Please provide a valid API key in the Authorization header"
-                },
-                headers={"WWW-Authenticate": "Bearer"}
-            )
-        
-        # Verify token
-        try:
-            token = auth_header.split(" ", 1)[1]
-            import secrets
-            if not any(secrets.compare_digest(token, key) for key in api_keys):
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Invalid authentication token"},
-                    headers={"WWW-Authenticate": "Bearer"}
-                )
-        except IndexError:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Malformed authentication token"},
-                headers={"WWW-Authenticate": "Bearer"}
-            )
-    
     # Serve frontend
     frontend_file = Path(__file__).parent.parent / "frontend" / "index.html"
     if frontend_file.exists():
@@ -260,8 +272,7 @@ async def root(request: Request):
         "name": "MailJaeger",
         "version": "1.0.0",
         "status": "running",
-        "message": "Frontend not found. Access API at /api/docs",
-        "authentication": "required" if api_keys else "disabled"
+        "message": "Frontend not found. Access API at /api/docs"
     }
 
 

@@ -16,7 +16,7 @@ security = HTTPBearer(auto_error=False)
 
 class AuthenticationError(HTTPException):
     """Authentication error exception"""
-    def __init__(self, detail: str = "Authentication required"):
+    def __init__(self, detail: str = "Unauthorized"):
         super().__init__(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=detail,
@@ -78,23 +78,23 @@ async def require_authentication(
     # Fail-closed: If no API keys configured, deny all access except allowlist
     if not api_keys:
         logger.error(f"No API keys configured - denying access to {request.url.path}")
-        raise AuthenticationError("Authentication required but no API keys configured")
+        raise AuthenticationError("Unauthorized")
     
     # Get credentials from header
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         logger.warning(f"Unauthenticated request to {request.url.path} from {request.client.host if request.client else 'unknown'}")
-        raise AuthenticationError("Missing or invalid authentication token")
+        raise AuthenticationError("Unauthorized")
     
     # Extract token
     try:
         token = auth_header.split(" ", 1)[1]
     except IndexError:
-        raise AuthenticationError("Malformed authentication token")
+        raise AuthenticationError("Unauthorized")
     
     # Verify token against all valid API keys using constant-time comparison
     if not any(secrets.compare_digest(token, key) for key in api_keys):
         logger.warning(f"Failed authentication attempt for {request.url.path} from {request.client.host if request.client else 'unknown'}")
-        raise AuthenticationError("Invalid authentication token")
+        raise AuthenticationError("Unauthorized")
     
     logger.debug(f"Authenticated request to {request.url.path}")
