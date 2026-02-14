@@ -75,7 +75,7 @@ class PurgeService:
         
         except Exception as e:
             self.db.rollback()
-            error_msg = f"Purge failed: {type(e).__name__}"
+            error_msg = f"Purge failed: {type(e).__name__}: {str(e)}"
             logger.error(error_msg, exc_info=True)
             stats['errors'].append(error_msg)
         
@@ -92,7 +92,7 @@ class PurgeService:
         count = query.count()
         
         if not dry_run and count > 0:
-            # Delete related records are handled by cascade
+            # Deleting related records is handled by cascade
             query.delete(synchronize_session=False)
             logger.info(f"Deleted {count} emails older than {retention_days} days")
         

@@ -759,15 +759,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const applyActionFiltersBtn = document.getElementById('applyActionFilters');
     if (applyActionFiltersBtn) {
         applyActionFiltersBtn.addEventListener('click', () => {
-            currentActionsFilters = {
-                status: document.getElementById('filterActionStatus').value || null,
-                action_type: document.getElementById('filterActionType').value || null
-            };
+            const statusValue = document.getElementById('filterActionStatus').value;
+            const typeValue = document.getElementById('filterActionType').value;
             
-            // Remove null values
-            Object.keys(currentActionsFilters).forEach(key => 
-                currentActionsFilters[key] === null && delete currentActionsFilters[key]
-            );
+            currentActionsFilters = {};
+            if (statusValue) currentActionsFilters.status = statusValue;
+            if (typeValue) currentActionsFilters.action_type = typeValue;
             
             currentActionsPage = 1;
             loadPendingActions();

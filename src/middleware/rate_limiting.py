@@ -34,8 +34,16 @@ def get_client_identifier(request: Request) -> str:
         # Get list of trusted proxy IPs
         trusted_ips = settings.get_trusted_proxy_ips()
         
-        # If trusted IPs list is empty, trust all proxies (as per documentation requirement)
-        # If list exists, only trust if direct IP is in the list
+        # Security: Require explicit trusted IPs when TRUST_PROXY is enabled
+        # Empty list means "trust all proxies" - log warning about potential security risk
+        if not trusted_ips:
+            logger.warning(
+                "TRUST_PROXY is enabled with empty TRUSTED_PROXY_IPS - trusting all proxies. "
+                "This is a security risk as it allows IP spoofing. "
+                "Set TRUSTED_PROXY_IPS to specific proxy IP addresses."
+            )
+        
+        # Only trust headers if direct IP is in trusted list (or list is empty)
         if not trusted_ips or direct_ip in trusted_ips:
             # Try X-Real-IP first (single IP, simpler)
             real_ip = request.headers.get("X-Real-IP")

@@ -716,12 +716,18 @@ async def apply_actions(
                     applied_count += 1
                     logger.info(f"Action {action.id} marked as applied (SAFE_MODE)")
                 else:
-                    # TODO: Implement actual IMAP operations here
-                    # For now, just mark as applied
-                    action.status = 'APPLIED'
-                    action.applied_at = datetime.utcnow()
-                    applied_count += 1
-                    logger.info(f"Action {action.id} applied")
+                    # TODO: Implement actual IMAP operations
+                    # For now, reject application when safe mode is disabled
+                    # until IMAP operations are implemented
+                    raise NotImplementedError(
+                        "IMAP operations not yet implemented. "
+                        "Please enable SAFE_MODE to test approval workflow."
+                    )
+            except NotImplementedError as e:
+                action.status = 'FAILED'
+                action.error_message = str(e)
+                failed_count += 1
+                logger.warning(f"Action {action.id} failed: {e}")
             except Exception as e:
                 action.status = 'FAILED'
                 action.error_message = str(e)
