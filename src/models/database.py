@@ -170,6 +170,39 @@ class FolderPattern(Base):
     last_applied = Column(DateTime)
 
 
+class PendingAction(Base):
+    """Pending IMAP action requiring approval"""
+    __tablename__ = "pending_actions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, index=True, nullable=False)
+    approved_at = Column(DateTime)
+    applied_at = Column(DateTime)
+    
+    # Action details
+    email_id = Column(Integer, ForeignKey("processed_emails.id"), nullable=False, index=True)
+    action_type = Column(String(50), nullable=False, index=True)  # MARK_READ, MOVE_FOLDER, FLAG, DELETE
+    target_folder = Column(String(200))  # Only for MOVE_FOLDER
+    reason = Column(String(200))  # spam, action_required, archive_policy, ai_suggestion, etc.
+    proposed_by = Column(String(50), nullable=False)  # system or user
+    
+    # Status tracking
+    status = Column(String(20), nullable=False, default="PENDING", index=True)  # PENDING, APPROVED, REJECTED, APPLIED, FAILED
+    approved_by = Column(String(200))  # Safe placeholder like token hash
+    
+    # Error tracking
+    error_code = Column(String(50))
+    error_message = Column(Text)  # Sanitized error message
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_status_created', 'status', 'created_at'),
+        Index('idx_email_status', 'email_id', 'status'),
+    )
+
+
 class AuditLog(Base):
     """Audit log for all actions"""
     __tablename__ = "audit_logs"

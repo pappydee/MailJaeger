@@ -31,6 +31,7 @@ from src.middleware.auth import require_authentication, AuthenticationError
 from src.middleware.security_headers import SecurityHeadersMiddleware
 from src.middleware.rate_limiting import limiter, rate_limit_exceeded_handler
 from src.utils.logging import setup_logging, get_logger
+from src.api.pending_actions import router as pending_actions_router
 
 # Setup logging
 setup_logging()
@@ -120,7 +121,37 @@ async def global_auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# Request size limit (10MB default for API requests)
+# Host allowlist validation middleware
+@app.middleware("http")
+async def host_allowlist_middleware(request: Request, call_next):
+    """
+    Validate Host header against allowlist if configured
+    """
+    allowed_hosts = settings.get_allowed_hosts()
+    
+    if allowed_hosts:
+        host_header = request.headers.get("host", "")
+        
+        # Handle IPv6 addresses: [::1]:8000 -> [::1]
+        # Handle IPv4/hostname with port: example.com:8000 -> example.com
+        if host_header.startswith("["):
+            # IPv6 address
+            host = host_header.split("]")[0] + "]" if "]" in host_header else host_header
+        else:
+            # IPv4 or hostname
+            host = host_header.split(":")[0] if ":" in host_header else host_header
+        
+        if host not in allowed_hosts:
+            logger.warning(f"Rejected request with invalid Host header: {host}")
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Invalid Host header"}
+            )
+    
+    return await call_next(request)
+
+
+# Request size limit (1MB default for API requests - reduced from 10MB)
 # This prevents large payload attacks
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
@@ -128,7 +159,7 @@ from starlette.responses import Response as StarletteResponse
 
 class RequestSizeLimiterMiddleware(BaseHTTPMiddleware):
     """Middleware to limit request body size"""
-    def __init__(self, app, max_size: int = 10 * 1024 * 1024):  # 10MB default
+    def __init__(self, app, max_size: int = 1 * 1024 * 1024):  # 1MB default
         super().__init__(app)
         self.max_size = max_size
     
@@ -144,13 +175,16 @@ class RequestSizeLimiterMiddleware(BaseHTTPMiddleware):
                 )
         return await call_next(request)
 
-app.add_middleware(RequestSizeLimiterMiddleware, max_size=10 * 1024 * 1024)
+app.add_middleware(RequestSizeLimiterMiddleware, max_size=1 * 1024 * 1024)
 
 # Add security headers middleware
 app.add_middleware(SecurityHeadersMiddleware)
 
 # Add rate limiting state
 app.state.limiter = limiter
+
+# Include API routers
+app.include_router(pending_actions_router)
 
 # Mount static files (frontend) - will be protected by global auth middleware
 frontend_dir = Path(__file__).parent.parent / "frontend"
@@ -520,13 +554,20 @@ async def get_processing_run(run_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/settings", dependencies=[Depends(require_authentication)])
 async def get_settings_api():
-    """Get current settings (sanitized - no sensitive credentials)"""
+    """
+    Get current settings (sanitized - no sensitive credentials)
+    
+    SECURITY: Never returns IMAP credentials, API keys, or file paths to secrets
+    """
+    # Only return non-sensitive settings
     return {
         "imap_host": settings.imap_host,
         "imap_port": settings.imap_port,
+        # NEVER return: imap_username, imap_password, imap_password_file
         "spam_threshold": settings.spam_threshold,
         "ai_endpoint": settings.ai_endpoint,
         "ai_model": settings.ai_model,
+        # NEVER return: api_key, api_key_file
         "schedule_time": settings.schedule_time,
         "schedule_timezone": settings.schedule_timezone,
         "learning_enabled": settings.learning_enabled,
@@ -534,7 +575,15 @@ async def get_settings_api():
         "store_email_body": settings.store_email_body,
         "store_attachments": settings.store_attachments,
         "safe_mode": settings.safe_mode,
-        "mark_as_read": settings.mark_as_read
+        "mark_as_read": settings.mark_as_read,
+        "delete_spam": settings.delete_spam,
+        "quarantine_folder": settings.quarantine_folder,
+        "require_approval": settings.require_approval,
+        "auto_apply_approved_actions": settings.auto_apply_approved_actions,
+        "approval_default_page_size": settings.approval_default_page_size,
+        "allowed_move_folders": settings.get_allowed_folders(),
+        "retention_days_emails": settings.retention_days_emails,
+        "retention_days_actions": settings.retention_days_actions
     }
 
 

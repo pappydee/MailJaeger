@@ -26,12 +26,13 @@ class IMAPService:
         self.client: Optional[IMAPClient] = None
     
     def connect(self) -> bool:
-        """Connect to IMAP server"""
+        """Connect to IMAP server with timeout"""
         try:
             self.client = IMAPClient(
                 self.settings.imap_host,
                 port=self.settings.imap_port,
-                ssl=self.settings.imap_use_ssl
+                ssl=self.settings.imap_use_ssl,
+                timeout=self.settings.imap_connect_timeout
             )
             # Get password from settings (handles file-based secrets)
             password = self.settings.get_imap_password()

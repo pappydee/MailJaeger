@@ -526,6 +526,8 @@ MailJaeger/
 │   │   ├── email_processor.py
 │   │   ├── imap_service.py
 │   │   ├── learning_service.py
+│   │   ├── pending_actions_service.py
+│   │   ├── retention_service.py
 │   │   ├── scheduler.py
 │   │   └── search_service.py
 │   ├── utils/            # Utilities
@@ -535,10 +537,79 @@ MailJaeger/
 └── README.md             # This file
 ```
 
+## Approval Workflow
+
+MailJaeger supports an optional approval workflow for all IMAP actions (mark read, move, flag, delete). This ensures human oversight before any email actions are performed.
+
+### Enabling Approval Workflow
+
+Set in `.env`:
+```bash
+REQUIRE_APPROVAL=true
+SAFE_MODE=false  # Turn off safe mode to allow actions after approval
+```
+
+### How It Works
+
+1. **Email Processing**: When `REQUIRE_APPROVAL=true`, the system analyzes emails but does not perform IMAP actions immediately
+2. **Action Enqueue**: Instead, proposed actions are stored in `pending_actions` table with status `PENDING`
+3. **Review**: Access pending actions via `/api/pending-actions` endpoint
+4. **Approval**: Approve or reject actions via API endpoints
+5. **Apply**: Once approved, actions can be applied individually or in batch
+
+### API Endpoints
+
+```bash
+# List pending actions
+GET /api/pending-actions?status=PENDING
+Authorization: Bearer YOUR_API_KEY
+
+# Get summary
+GET /api/pending-actions/summary
+Authorization: Bearer YOUR_API_KEY
+
+# Approve an action
+POST /api/pending-actions/{action_id}/approve
+Authorization: Bearer YOUR_API_KEY
+
+# Reject an action
+POST /api/pending-actions/{action_id}/reject
+Authorization: Bearer YOUR_API_KEY
+
+# Apply a single approved action
+POST /api/pending-actions/{action_id}/apply
+Authorization: Bearer YOUR_API_KEY
+
+# Batch apply (up to MAX_PENDING_ACTIONS_PER_RUN)
+POST /api/pending-actions/apply
+Authorization: Bearer YOUR_API_KEY
+Content-Type: application/json
+{"max_count": 100}
+```
+
+### Folder Allowlist
+
+Configure which folders can be used for move operations:
+```bash
+ALLOWED_MOVE_FOLDERS=Quarantine,Archive,Work,Personal
+```
+
+Actions attempting to move to unlisted folders are automatically marked as `FAILED` with error code `FOLDER_NOT_ALLOWED`.
+
+### Data Retention
+
+Configure automatic purge of old data:
+```bash
+RETENTION_DAYS_EMAILS=30      # Purge emails older than 30 days
+RETENTION_DAYS_ACTIONS=90     # Purge completed actions older than 90 days
+```
+
+**Note**: `PENDING` and `APPROVED` actions are never purged automatically.
+
 ## Roadmap
 
 Version 1.0 includes all core features as specified. Future enhancements:
-- [ ] Web UI dashboard
+- [ ] Web UI for approval workflow
 - [ ] Mobile app support
 - [ ] Calendar integration
 - [ ] Attachment analysis

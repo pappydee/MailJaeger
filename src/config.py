@@ -28,6 +28,16 @@ class Settings(BaseSettings):
         default=False,
         description="Trust X-Forwarded-* headers from reverse proxy (enable only when behind trusted proxy)"
     )
+    trusted_proxy_ips: str = Field(
+        default="",
+        description="Comma-separated list of trusted proxy IP addresses (empty = trust all when TRUST_PROXY=true)"
+    )
+    
+    def get_trusted_proxy_ips(self) -> List[str]:
+        """Get list of trusted proxy IPs"""
+        if not self.trusted_proxy_ips:
+            return []
+        return [ip.strip() for ip in self.trusted_proxy_ips.split(',') if ip.strip()]
     
     # Server Configuration
     server_host: str = Field(
@@ -35,6 +45,18 @@ class Settings(BaseSettings):
         description="Server bind address (use 127.0.0.1 for local-only, 0.0.0.0 for external)"
     )
     server_port: int = Field(default=8000, description="Server port")
+    
+    # Host allowlist
+    allowed_hosts: str = Field(
+        default="",
+        description="Comma-separated list of allowed Host header values (empty = allow all)"
+    )
+    
+    def get_allowed_hosts(self) -> List[str]:
+        """Get list of allowed hosts"""
+        if not self.allowed_hosts:
+            return []
+        return [host.strip() for host in self.allowed_hosts.split(',') if host.strip()]
     
     # CORS Configuration
     cors_origins: str = Field(
@@ -144,6 +166,36 @@ class Settings(BaseSettings):
         description="Quarantine folder for suspected spam"
     )
     
+    # Approval Workflow
+    require_approval: bool = Field(
+        default=True,
+        description="Require approval before applying IMAP actions"
+    )
+    auto_apply_approved_actions: bool = Field(
+        default=False,
+        description="Automatically apply approved actions"
+    )
+    approval_default_page_size: int = Field(
+        default=50,
+        ge=1,
+        le=100,
+        description="Default page size for pending actions list"
+    )
+    max_pending_actions_per_run: int = Field(
+        default=500,
+        ge=1,
+        le=1000,
+        description="Maximum pending actions to process in batch apply"
+    )
+    allowed_move_folders: str = Field(
+        default="Quarantine,Archive",
+        description="Comma-separated list of allowed folders for move operations"
+    )
+    
+    def get_allowed_folders(self) -> List[str]:
+        """Get list of allowed move folders"""
+        return [f.strip() for f in self.allowed_move_folders.split(',') if f.strip()]
+    
     # Storage
     store_email_body: bool = Field(
         default=False,
@@ -166,6 +218,44 @@ class Settings(BaseSettings):
     embeddings_model: str = Field(
         default="all-MiniLM-L6-v2",
         description="Model for semantic embeddings"
+    )
+    
+    # Retention and Purge
+    retention_days_emails: int = Field(
+        default=30,
+        ge=0,
+        description="Days to retain processed emails before purging (0 = never purge)"
+    )
+    retention_days_actions: int = Field(
+        default=90,
+        ge=0,
+        description="Days to retain completed/failed actions before purging (0 = never purge)"
+    )
+    
+    # Timeouts
+    imap_connect_timeout: int = Field(
+        default=30,
+        ge=5,
+        le=300,
+        description="IMAP connection timeout in seconds"
+    )
+    imap_operation_timeout: int = Field(
+        default=60,
+        ge=10,
+        le=300,
+        description="IMAP operation timeout in seconds"
+    )
+    llm_connect_timeout: int = Field(
+        default=10,
+        ge=5,
+        le=60,
+        description="LLM connection timeout in seconds"
+    )
+    llm_read_timeout: int = Field(
+        default=120,
+        ge=10,
+        le=600,
+        description="LLM read timeout in seconds"
     )
     
     # Logging
