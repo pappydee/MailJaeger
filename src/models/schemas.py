@@ -1,6 +1,7 @@
 """
 Pydantic models for API requests and responses
 """
+
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List
 from datetime import datetime
@@ -35,7 +36,7 @@ class TaskResponse(BaseModel):
     confidence: Optional[float] = None
     is_completed: bool
     completed_at: Optional[datetime] = None
-    
+
     class Config:
         from_attributes = True
 
@@ -61,7 +62,7 @@ class EmailResponse(BaseModel):
     tasks: List[TaskResponse] = []
     created_at: datetime
     processed_at: Optional[datetime] = None
-    
+
     class Config:
         from_attributes = True
 
@@ -84,7 +85,7 @@ class ProcessingRunResponse(BaseModel):
     emails_failed: int
     error_message: Optional[str] = None
     trigger_type: Optional[str] = None
-    
+
     class Config:
         from_attributes = True
 
@@ -165,7 +166,7 @@ class PendingActionResponse(BaseModel):
     approved_at: Optional[datetime] = None
     applied_at: Optional[datetime] = None
     error_message: Optional[str] = None
-    
+
     class Config:
         from_attributes = True
 
