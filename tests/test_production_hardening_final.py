@@ -14,31 +14,31 @@ import logging
 def build_fresh_app(env_dict):
     """
     Build a fresh app with the given environment variables.
-    
+
     This helper ensures tests are deterministic by:
     1. Patching os.environ with env_dict (clear=True)
     2. Reloading src.config to get fresh settings
     3. Reloading src.main to get a fresh app with new settings
     4. Returning the new app object
-    
+
     Args:
         env_dict: Dictionary of environment variables
-    
+
     Returns:
         Fresh FastAPI app instance
     """
     # Import modules
     import src.config
     import src.main
-    
+
     # Patch environment and reload
     with patch.dict(os.environ, env_dict, clear=True):
         # Reload config module to clear cached settings
         importlib.reload(src.config)
-        
+
         # Reload main module to get fresh app with new settings
         importlib.reload(src.main)
-        
+
         return src.main.app
 
 

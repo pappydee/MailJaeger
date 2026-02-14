@@ -1,6 +1,7 @@
 """
 Database setup and session management
 """
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
@@ -20,22 +21,24 @@ _SessionLocal = None
 def init_db():
     """Initialize database connection and create tables"""
     global _engine, _SessionLocal
-    
+
     settings = get_settings()
-    
+
     # Create engine
     _engine = create_engine(
         settings.database_url,
-        connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {},
-        pool_pre_ping=True
+        connect_args=(
+            {"check_same_thread": False} if "sqlite" in settings.database_url else {}
+        ),
+        pool_pre_ping=True,
     )
-    
+
     # Create session factory
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
-    
+
     # Create tables
     Base.metadata.create_all(bind=_engine)
-    
+
     logger.info("Database initialized successfully")
 
 
