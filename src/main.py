@@ -44,12 +44,16 @@ try:
     settings = get_settings()
     settings.validate_required_settings()
 except ValueError as e:
-    logger.error(f"Configuration validation failed: {e}")
+    # Use sanitize_error to prevent credential leakage in logs
+    sanitized = sanitize_error(e, debug=False)
+    logger.error("Configuration validation failed: %s", sanitized)
     print(f"\n❌ Configuration Error:\n{e}\n", file=sys.stderr)
     print("Please check your .env file and environment variables.", file=sys.stderr)
     sys.exit(1)
 except Exception as e:
-    logger.error(f"Failed to load configuration: {e}")
+    # Use sanitize_error to prevent credential leakage in logs
+    sanitized = sanitize_error(e, debug=False)
+    logger.error("Failed to load configuration: %s", sanitized)
     print(f"\n❌ Configuration Error: {e}\n", file=sys.stderr)
     sys.exit(1)
 
