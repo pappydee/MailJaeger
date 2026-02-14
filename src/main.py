@@ -566,13 +566,7 @@ async def list_pending_actions(
     
     actions = query.order_by(PendingAction.created_at.desc()).all()
     
-    # Convert to response with email data
-    result = []
-    for action in actions:
-        action_dict = PendingActionWithEmailResponse.from_orm(action)
-        result.append(action_dict)
-    
-    return result
+    return actions
 
 
 @app.get("/api/pending-actions/{action_id}", response_model=PendingActionWithEmailResponse, dependencies=[Depends(require_authentication)])
