@@ -549,3 +549,300 @@ body {
         grid-template-columns: 1fr;
     }
 }
+
+/* ============================================================================
+   Tabs Navigation
+   ============================================================================ */
+
+.tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+    border-bottom: 2px solid var(--border);
+}
+
+.tab-button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 20px;
+    background: transparent;
+    border: none;
+    border-bottom: 3px solid transparent;
+    color: var(--text-light);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.tab-button:hover {
+    color: var(--primary);
+    background: rgba(79, 70, 229, 0.05);
+}
+
+.tab-button.active {
+    color: var(--primary);
+    border-bottom-color: var(--primary);
+}
+
+.tab-button svg {
+    opacity: 0.7;
+}
+
+.tab-button.active svg {
+    opacity: 1;
+}
+
+/* ============================================================================
+   Pending Actions Container
+   ============================================================================ */
+
+.pending-actions-container {
+    background: var(--surface);
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.batch-operations {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 20px;
+    padding: 16px;
+    background: #F9FAFB;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+}
+
+.batch-operations button {
+    flex: 1;
+    max-width: 200px;
+}
+
+.actions-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.action-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    transition: all 0.2s;
+}
+
+.action-item:hover {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.action-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 12px;
+    gap: 16px;
+}
+
+.action-info {
+    flex: 1;
+}
+
+.action-type {
+    font-weight: 600;
+    font-size: 16px;
+    color: var(--text);
+    margin-bottom: 4px;
+}
+
+.action-email-ref {
+    font-size: 13px;
+    color: var(--text-light);
+    margin-bottom: 8px;
+}
+
+.action-reason {
+    font-size: 14px;
+    color: var(--text);
+    margin-top: 8px;
+    padding: 8px;
+    background: #F9FAFB;
+    border-radius: 6px;
+}
+
+.action-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--text-light);
+    margin-top: 8px;
+}
+
+.action-meta span {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.action-buttons {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.action-buttons button {
+    padding: 8px 16px;
+    font-size: 13px;
+    min-width: 80px;
+}
+
+.action-status {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.action-status.PENDING {
+    background: #FEF3C7;
+    color: #92400E;
+}
+
+.action-status.APPROVED {
+    background: #D1FAE5;
+    color: #065F46;
+}
+
+.action-status.REJECTED {
+    background: #FEE2E2;
+    color: #991B1B;
+}
+
+.action-status.APPLIED {
+    background: #DBEAFE;
+    color: #1E40AF;
+}
+
+.action-status.FAILED {
+    background: #FEE2E2;
+    color: #991B1B;
+}
+
+.pagination {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 16px;
+    margin-top: 20px;
+    padding: 16px;
+}
+
+.pagination button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+#actionsPageInfo {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text);
+}
+
+/* ============================================================================
+   Button Variants
+   ============================================================================ */
+
+.btn-success {
+    background: var(--success);
+    color: white;
+}
+
+.btn-success:hover {
+    background: #059669;
+}
+
+.btn-danger {
+    background: var(--danger);
+    color: white;
+}
+
+.btn-danger:hover {
+    background: #DC2626;
+}
+
+.btn-warning {
+    background: var(--warning);
+    color: white;
+}
+
+.btn-warning:hover {
+    background: #D97706;
+}
+
+/* ============================================================================
+   Toast Notifications
+   ============================================================================ */
+
+.toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    padding: 16px 24px;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    font-size: 14px;
+    font-weight: 500;
+    z-index: 10000;
+    animation: slideIn 0.3s ease-out;
+}
+
+.toast.success {
+    background: var(--success);
+    color: white;
+}
+
+.toast.error {
+    background: var(--danger);
+    color: white;
+}
+
+@keyframes slideIn {
+    from {
+        transform: translateX(400px);
+        opacity: 0;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+/* Email detail - proposed actions subsection */
+.proposed-actions {
+    margin-top: 16px;
+}
+
+.proposed-actions-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.proposed-action-item {
+    padding: 12px;
+    background: #F9FAFB;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+}
+
+.proposed-action-item .action-type {
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 4px;
+}

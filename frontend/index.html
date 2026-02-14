@@ -108,6 +108,23 @@
             </div>
         </div>
 
+        <!-- Navigation Tabs -->
+        <div class="tabs">
+            <button class="tab-button active" id="tabEmails" onclick="switchTab('emails')">
+                <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                    <path d="M0 4a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V4z"/>
+                </svg>
+                Emails
+            </button>
+            <button class="tab-button" id="tabPendingActions" onclick="switchTab('pendingActions')">
+                <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                    <path d="M8 15A7 7 0 1 1 8 1a7 7 0 0 1 0 14zm0 1A8 8 0 1 0 8 0a8 8 0 0 0 0 16z"/>
+                    <path d="M10.97 4.97a.235.235 0 0 0-.02.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-1.071-1.05z"/>
+                </svg>
+                Pending Actions
+            </button>
+        </div>
+
         <!-- Filters -->
         <div class="filters">
             <div class="filter-group">
@@ -138,6 +155,56 @@
         <!-- Email List -->
         <div class="email-list" id="emailList">
             <div class="loading">Lade Emails...</div>
+        </div>
+
+        <!-- Pending Actions List -->
+        <div class="pending-actions-container" id="pendingActionsContainer" style="display: none;">
+            <!-- Action Filters -->
+            <div class="filters">
+                <div class="filter-group">
+                    <label>Filter nach:</label>
+                    <select id="filterActionStatus" class="filter-select">
+                        <option value="">Alle Status</option>
+                        <option value="PENDING">Pending</option>
+                        <option value="APPROVED">Approved</option>
+                        <option value="REJECTED">Rejected</option>
+                        <option value="APPLIED">Applied</option>
+                        <option value="FAILED">Failed</option>
+                    </select>
+                    <select id="filterActionType" class="filter-select">
+                        <option value="">Alle Typen</option>
+                        <option value="MOVE">Move</option>
+                        <option value="DELETE">Delete</option>
+                        <option value="MARK_READ">Mark Read</option>
+                    </select>
+                </div>
+                <button id="applyActionFilters" class="btn btn-secondary">Filter anwenden</button>
+            </div>
+
+            <!-- Batch Operations -->
+            <div class="batch-operations">
+                <button id="batchApprove" class="btn btn-success" onclick="batchApproveAll()">
+                    ✓ Approve all on page
+                </button>
+                <button id="batchReject" class="btn btn-danger" onclick="batchRejectAll()">
+                    ✗ Reject all on page
+                </button>
+                <button id="batchApply" class="btn btn-primary" onclick="batchApplyApproved()">
+                    ▶ Apply approved (batch)
+                </button>
+            </div>
+
+            <!-- Actions List -->
+            <div class="actions-list" id="actionsList">
+                <div class="loading">Lade Pending Actions...</div>
+            </div>
+
+            <!-- Pagination -->
+            <div class="pagination" id="actionsPagination" style="display: none;">
+                <button class="btn btn-secondary" id="actionsPrevPage" onclick="changeActionsPage(-1)">◀ Zurück</button>
+                <span id="actionsPageInfo">Seite 1</span>
+                <button class="btn btn-secondary" id="actionsNextPage" onclick="changeActionsPage(1)">Weiter ▶</button>
+            </div>
         </div>
 
         <!-- Email Detail Modal -->

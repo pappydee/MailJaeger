@@ -421,6 +421,13 @@ async function showEmailDetail(emailId) {
                 </div>
             ` : ''}
             
+            <div class="detail-section proposed-actions" id="proposedActionsSection">
+                <h3>Proposed Mailbox Actions</h3>
+                <div id="proposedActionsList">
+                    <div class="loading" style="font-size: 13px;">Lade Actions...</div>
+                </div>
+            </div>
+            
             ${!email.is_resolved ? `
                 <div class="detail-section">
                     <button class="btn btn-primary" onclick="markAsResolved(${email.id})">
@@ -429,6 +436,9 @@ async function showEmailDetail(emailId) {
                 </div>
             ` : ''}
         `;
+        
+        // Load pending actions for this email
+        loadEmailPendingActions(email.id);
     } catch (error) {
         console.error('Error loading email detail:', error);
         modalBody.innerHTML = '<div class="loading">Fehler beim Laden der Details</div>';
@@ -569,13 +579,418 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+function showToast(message, type = 'success') {
+    // Remove existing toasts
+    const existingToast = document.querySelector('.toast');
+    if (existingToast) {
+        existingToast.remove();
+    }
+    
+    // Create new toast
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    
+    // Remove after 3 seconds
+    setTimeout(() => {
+        toast.remove();
+    }, 3000);
+}
+
 function showSuccess(message) {
-    // Simple alert for now - could be replaced with toast notification
-    console.log('Success:', message);
+    showToast(message, 'success');
 }
 
 function showError(message) {
-    // Simple alert for now - could be replaced with toast notification
-    console.error('Error:', message);
-    alert(message);
+    showToast(message, 'error');
+}
+
+// ============================================================================
+// Pending Actions Tab
+// ============================================================================
+
+let currentActionsPage = 1;
+let currentActionsFilters = {
+    status: '',
+    action_type: ''
+};
+let allActions = [];
+
+// Switch between tabs
+function switchTab(tabName) {
+    // Update tab buttons
+    document.querySelectorAll('.tab-button').forEach(btn => {
+        btn.classList.remove('active');
+    });
+    
+    if (tabName === 'emails') {
+        document.getElementById('tabEmails').classList.add('active');
+        document.getElementById('emailList').style.display = 'flex';
+        document.querySelector('.filters').style.display = 'flex';
+        document.getElementById('pendingActionsContainer').style.display = 'none';
+    } else if (tabName === 'pendingActions') {
+        document.getElementById('tabPendingActions').classList.add('active');
+        document.getElementById('emailList').style.display = 'none';
+        document.querySelector('.filters').style.display = 'none';
+        document.getElementById('pendingActionsContainer').style.display = 'block';
+        
+        // Load pending actions when tab is opened
+        loadPendingActions();
+    }
+}
+
+// Load pending actions from API
+async function loadPendingActions() {
+    const actionsList = document.getElementById('actionsList');
+    actionsList.innerHTML = '<div class="loading">Lade Pending Actions...</div>';
+    
+    try {
+        const params = new URLSearchParams({
+            page: currentActionsPage,
+            page_size: 50,
+            ...currentActionsFilters
+        });
+        
+        // Remove empty values
+        for (const [key, value] of [...params.entries()]) {
+            if (!value) params.delete(key);
+        }
+        
+        const response = await fetch(`${API_BASE}/api/pending-actions?${params}`, {
+            headers: getAuthHeaders()
+        });
+        
+        if (handleAuthError(response)) return;
+        
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        allActions = await response.json();
+        renderPendingActions(allActions);
+        
+        // Update pagination
+        updateActionsPagination();
+    } catch (error) {
+        console.error('Error loading pending actions:', error);
+        actionsList.innerHTML = '<div class="loading">Fehler beim Laden der Pending Actions</div>';
+    }
+}
+
+// Render pending actions list
+function renderPendingActions(actions) {
+    const actionsList = document.getElementById('actionsList');
+    
+    if (!Array.isArray(actions)) {
+        console.error('Expected array but got:', typeof actions, actions);
+        actionsList.innerHTML = '<div class="loading">Fehler beim Laden der Pending Actions</div>';
+        return;
+    }
+    
+    if (actions.length === 0) {
+        actionsList.innerHTML = '<div class="loading">Keine Pending Actions gefunden</div>';
+        return;
+    }
+    
+    actionsList.innerHTML = actions.map(action => {
+        const isApplyEnabled = action.status === 'APPROVED';
+        const showActionButtons = action.status === 'PENDING';
+        
+        return `
+            <div class="action-item">
+                <div class="action-header">
+                    <div class="action-info">
+                        <div class="action-type">${escapeHtml(action.action_type)}</div>
+                        <div class="action-email-ref">Email ID: ${action.email_id}</div>
+                        <span class="action-status ${action.status}">${action.status}</span>
+                        ${action.target_folder ? `<div style="margin-top: 8px; font-size: 13px;">📁 Target: ${escapeHtml(action.target_folder)}</div>` : ''}
+                        ${action.reason ? `<div class="action-reason">${escapeHtml(action.reason)}</div>` : ''}
+                        <div class="action-meta">
+                            <span>📅 ${formatDateTime(action.created_at)}</span>
+                            <span>👤 Proposed by: ${escapeHtml(action.proposed_by)}</span>
+                            ${action.approved_by ? `<span>✓ Approved by: ${escapeHtml(action.approved_by)}</span>` : ''}
+                            ${action.applied_at ? `<span>✓ Applied: ${formatDateTime(action.applied_at)}</span>` : ''}
+                            ${action.error_message ? `<span style="color: var(--danger);">❌ Error: ${escapeHtml(action.error_message)}</span>` : ''}
+                        </div>
+                    </div>
+                    <div class="action-buttons">
+                        ${showActionButtons ? `
+                            <button class="btn btn-success" onclick="approveAction(${action.id})">✓ Approve</button>
+                            <button class="btn btn-danger" onclick="rejectAction(${action.id})">✗ Reject</button>
+                        ` : ''}
+                        ${isApplyEnabled ? `
+                            <button class="btn btn-primary" onclick="applyAction(${action.id})">▶ Apply</button>
+                        ` : ''}
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+// Update pagination controls
+function updateActionsPagination() {
+    const pagination = document.getElementById('actionsPagination');
+    const pageInfo = document.getElementById('actionsPageInfo');
+    const prevBtn = document.getElementById('actionsPrevPage');
+    const nextBtn = document.getElementById('actionsNextPage');
+    
+    if (allActions.length === 0) {
+        pagination.style.display = 'none';
+        return;
+    }
+    
+    pagination.style.display = 'flex';
+    pageInfo.textContent = `Seite ${currentActionsPage}`;
+    
+    prevBtn.disabled = currentActionsPage === 1;
+    nextBtn.disabled = allActions.length < 50;
+}
+
+// Change actions page
+function changeActionsPage(delta) {
+    currentActionsPage = Math.max(1, currentActionsPage + delta);
+    loadPendingActions();
+}
+
+// Apply action filters
+document.addEventListener('DOMContentLoaded', () => {
+    const applyActionFiltersBtn = document.getElementById('applyActionFilters');
+    if (applyActionFiltersBtn) {
+        applyActionFiltersBtn.addEventListener('click', () => {
+            const statusValue = document.getElementById('filterActionStatus').value;
+            const typeValue = document.getElementById('filterActionType').value;
+            
+            currentActionsFilters = {};
+            if (statusValue) currentActionsFilters.status = statusValue;
+            if (typeValue) currentActionsFilters.action_type = typeValue;
+            
+            currentActionsPage = 1;
+            loadPendingActions();
+        });
+    }
+});
+
+// Approve single action
+async function approveAction(actionId) {
+    try {
+        const response = await fetch(`${API_BASE}/api/pending-actions/approve`, {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+                action_ids: [actionId],
+                approved_by: 'admin'
+            })
+        });
+        
+        if (handleAuthError(response)) return;
+        
+        const result = await response.json();
+        
+        if (response.ok) {
+            showSuccess(result.message || 'Action approved');
+            loadPendingActions();
+        } else {
+            showError(result.detail || 'Failed to approve action');
+        }
+    } catch (error) {
+        console.error('Error approving action:', error);
+        showError('Fehler beim Genehmigen');
+    }
+}
+
+// Reject single action
+async function rejectAction(actionId) {
+    try {
+        const response = await fetch(`${API_BASE}/api/pending-actions/reject`, {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+                action_ids: [actionId],
+                approved_by: 'admin'
+            })
+        });
+        
+        if (handleAuthError(response)) return;
+        
+        const result = await response.json();
+        
+        if (response.ok) {
+            showSuccess(result.message || 'Action rejected');
+            loadPendingActions();
+        } else {
+            showError(result.detail || 'Failed to reject action');
+        }
+    } catch (error) {
+        console.error('Error rejecting action:', error);
+        showError('Fehler beim Ablehnen');
+    }
+}
+
+// Apply single action
+async function applyAction(actionId) {
+    try {
+        const response = await fetch(`${API_BASE}/api/pending-actions/apply`, {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+                action_ids: [actionId]
+            })
+        });
+        
+        if (handleAuthError(response)) return;
+        
+        const result = await response.json();
+        
+        if (response.ok) {
+            showSuccess(result.message || 'Action applied');
+            loadPendingActions();
+        } else {
+            showError(result.detail || 'Failed to apply action');
+        }
+    } catch (error) {
+        console.error('Error applying action:', error);
+        showError('Fehler beim Anwenden');
+    }
+}
+
+// Batch approve all on page
+async function batchApproveAll() {
+    const pendingActions = allActions.filter(a => a.status === 'PENDING');
+    
+    if (pendingActions.length === 0) {
+        showError('Keine pending actions auf dieser Seite');
+        return;
+    }
+    
+    try {
+        const response = await fetch(`${API_BASE}/api/pending-actions/approve`, {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+                action_ids: pendingActions.map(a => a.id),
+                approved_by: 'admin'
+            })
+        });
+        
+        if (handleAuthError(response)) return;
+        
+        const result = await response.json();
+        
+        if (response.ok) {
+            showSuccess(result.message || `${pendingActions.length} action(s) approved`);
+            loadPendingActions();
+        } else {
+            showError(result.detail || 'Failed to approve actions');
+        }
+    } catch (error) {
+        console.error('Error batch approving:', error);
+        showError('Fehler beim Batch-Genehmigen');
+    }
+}
+
+// Batch reject all on page
+async function batchRejectAll() {
+    const pendingActions = allActions.filter(a => a.status === 'PENDING');
+    
+    if (pendingActions.length === 0) {
+        showError('Keine pending actions auf dieser Seite');
+        return;
+    }
+    
+    try {
+        const response = await fetch(`${API_BASE}/api/pending-actions/reject`, {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+                action_ids: pendingActions.map(a => a.id),
+                approved_by: 'admin'
+            })
+        });
+        
+        if (handleAuthError(response)) return;
+        
+        const result = await response.json();
+        
+        if (response.ok) {
+            showSuccess(result.message || `${pendingActions.length} action(s) rejected`);
+            loadPendingActions();
+        } else {
+            showError(result.detail || 'Failed to reject actions');
+        }
+    } catch (error) {
+        console.error('Error batch rejecting:', error);
+        showError('Fehler beim Batch-Ablehnen');
+    }
+}
+
+// Batch apply approved actions
+async function batchApplyApproved() {
+    try {
+        const response = await fetch(`${API_BASE}/api/pending-actions/apply`, {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+                max_count: 100  // Apply up to 100 approved actions
+            })
+        });
+        
+        if (handleAuthError(response)) return;
+        
+        const result = await response.json();
+        
+        if (response.ok) {
+            showSuccess(result.message || 'Approved actions applied');
+            loadPendingActions();
+        } else {
+            showError(result.detail || 'Failed to apply actions');
+        }
+    } catch (error) {
+        console.error('Error batch applying:', error);
+        showError('Fehler beim Batch-Anwenden');
+    }
+}
+
+// Load pending actions for specific email
+async function loadEmailPendingActions(emailId) {
+    const proposedActionsList = document.getElementById('proposedActionsList');
+    
+    try {
+        const response = await fetch(`${API_BASE}/api/pending-actions?email_id=${emailId}`, {
+            headers: getAuthHeaders()
+        });
+        
+        if (handleAuthError(response)) return;
+        
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const actions = await response.json();
+        
+        if (!Array.isArray(actions) || actions.length === 0) {
+            proposedActionsList.innerHTML = '<div style="font-size: 13px; color: var(--text-light);">Keine Pending Actions für diese Email</div>';
+            return;
+        }
+        
+        proposedActionsList.innerHTML = `
+            <div class="proposed-actions-list">
+                ${actions.map(action => `
+                    <div class="proposed-action-item">
+                        <div class="action-type">${escapeHtml(action.action_type)}</div>
+                        <span class="action-status ${action.status}">${action.status}</span>
+                        ${action.target_folder ? `<div style="margin-top: 4px;">📁 ${escapeHtml(action.target_folder)}</div>` : ''}
+                        ${action.reason ? `<div style="margin-top: 4px; font-size: 12px; color: var(--text-light);">${escapeHtml(action.reason)}</div>` : ''}
+                        <div style="margin-top: 4px; font-size: 11px; color: var(--text-light);">
+                            Created: ${formatDateTime(action.created_at)}
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    } catch (error) {
+        console.error('Error loading email pending actions:', error);
+        proposedActionsList.innerHTML = '<div style="font-size: 13px; color: var(--danger);">Fehler beim Laden</div>';
+    }
 }

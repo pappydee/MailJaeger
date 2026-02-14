@@ -207,6 +207,118 @@ Interactive API documentation:
 - **Swagger UI**: http://localhost:8000/api/docs
 - **ReDoc**: http://localhost:8000/api/redoc
 
+### Approval Workflow
+
+MailJaeger supports an optional **approval workflow** for IMAP mailbox changes, providing an extra layer of control before actions are executed.
+
+#### Enabling Approval Mode
+
+Set `REQUIRE_APPROVAL=true` in your `.env` file to enable the approval workflow:
+
+```bash
+REQUIRE_APPROVAL=true
+```
+
+When enabled:
+- All proposed IMAP actions (move, delete, mark as read) are queued as **Pending Actions**
+- Actions require manual approval before execution
+- The system will **NOT** automatically modify your mailbox
+
+#### Using the Dashboard
+
+1. **Navigate to Pending Actions Tab**
+   - Open the dashboard at http://localhost:8000
+   - Click the "Pending Actions" tab in the navigation
+
+2. **Review Pending Actions**
+   - Each action shows: email ID, action type, target folder, reason, status
+   - Filter by status (PENDING, APPROVED, REJECTED, APPLIED) or action type
+
+3. **Approve or Reject Actions**
+   - **Per-row buttons**: Approve ✓ or Reject ✗ individual actions
+   - **Batch operations**:
+     - "Approve all on page" - approves all pending actions on current page
+     - "Reject all on page" - rejects all pending actions on current page
+
+4. **Apply Approved Actions**
+   - Click "Apply" button on individual approved actions
+   - Or use "Apply approved (batch)" to execute up to 100 approved actions at once
+   - Actions are executed only when explicitly applied
+
+#### Viewing Email Actions
+
+In the email detail view:
+- Look for the "Proposed Mailbox Actions" section
+- Shows all pending actions related to that specific email
+- Displays action status and timestamps
+
+#### API Examples
+
+**List pending actions:**
+```bash
+curl -X GET "http://localhost:8000/api/pending-actions?status=PENDING" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+**Approve actions:**
+```bash
+curl -X POST http://localhost:8000/api/pending-actions/approve \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"action_ids": [1, 2, 3], "approved_by": "admin"}'
+```
+
+**Reject actions:**
+```bash
+curl -X POST http://localhost:8000/api/pending-actions/reject \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"action_ids": [4, 5], "approved_by": "admin"}'
+```
+
+**Apply approved actions:**
+```bash
+curl -X POST http://localhost:8000/api/pending-actions/apply \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"max_count": 50}'
+```
+
+#### Data Retention
+
+Configure retention policies for old data:
+
+```bash
+# Days to retain processed emails (0 = keep forever)
+RETENTION_DAYS_EMAILS=90
+
+# Days to retain completed/rejected actions (0 = keep forever)
+RETENTION_DAYS_ACTIONS=30
+
+# Days to retain audit logs (0 = keep forever)
+RETENTION_DAYS_AUDIT=180
+```
+
+**Automatic Purge:**
+- Runs daily at 03:30 (local time)
+- Deletes data older than configured retention periods
+- PENDING and APPROVED actions are never auto-deleted
+
+**Manual Purge (Admin):**
+```bash
+# Dry run (preview what would be deleted)
+curl -X POST http://localhost:8000/api/purge \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"dry_run": true}'
+
+# Execute purge
+curl -X POST http://localhost:8000/api/purge \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"dry_run": false}'
+```
+
 ## 🔒 Security Configuration
 
 ### Default Security Settings
@@ -219,9 +331,12 @@ MailJaeger ships with secure defaults optimized for local deployment:
 | `SERVER_HOST` | `127.0.0.1` | Localhost-only (not publicly accessible) |
 | `CORS_ORIGINS` | `localhost:8000,127.0.0.1:8000` | Restrictive CORS policy |
 | `SAFE_MODE` | `true` | No destructive IMAP actions (dry-run) |
+| `REQUIRE_APPROVAL` | `false` | Manual approval for IMAP changes |
 | `STORE_EMAIL_BODY` | `false` | Data minimization (privacy) |
 | `MARK_AS_READ` | `false` | Keeps emails unread |
 | `DELETE_SPAM` | `false` | Moves to quarantine instead of deletion |
+| `TRUST_PROXY` | `false` | Honors X-Forwarded-* headers only when enabled |
+| `RETENTION_DAYS_*` | `0` | Keep all data forever (no auto-deletion) |
 
 ### Production Checklist
 

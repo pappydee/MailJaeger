@@ -145,3 +145,51 @@ class SettingsUpdate(BaseModel):
     learning_confidence_threshold: Optional[float] = Field(None, ge=0.0, le=1.0)
     store_email_body: Optional[bool] = None
     store_attachments: Optional[bool] = None
+
+
+class ActionStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    APPLIED = "APPLIED"
+    FAILED = "FAILED"
+
+
+class PendingActionResponse(BaseModel):
+    id: int
+    email_id: int
+    action_type: str
+    target_folder: Optional[str] = None
+    reason: Optional[str] = None
+    status: str
+    proposed_by: str
+    approved_by: Optional[str] = None
+    created_at: datetime
+    approved_at: Optional[datetime] = None
+    applied_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
+
+
+class PendingActionListRequest(BaseModel):
+    status: Optional[ActionStatus] = None
+    email_id: Optional[int] = None
+    action_type: Optional[str] = None
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=200)
+
+
+class ApproveRejectRequest(BaseModel):
+    action_ids: List[int]
+    approved_by: Optional[str] = Field(default="admin", description="User identifier")
+
+
+class ApplyActionsRequest(BaseModel):
+    action_ids: Optional[List[int]] = Field(default=None, description="Specific action IDs to apply, or None for all approved")
+    max_count: Optional[int] = Field(default=None, ge=1, description="Maximum number of actions to apply")
+
+
+class PurgeRequest(BaseModel):
+    dry_run: bool = Field(default=True, description="If true, only simulate purge without actually deleting")

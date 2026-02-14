@@ -28,6 +28,33 @@ class Settings(BaseSettings):
         default=False,
         description="Trust X-Forwarded-* headers from reverse proxy (enable only when behind trusted proxy)"
     )
+    trusted_proxy_ips: str = Field(
+        default="",
+        description="Comma-separated list of trusted proxy IP addresses. If empty and TRUST_PROXY=true, trusts all proxies (use with caution)"
+    )
+    
+    # Approval Workflow
+    require_approval: bool = Field(
+        default=False,
+        description="Require approval before executing IMAP changes (moves, deletions)"
+    )
+    
+    # Retention Settings
+    retention_days_emails: int = Field(
+        default=0,
+        ge=0,
+        description="Days to retain processed emails (0 = keep forever)"
+    )
+    retention_days_actions: int = Field(
+        default=0,
+        ge=0,
+        description="Days to retain completed/rejected pending actions (0 = keep forever)"
+    )
+    retention_days_audit: int = Field(
+        default=0,
+        ge=0,
+        description="Days to retain audit logs (0 = keep forever)"
+    )
     
     # Server Configuration
     server_host: str = Field(
@@ -217,6 +244,12 @@ class Settings(BaseSettings):
                 logger.error(f"Failed to load API keys from file {self.api_key_file}: {type(e).__name__}")
         
         return keys
+    
+    def get_trusted_proxy_ips(self) -> List[str]:
+        """Get list of trusted proxy IP addresses"""
+        if not self.trusted_proxy_ips:
+            return []
+        return [ip.strip() for ip in self.trusted_proxy_ips.split(',') if ip.strip()]
     
     def validate_required_settings(self):
         """Validate that required settings are present"""

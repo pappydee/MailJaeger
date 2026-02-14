@@ -18,15 +18,18 @@ from src.database.connection import init_db, get_db
 from src.models.schemas import (
     EmailResponse, EmailDetailResponse, DashboardResponse,
     ProcessingRunResponse, EmailListRequest, SearchRequest,
-    MarkResolvedRequest, TriggerRunRequest, SettingsUpdate
+    MarkResolvedRequest, TriggerRunRequest, SettingsUpdate,
+    PendingActionResponse, PendingActionListRequest,
+    ApproveRejectRequest, ApplyActionsRequest, PurgeRequest
 )
-from src.models.database import ProcessedEmail, ProcessingRun
+from src.models.database import ProcessedEmail, ProcessingRun, PendingAction
 from src.services.scheduler import get_scheduler
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
 from src.services.search_service import SearchService
 from src.services.learning_service import LearningService
 from src.services.email_processor import EmailProcessor
+from src.services.purge_service import PurgeService
 from src.middleware.auth import require_authentication, AuthenticationError
 from src.middleware.security_headers import SecurityHeadersMiddleware
 from src.middleware.rate_limiting import limiter, rate_limit_exceeded_handler
@@ -547,6 +550,384 @@ async def update_settings_api(request: SettingsUpdate):
         "success": True,
         "message": "Settings update requires restart to take effect"
     }
+
+
+
+
+# ============================================================================
+# Pending Actions Endpoints
+# ============================================================================
+
+@app.get("/api/pending-actions", response_model=List[PendingActionResponse], dependencies=[Depends(require_authentication)])
+@limiter.limit("60/minute")
+async def list_pending_actions(
+    request: Request,
+    status: Optional[str] = Query(None, description="Filter by status"),
+    email_id: Optional[int] = Query(None, description="Filter by email ID"),
+    action_type: Optional[str] = Query(None, description="Filter by action type"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db)
+):
+    """List pending actions with optional filters"""
+    try:
+        query = db.query(PendingAction)
+        
+        if status:
+            query = query.filter(PendingAction.status == status)
+        if email_id:
+            query = query.filter(PendingAction.email_id == email_id)
+        if action_type:
+            query = query.filter(PendingAction.action_type == action_type)
+        
+        # Order by created_at descending (newest first)
+        query = query.order_by(PendingAction.created_at.desc())
+        
+        # Pagination
+        offset = (page - 1) * page_size
+        actions = query.offset(offset).limit(page_size).all()
+        
+        return actions
+    except Exception as e:
+        logger.error(f"Error listing pending actions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list pending actions")
+
+
+@app.post("/api/pending-actions/approve", dependencies=[Depends(require_authentication)])
+@limiter.limit("30/minute")
+async def approve_actions(
+    request: Request,
+    approve_request: ApproveRejectRequest,
+    db: Session = Depends(get_db)
+):
+    """Approve pending actions"""
+    try:
+        actions = db.query(PendingAction).filter(
+            PendingAction.id.in_(approve_request.action_ids),
+            PendingAction.status == 'PENDING'
+        ).all()
+        
+        if not actions:
+            raise HTTPException(status_code=404, detail="No pending actions found with given IDs")
+        
+        for action in actions:
+            action.status = 'APPROVED'
+            action.approved_by = approve_request.approved_by
+            action.approved_at = datetime.utcnow()
+            
+            # Add audit log
+            audit = AuditLog(
+                event_type="ACTION_APPROVED",
+                email_message_id=None,
+                description=f"Action {action.id} approved by {approve_request.approved_by}",
+                data={
+                    "action_id": action.id,
+                    "action_type": action.action_type,
+                    "approved_by": approve_request.approved_by
+                }
+            )
+            db.add(audit)
+        
+        db.commit()
+        
+        logger.info(
+            f"Approved {len(actions)} actions by {approve_request.approved_by}"
+        )
+        
+        return {
+            "success": True,
+            "approved_count": len(actions),
+            "message": f"Approved {len(actions)} action(s)"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error approving actions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to approve actions")
+
+
+@app.post("/api/pending-actions/reject", dependencies=[Depends(require_authentication)])
+@limiter.limit("30/minute")
+async def reject_actions(
+    request: Request,
+    reject_request: ApproveRejectRequest,
+    db: Session = Depends(get_db)
+):
+    """Reject pending actions"""
+    try:
+        actions = db.query(PendingAction).filter(
+            PendingAction.id.in_(reject_request.action_ids),
+            PendingAction.status == 'PENDING'
+        ).all()
+        
+        if not actions:
+            raise HTTPException(status_code=404, detail="No pending actions found with given IDs")
+        
+        for action in actions:
+            action.status = 'REJECTED'
+            action.approved_by = reject_request.approved_by
+            action.approved_at = datetime.utcnow()
+            
+            # Add audit log
+            audit = AuditLog(
+                event_type="ACTION_REJECTED",
+                email_message_id=None,
+                description=f"Action {action.id} rejected by {reject_request.approved_by}",
+                data={
+                    "action_id": action.id,
+                    "action_type": action.action_type,
+                    "approved_by": reject_request.approved_by
+                }
+            )
+            db.add(audit)
+        
+        db.commit()
+        
+        logger.info(
+            f"Rejected {len(actions)} actions by {reject_request.approved_by}"
+        )
+        
+        return {
+            "success": True,
+            "rejected_count": len(actions),
+            "message": f"Rejected {len(actions)} action(s)"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error rejecting actions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to reject actions")
+
+
+@app.post("/api/pending-actions/apply", dependencies=[Depends(require_authentication)])
+@limiter.limit("10/minute")
+async def apply_actions(
+    request: Request,
+    apply_request: ApplyActionsRequest,
+    db: Session = Depends(get_db)
+):
+    """Apply approved actions to IMAP server"""
+    try:
+        settings = get_settings()
+        
+        # Build query for approved actions
+        query = db.query(PendingAction).filter(
+            PendingAction.status == 'APPROVED'
+        )
+        
+        if apply_request.action_ids:
+            query = query.filter(PendingAction.id.in_(apply_request.action_ids))
+        
+        query = query.order_by(PendingAction.created_at)
+        
+        if apply_request.max_count:
+            query = query.limit(apply_request.max_count)
+        
+        actions = query.all()
+        
+        if not actions:
+            return {
+                "success": True,
+                "applied_count": 0,
+                "failed_count": 0,
+                "message": "No approved actions to apply"
+            }
+        
+        # Apply actions atomically (each action isolated)
+        applied_count = 0
+        failed_count = 0
+        imap_service = None
+        
+        try:
+            # Initialize IMAP connection once for all actions
+            if not settings.safe_mode:
+                imap_service = IMAPService()
+        except Exception as e:
+            logger.error(f"Failed to initialize IMAP service: {e}", exc_info=True)
+            # Mark all actions as failed
+            for action in actions:
+                action.status = 'FAILED'
+                action.error_message = "IMAP connection failed"
+                action.applied_at = datetime.utcnow()
+                failed_count += 1
+            
+            db.commit()
+            return {
+                "success": False,
+                "applied_count": 0,
+                "failed_count": failed_count,
+                "message": "IMAP connection failed"
+            }
+        
+        for action in actions:
+            try:
+                if settings.safe_mode:
+                    # In safe mode, just mark as applied without actual IMAP
+                    action.status = 'APPLIED'
+                    action.applied_at = datetime.utcnow()
+                    applied_count += 1
+                    logger.info(
+                        f"Action {action.id} marked as applied (SAFE_MODE)"
+                    )
+                    
+                    # Add audit log
+                    audit = AuditLog(
+                        event_type="ACTION_APPLIED",
+                        email_message_id=None,
+                        description=f"Action {action.id} applied in safe mode",
+                        data={
+                            "action_id": action.id,
+                            "action_type": action.action_type,
+                            "safe_mode": True
+                        }
+                    )
+                    db.add(audit)
+                else:
+                    # Execute actual IMAP operation
+                    # Get the email to find UID
+                    email = db.query(ProcessedEmail).filter(
+                        ProcessedEmail.id == action.email_id
+                    ).first()
+                    
+                    if not email or not email.uid:
+                        raise ValueError("Email or UID not found")
+                    
+                    uid = email.uid
+                    success = False
+                    
+                    # Execute action based on type
+                    if action.action_type == "MOVE":
+                        if not action.target_folder:
+                            raise ValueError("Target folder required for MOVE")
+                        success = imap_service.move_to_folder(
+                            uid,
+                            action.target_folder
+                        )
+                        if success:
+                            email.is_archived = True
+                    
+                    elif action.action_type == "MARK_READ":
+                        success = imap_service.mark_as_read(uid)
+                    
+                    elif action.action_type == "FLAG":
+                        success = imap_service.add_flag(uid)
+                        if success:
+                            email.is_flagged = True
+                    
+                    elif action.action_type == "DELETE":
+                        # DELETE would move to trash/delete folder
+                        # For safety, treat as MOVE to spam
+                        success = imap_service.move_to_folder(
+                            uid,
+                            settings.spam_folder
+                        )
+                        if success:
+                            email.is_archived = True
+                    
+                    else:
+                        raise ValueError(
+                            f"Unknown action type: {action.action_type}"
+                        )
+                    
+                    if success:
+                        action.status = 'APPLIED'
+                        action.applied_at = datetime.utcnow()
+                        applied_count += 1
+                        logger.info(
+                            f"Action {action.id} applied successfully: "
+                            f"{action.action_type}"
+                        )
+                        
+                        # Add audit log
+                        audit = AuditLog(
+                            event_type="ACTION_APPLIED",
+                            email_message_id=email.message_id,
+                            description=(
+                                f"Action {action.action_type} applied "
+                                f"to email {email.message_id}"
+                            ),
+                            data={
+                                "action_id": action.id,
+                                "action_type": action.action_type,
+                                "target_folder": action.target_folder,
+                                "safe_mode": False
+                            }
+                        )
+                        db.add(audit)
+                    else:
+                        raise RuntimeError("IMAP operation failed")
+                        
+            except Exception as e:
+                # Sanitize error message - never expose credentials or internal details
+                error_msg = "Operation failed"
+                if settings.debug:
+                    error_msg = str(e)
+                else:
+                    # In production, use generic error message
+                    if "password" in str(e).lower() or "credential" in str(e).lower():
+                        error_msg = "Authentication error"
+                    elif "connection" in str(e).lower():
+                        error_msg = "Connection error"
+                    elif "not found" in str(e).lower():
+                        error_msg = "Resource not found"
+                    else:
+                        error_msg = "Operation failed"
+                
+                action.status = 'FAILED'
+                action.error_message = error_msg
+                action.applied_at = datetime.utcnow()
+                failed_count += 1
+                logger.error(
+                    f"Failed to apply action {action.id}: {type(e).__name__}",
+                    exc_info=settings.debug
+                )
+        
+        db.commit()
+        
+        return {
+            "success": True,
+            "applied_count": applied_count,
+            "failed_count": failed_count,
+            "message": f"Applied {applied_count} action(s), {failed_count} failed"
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error applying actions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to apply actions")
+
+
+# ============================================================================
+# Purge Endpoint
+# ============================================================================
+
+@app.post("/api/purge", dependencies=[Depends(require_authentication)])
+@limiter.limit("2/hour")  # Strict rate limit for admin operations
+async def trigger_purge(
+    request: Request,
+    purge_request: PurgeRequest,
+    db: Session = Depends(get_db)
+):
+    """Manually trigger data purge (admin only)"""
+    try:
+        purge_service = PurgeService(db)
+        stats = purge_service.execute_purge(dry_run=purge_request.dry_run)
+        
+        return {
+            "success": True,
+            "dry_run": stats['dry_run'],
+            "stats": {
+                "emails_deleted": stats['emails_deleted'],
+                "actions_deleted": stats['actions_deleted'],
+                "audit_logs_deleted": stats['audit_logs_deleted']
+            },
+            "errors": stats['errors'],
+            "message": "Purge completed successfully" if not stats['errors'] else "Purge completed with errors"
+        }
+    except Exception as e:
+        logger.error(f"Error triggering purge: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to trigger purge")
 
 
 @app.get("/api/health")

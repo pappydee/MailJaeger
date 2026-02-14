@@ -7,7 +7,13 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from src.config import get_settings
-from src.models.database import ProcessedEmail, EmailTask, ProcessingRun, AuditLog
+from src.models.database import (
+    ProcessedEmail,
+    EmailTask,
+    ProcessingRun,
+    AuditLog,
+    PendingAction
+)
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
 from src.utils.logging import get_logger
@@ -174,13 +180,89 @@ class EmailProcessor:
             )
             email_record.tasks.append(task)
         
-        # Step 5: Mailbox Actions (with safe mode check)
+        # Step 5: Persistence (add email_record first to get ID)
+        self.db.add(email_record)
+        self.db.flush()  # Flush to get email_record.id for PendingActions
+        
+        # Step 6: Mailbox Actions (with approval workflow or safe mode)
         actions_taken = []
         
-        if self.settings.safe_mode:
+        if self.settings.require_approval:
+            # REQUIRE_APPROVAL=true: Queue actions as PendingActions
+            logger.info(
+                f"REQUIRE_APPROVAL enabled: Queuing actions for {message_id}"
+            )
+            actions_taken.append("queued_pending_actions")
+            
+            # Queue spam handling action
+            if is_spam:
+                if self.settings.delete_spam:
+                    pending_action = PendingAction(
+                        email_id=email_record.id,
+                        action_type="MOVE",
+                        target_folder=self.settings.spam_folder,
+                        reason=f"Spam detected (probability: {spam_probability:.2f})",
+                        status="PENDING",
+                        proposed_by="AI"
+                    )
+                else:
+                    pending_action = PendingAction(
+                        email_id=email_record.id,
+                        action_type="MOVE",
+                        target_folder=self.settings.quarantine_folder,
+                        reason=f"Spam quarantine (probability: {spam_probability:.2f})",
+                        status="PENDING",
+                        proposed_by="AI"
+                    )
+                self.db.add(pending_action)
+                logger.info(
+                    f"Queued MOVE action to {pending_action.target_folder}"
+                )
+            else:
+                # Queue mark as read if enabled
+                if self.settings.mark_as_read:
+                    pending_action = PendingAction(
+                        email_id=email_record.id,
+                        action_type="MARK_READ",
+                        reason="Mark processed email as read",
+                        status="PENDING",
+                        proposed_by="AI"
+                    )
+                    self.db.add(pending_action)
+                    logger.info("Queued MARK_READ action")
+                
+                # Queue move to archive
+                pending_action = PendingAction(
+                    email_id=email_record.id,
+                    action_type="MOVE",
+                    target_folder=self.settings.archive_folder,
+                    reason=f"Archive processed email (category: {analysis['category']})",
+                    status="PENDING",
+                    proposed_by="AI"
+                )
+                self.db.add(pending_action)
+                logger.info(f"Queued MOVE action to {self.settings.archive_folder}")
+                
+                # Queue flag if action required
+                if action_required:
+                    pending_action = PendingAction(
+                        email_id=email_record.id,
+                        action_type="FLAG",
+                        reason="Action required flag",
+                        status="PENDING",
+                        proposed_by="AI"
+                    )
+                    self.db.add(pending_action)
+                    logger.info("Queued FLAG action")
+                    self.stats['action_required'] += 1
+        
+        elif self.settings.safe_mode:
+            # SAFE_MODE=true: Skip actions (dry-run)
             logger.info(f"SAFE MODE: Skipping IMAP actions for {message_id}")
             actions_taken.append("safe_mode_skip")
+        
         else:
+            # REQUIRE_APPROVAL=false, SAFE_MODE=false: Execute immediately
             if is_spam:
                 # Handle spam based on configuration
                 if self.settings.delete_spam:
@@ -189,14 +271,19 @@ class EmailProcessor:
                         actions_taken.append("moved_to_spam")
                         email_record.is_archived = True
                         self.stats['spam'] += 1
-                        logger.info(f"Moved spam email to {self.settings.spam_folder}")
+                        logger.info(
+                            f"Moved spam email to {self.settings.spam_folder}"
+                        )
                 else:
                     # Move to quarantine folder for review
                     if imap.move_to_folder(uid, self.settings.quarantine_folder):
                         actions_taken.append("moved_to_quarantine")
                         email_record.is_archived = True
                         self.stats['spam'] += 1
-                        logger.info(f"Moved spam email to quarantine: {self.settings.quarantine_folder}")
+                        logger.info(
+                            f"Moved spam email to quarantine: "
+                            f"{self.settings.quarantine_folder}"
+                        )
             else:
                 # Mark as read if configured
                 if self.settings.mark_as_read:
@@ -218,10 +305,7 @@ class EmailProcessor:
         
         email_record.actions_taken = {"actions": actions_taken}
         
-        # Step 6: Persistence
-        self.db.add(email_record)
-        
-        # Add audit log
+        # Step 7: Add audit log
         audit = AuditLog(
             event_type="EMAIL_PROCESSED",
             email_message_id=message_id,
