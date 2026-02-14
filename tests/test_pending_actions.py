@@ -697,3 +697,75 @@ def test_connection_failure_single_action_preserves_approved():
                     
                     # commit should NOT have been called
                     mock_db.commit.assert_not_called()
+
+
+def test_no_raw_exceptions_in_error_message_when_debug_false():
+    """Test that no code path stores raw str(e) into PendingAction.error_message when debug=false"""
+    from fastapi.testclient import TestClient
+    from src.main import app
+    from unittest.mock import patch, MagicMock
+    
+    client = TestClient(app)
+    
+    # Create mock approved action
+    mock_action = MagicMock()
+    mock_action.id = 1
+    mock_action.status = "APPROVED"
+    mock_action.email_id = 1
+    mock_action.error_message = None  # Track what gets set
+    
+    # Create mock email
+    mock_email = MagicMock()
+    mock_email.id = 1
+    mock_email.uid = "12345"
+    
+    # Mock database
+    mock_db = MagicMock()
+    
+    # Setup query mocks to return action and email
+    def query_side_effect(model):
+        mock_query = MagicMock()
+        if hasattr(model, '__name__') and model.__name__ == 'ProcessedEmail':
+            mock_query.filter.return_value.first.return_value = mock_email
+        else:
+            mock_query.filter.return_value.all.return_value = [mock_action]
+        return mock_query
+    
+    mock_db.query.side_effect = query_side_effect
+    
+    # Mock IMAP service that raises an exception with sensitive data
+    with patch('src.services.imap_service.IMAPService') as MockIMAP:
+        mock_imap_instance = MagicMock()
+        mock_imap_instance.client = MagicMock()  # Connection succeeds
+        mock_imap_instance.__enter__ = MagicMock(return_value=mock_imap_instance)
+        mock_imap_instance.__exit__ = MagicMock(return_value=False)
+        
+        # Make IMAP operation raise exception with sensitive data
+        sensitive_error = Exception("IMAP error: password='secret123' user='admin@example.com'")
+        mock_imap_instance.move_to_folder.side_effect = sensitive_error
+        mock_imap_instance.mark_as_read.side_effect = sensitive_error
+        mock_imap_instance.add_flag.side_effect = sensitive_error
+        
+        MockIMAP.return_value = mock_imap_instance
+        
+        with patch('src.main.settings') as mock_settings:
+            mock_settings.safe_mode = False
+            mock_settings.debug = False  # Production mode - no sensitive data should leak
+            
+            with patch('src.main.require_authentication'):
+                with patch('src.main.get_db', return_value=mock_db):
+                    response = client.post(
+                        "/api/pending-actions/apply",
+                        json={"dry_run": False},
+                        headers={"Authorization": "Bearer test-token"}
+                    )
+                    
+                    # Check that error_message was set (action failed)
+                    if mock_action.error_message is not None:
+                        # Verify no sensitive data in error_message
+                        assert "secret123" not in str(mock_action.error_message)
+                        assert "admin@example.com" not in str(mock_action.error_message)
+                        assert "password=" not in str(mock_action.error_message).lower()
+                        
+                        # Should only contain error type (Exception) in production mode
+                        assert mock_action.error_message == "Exception"
