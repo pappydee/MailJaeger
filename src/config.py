@@ -152,6 +152,20 @@ class Settings(BaseSettings):
         description="Quarantine folder for suspected spam"
     )
     
+    # Advanced Safety Controls
+    allow_destructive_imap: bool = Field(
+        default=False,
+        description="Allow destructive IMAP operations (DELETE/EXPUNGE) - requires explicit opt-in"
+    )
+    max_apply_per_request: int = Field(
+        default=20,
+        description="Maximum number of actions to apply per request (safety limit)"
+    )
+    safety_review_folder: str = Field(
+        default="MailJaeger/Review",
+        description="Safety folder for actions requiring additional review"
+    )
+    
     # Storage
     store_email_body: bool = Field(
         default=False,
@@ -226,24 +240,68 @@ class Settings(BaseSettings):
         
         return keys
     
+    def is_web_exposed(self) -> bool:
+        """
+        Check if deployment is web-exposed (internet-facing).
+        
+        Web-exposed means any of:
+        - SERVER_HOST is 0.0.0.0 (accessible from any interface)
+        - TRUST_PROXY is true (behind reverse proxy)
+        - ALLOWED_HOSTS is non-empty (configured for specific hosts)
+        
+        Returns:
+            True if deployment is web-exposed, False otherwise
+        """
+        if self.server_host == "0.0.0.0":
+            return True
+        if self.trust_proxy:
+            return True
+        if self.allowed_hosts and self.allowed_hosts.strip() != "":
+            return True
+        return False
+    
+    def get_safe_folders(self) -> List[str]:
+        """
+        Get list of safe folders where emails can be moved.
+        
+        Safe folders include:
+        - Configured spam folder
+        - Configured quarantine folder
+        - Configured archive folder
+        - Safety review folder
+        
+        Returns:
+            List of safe folder names
+        """
+        folders = [
+            self.spam_folder,
+            self.quarantine_folder,
+            self.archive_folder,
+            self.safety_review_folder
+        ]
+        # Remove duplicates and empty values
+        return list(set([f for f in folders if f and f.strip()]))
+    
     def validate_required_settings(self):
         """Validate that required settings are present"""
         errors = []
         
         # Check for production debug guard - prevent DEBUG=true in web-exposed deployments
-        # Web-exposed means: accessible from internet (0.0.0.0), behind proxy, or has allowed hosts set
-        is_web_exposed = (
-            self.server_host == "0.0.0.0" or 
-            self.trust_proxy or
-            (self.allowed_hosts and self.allowed_hosts.strip())
-        )
-        
-        if self.debug and is_web_exposed:
+        if self.debug and self.is_web_exposed():
             errors.append(
                 "DEBUG must be false in production/web-exposed deployments. "
                 "Running with DEBUG=true exposes sensitive information in logs and API responses. "
                 "Set DEBUG=false when SERVER_HOST=0.0.0.0, TRUST_PROXY=true, or ALLOWED_HOSTS is set."
             )
+        
+        # Fail-closed safety check: web-exposed deployments MUST have at least one safety control
+        if self.is_web_exposed():
+            if not self.safe_mode and not self.require_approval:
+                errors.append(
+                    "Fail-closed safety requirement: Web-exposed deployments (SERVER_HOST=0.0.0.0, "
+                    "TRUST_PROXY=true, or ALLOWED_HOSTS set) MUST enable at least one safety control. "
+                    "Set SAFE_MODE=true OR REQUIRE_APPROVAL=true to prevent direct IMAP actions on internet-facing instances."
+                )
         
         # Check IMAP credentials
         if not self.imap_host:

@@ -8,10 +8,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 import secrets
+import hashlib
 
 from src.config import get_settings
 from src.database.connection import init_db, get_db
@@ -20,9 +21,10 @@ from src.models.schemas import (
     ProcessingRunResponse, EmailListRequest, SearchRequest,
     MarkResolvedRequest, TriggerRunRequest, SettingsUpdate,
     PendingActionResponse, PendingActionWithEmailResponse,
-    ApproveActionRequest, ApplyActionsRequest
+    ApproveActionRequest, ApplyActionsRequest,
+    PreviewActionsRequest, PreviewActionsResponse, ApplyActionsResponse
 )
-from src.models.database import ProcessedEmail, ProcessingRun, PendingAction
+from src.models.database import ProcessedEmail, ProcessingRun, PendingAction, ApplyToken
 from src.services.scheduler import get_scheduler
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
@@ -603,16 +605,51 @@ async def list_pending_actions(
 
 # NOTE: Preview route MUST be defined BEFORE {action_id} route to avoid routing collision
 # FastAPI matches routes in order, so /preview would match /{action_id} if defined after
-@app.get("/api/pending-actions/preview", dependencies=[Depends(require_authentication)])
-async def preview_pending_actions(db: Session = Depends(get_db)):
-    """Preview all approved pending actions (dry-run)"""
-    actions = db.query(PendingAction).filter(
-        PendingAction.status == "APPROVED"
-    ).all()
+@app.post("/api/pending-actions/preview", response_model=PreviewActionsResponse, dependencies=[Depends(require_authentication)])
+async def preview_pending_actions(
+    request: PreviewActionsRequest = PreviewActionsRequest(),
+    db: Session = Depends(get_db)
+):
+    """
+    Preview pending actions and generate apply token for two-step safety.
     
+    Generates a short-lived token that must be used in the apply endpoint.
+    This prevents accidental "apply all" and ensures user reviews before applying.
+    """
+    # Get actions based on request
+    query = db.query(PendingAction).filter(PendingAction.status == "APPROVED")
+    
+    if request.action_ids:
+        # Specific actions requested
+        query = query.filter(PendingAction.id.in_(request.action_ids))
+        actions = query.all()
+    else:
+        # All approved actions, but respect max_count limit
+        max_count = request.max_count if request.max_count is not None else settings.max_apply_per_request
+        actions = query.limit(max_count).all()
+    
+    if not actions:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "apply_token": "",
+                "token_expires_at": None,
+                "action_count": 0,
+                "summary": {},
+                "actions": []
+            }
+        )
+    
+    # Build action preview and summary
     preview = []
+    summary = {"by_type": {}, "by_folder": {}}
+    action_ids = []
+    
     for action in actions:
         email = db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+        
+        action_ids.append(action.id)
         preview.append({
             "action_id": action.id,
             "email_id": action.email_id,
@@ -620,15 +657,45 @@ async def preview_pending_actions(db: Session = Depends(get_db)):
             "email_sender": email.sender if email else "Unknown",
             "action_type": action.action_type,
             "target_folder": action.target_folder,
-            "created_at": action.created_at,
-            "approved_at": action.approved_at
+            "created_at": action.created_at.isoformat() if action.created_at else None,
+            "approved_at": action.approved_at.isoformat() if action.approved_at else None
         })
+        
+        # Update summary
+        action_type = action.action_type
+        summary["by_type"][action_type] = summary["by_type"].get(action_type, 0) + 1
+        
+        if action.target_folder:
+            summary["by_folder"][action.target_folder] = summary["by_folder"].get(action.target_folder, 0) + 1
     
-    return {
-        "success": True,
-        "count": len(preview),
-        "actions": preview
-    }
+    # Generate apply token
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(minutes=5)  # 5 minute expiry
+    
+    # Clean up expired tokens
+    db.query(ApplyToken).filter(ApplyToken.expires_at < datetime.utcnow()).delete()
+    
+    # Create token record
+    apply_token = ApplyToken(
+        token=token,
+        action_ids=action_ids,
+        action_count=len(action_ids),
+        summary=summary,
+        expires_at=expires_at
+    )
+    db.add(apply_token)
+    db.commit()
+    
+    logger.info(f"Generated apply token for {len(action_ids)} actions (expires in 5 minutes)")
+    
+    return PreviewActionsResponse(
+        success=True,
+        apply_token=token,
+        token_expires_at=expires_at,
+        action_count=len(action_ids),
+        summary=summary,
+        actions=preview
+    )
 
 
 @app.get("/api/pending-actions/{action_id}", response_model=PendingActionWithEmailResponse, dependencies=[Depends(require_authentication)])
@@ -678,12 +745,21 @@ async def approve_pending_action(
     }
 
 
-@app.post("/api/pending-actions/apply", dependencies=[Depends(require_authentication)])
+@app.post("/api/pending-actions/apply", response_model=ApplyActionsResponse, dependencies=[Depends(require_authentication)])
 async def apply_all_approved_actions(
     request: ApplyActionsRequest = ApplyActionsRequest(),
     db: Session = Depends(get_db)
 ):
-    """Apply all approved pending actions to IMAP mailboxes"""
+    """
+    Apply approved pending actions to IMAP mailboxes with strict safety controls.
+    
+    Safety requirements:
+    - SAFE_MODE always wins (returns 409 if enabled)
+    - Requires apply_token from preview endpoint (two-step safety)
+    - Requires explicit action_ids OR max_count (prevents accidental "apply all")
+    - Blocks DELETE operations unless ALLOW_DESTRUCTIVE_IMAP=true
+    - Validates target folders against allowlist
+    """
     # Check SAFE_MODE first - it always wins
     if settings.safe_mode:
         return JSONResponse(
@@ -692,43 +768,108 @@ async def apply_all_approved_actions(
                 "success": False,
                 "message": "SAFE_MODE enabled; no actions applied",
                 "applied": 0,
-                "failed": 0
+                "failed": 0,
+                "actions": []
             }
         )
     
-    # Get all approved actions
+    # Require apply_token (two-step safety)
+    if not request.apply_token:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "Apply token required. Use /api/pending-actions/preview to generate token.",
+                "applied": 0,
+                "failed": 0,
+                "actions": []
+            }
+        )
+    
+    # Validate and consume apply_token
+    token_record = db.query(ApplyToken).filter(
+        ApplyToken.token == request.apply_token,
+        ApplyToken.is_used == False
+    ).first()
+    
+    if not token_record:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "Invalid or already used apply token",
+                "applied": 0,
+                "failed": 0,
+                "actions": []
+            }
+        )
+    
+    if token_record.expires_at < datetime.utcnow():
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "Apply token has expired. Generate a new token with /api/pending-actions/preview",
+                "applied": 0,
+                "failed": 0,
+                "actions": []
+            }
+        )
+    
+    # Get actions based on token (enforces preview-apply matching)
     actions = db.query(PendingAction).filter(
+        PendingAction.id.in_(token_record.action_ids),
         PendingAction.status == "APPROVED"
     ).all()
     
     if not actions:
-        return {
-            "success": True,
-            "message": "No approved actions to apply",
-            "applied": 0,
-            "failed": 0,
-            "actions": []
-        }
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": "No approved actions to apply",
+                "applied": 0,
+                "failed": 0,
+                "actions": []
+            }
+        )
+    
+    # Mark token as used
+    token_record.is_used = True
+    token_record.used_at = datetime.utcnow()
+    db.commit()
+    
+    # Get safe folders
+    safe_folders = settings.get_safe_folders()
     
     if request.dry_run:
         # Preview mode - just return what would be done
         preview = []
         for action in actions:
             email = db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+            
+            # Check safety validations
+            warnings = []
+            if action.action_type == "DELETE" and not settings.allow_destructive_imap:
+                warnings.append("DELETE blocked (ALLOW_DESTRUCTIVE_IMAP=false)")
+            if action.target_folder and action.target_folder not in safe_folders:
+                warnings.append(f"Target folder '{action.target_folder}' not in safe folder allowlist")
+            
             preview.append({
                 "action_id": action.id,
                 "email_id": action.email_id,
                 "email_subject": email.subject if email else "Unknown",
                 "action_type": action.action_type,
-                "target_folder": action.target_folder
+                "target_folder": action.target_folder,
+                "warnings": warnings
             })
         
-        return {
-            "success": True,
-            "dry_run": True,
-            "message": f"Would apply {len(preview)} actions",
-            "actions": preview
-        }
+        return ApplyActionsResponse(
+            success=True,
+            applied=0,
+            failed=0,
+            actions=preview
+        )
     
     # Apply actions - use context manager for IMAP connection
     applied = 0
@@ -774,6 +915,34 @@ async def apply_all_approved_actions(
                         })
                         continue
                     
+                    # Safety check: Block DELETE unless explicitly enabled
+                    if action.action_type == "DELETE":
+                        if not settings.allow_destructive_imap:
+                            action.status = "REJECTED"
+                            action.error_message = "DELETE blocked: ALLOW_DESTRUCTIVE_IMAP is false"
+                            failed += 1
+                            logger.warning(f"Blocked DELETE action {action.id}: destructive operations disabled")
+                            results.append({
+                                "action_id": action.id,
+                                "status": "REJECTED",
+                                "error": action.error_message
+                            })
+                            continue
+                    
+                    # Safety check: Validate target folder against allowlist
+                    if action.action_type == "MOVE_FOLDER":
+                        if action.target_folder not in safe_folders:
+                            action.status = "FAILED"
+                            action.error_message = f"Target folder not in safe folder allowlist. Allowed: {', '.join(safe_folders)}"
+                            failed += 1
+                            logger.error(f"Failed action {action.id}: target folder '{action.target_folder}' not in allowlist")
+                            results.append({
+                                "action_id": action.id,
+                                "status": "FAILED",
+                                "error": "Target folder not in safe folder allowlist"
+                            })
+                            continue
+                    
                     uid = int(email.uid)
                     success = False
                     
@@ -788,6 +957,9 @@ async def apply_all_approved_actions(
                         success = imap.add_flag(uid)
                         if success:
                             email.is_flagged = True
+                    elif action.action_type == "DELETE":
+                        # DELETE is already checked above; should not reach here unless enabled
+                        success = imap.delete_message(uid) if hasattr(imap, 'delete_message') else False
                     else:
                         action.status = "FAILED"
                         action.error_message = f"Unknown action type: {action.action_type}"
@@ -843,12 +1015,12 @@ async def apply_all_approved_actions(
             detail="Failed to apply actions" if not settings.debug else f"Failed to apply actions: {sanitized_error}"
         )
     
-    return {
-        "success": True,
-        "applied": applied,
-        "failed": failed,
-        "actions": results
-    }
+    return ApplyActionsResponse(
+        success=True,
+        applied=applied,
+        failed=failed,
+        actions=results
+    )
 
 
 @app.post("/api/pending-actions/{action_id}/apply", dependencies=[Depends(require_authentication)])
