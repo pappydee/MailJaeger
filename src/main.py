@@ -91,53 +91,7 @@ app.add_middleware(SecurityHeadersMiddleware)
 # Add rate limiting state
 app.state.limiter = limiter
 
-# Authentication middleware for static files
-class StaticAuthMiddleware(BaseHTTPMiddleware):
-    """Middleware to require authentication for static files"""
-    async def dispatch(self, request: StarletteRequest, call_next):
-        # Only check static file routes
-        if request.url.path.startswith("/static/"):
-            # Check authentication
-            settings = get_settings()
-            api_keys = settings.get_api_keys()
-            
-            # Fail-closed: require auth for static files
-            if not api_keys:
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Unauthorized"},
-                    headers={"WWW-Authenticate": "Bearer"}
-                )
-            
-            auth_header = request.headers.get("Authorization")
-            if not auth_header or not auth_header.startswith("Bearer "):
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Unauthorized"},
-                    headers={"WWW-Authenticate": "Bearer"}
-                )
-            
-            # Verify token
-            try:
-                token = auth_header.split(" ", 1)[1]
-                if not any(secrets.compare_digest(token, key) for key in api_keys):
-                    return JSONResponse(
-                        status_code=401,
-                        content={"detail": "Unauthorized"},
-                        headers={"WWW-Authenticate": "Bearer"}
-                    )
-            except (IndexError, AttributeError):
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Unauthorized"},
-                    headers={"WWW-Authenticate": "Bearer"}
-                )
-        
-        return await call_next(request)
-
-app.add_middleware(StaticAuthMiddleware)
-
-# Mount static files (frontend) - protected by StaticAuthMiddleware
+# Mount static files (frontend) - will be protected by global auth middleware
 frontend_dir = Path(__file__).parent.parent / "frontend"
 if frontend_dir.exists():
     app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
@@ -154,6 +108,67 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
     max_age=600,  # Cache preflight requests for 10 minutes
 )
+
+
+# Global authentication middleware (fail-closed)
+# This enforces authentication for ALL routes except explicit allowlist
+@app.middleware("http")
+async def global_auth_middleware(request: Request, call_next):
+    """
+    Global authentication middleware that enforces Bearer token auth for all routes
+    except those in the explicit allowlist. This is fail-closed by default.
+    """
+    # Explicit allowlist of unauthenticated routes
+    UNAUTHENTICATED_ROUTES = {"/api/health"}
+    
+    # Allow unauthenticated access only to explicitly allowed routes
+    if request.url.path in UNAUTHENTICATED_ROUTES:
+        return await call_next(request)
+    
+    # Check authentication for all other routes
+    settings = get_settings()
+    api_keys = settings.get_api_keys()
+    
+    # Fail-closed: If no API keys configured, deny all access except allowlist
+    if not api_keys:
+        logger.error(f"No API keys configured - denying access to {request.url.path}")
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized"},
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    # Get credentials from header
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        logger.warning(f"Unauthenticated request to {request.url.path} from {request.client.host if request.client else 'unknown'}")
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized"},
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    # Extract and verify token
+    try:
+        token = auth_header.split(" ", 1)[1]
+        if not any(secrets.compare_digest(token, key) for key in api_keys):
+            logger.warning(f"Failed authentication attempt for {request.url.path} from {request.client.host if request.client else 'unknown'}")
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized"},
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+    except IndexError:
+        logger.warning(f"Malformed auth header for {request.url.path}")
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized"},
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    # Authentication successful, log and proceed
+    logger.debug(f"Authenticated request to {request.url.path}")
+    return await call_next(request)
 
 
 # Rate limit exceeded handler
@@ -260,9 +275,9 @@ async def shutdown_event():
     logger.info("MailJaeger shutdown complete")
 
 
-@app.get("/", dependencies=[Depends(require_authentication)])
+@app.get("/")
 async def root(request: Request):
-    """Serve frontend dashboard - requires authentication"""
+    """Serve frontend dashboard - authentication enforced by global middleware"""
     # Serve frontend
     frontend_file = Path(__file__).parent.parent / "frontend" / "index.html"
     if frontend_file.exists():
