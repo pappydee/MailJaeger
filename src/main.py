@@ -16,7 +16,8 @@ import secrets
 import hashlib
 
 from src.config import get_settings
-from src.database.connection import init_db, get_db
+from src.database.connection import init_db, get_db, get_engine
+from src.database.startup_checks import verify_pending_actions_table
 from src.models.schemas import (
     EmailResponse,
     EmailDetailResponse,
@@ -307,6 +308,17 @@ async def startup_event():
     # Initialize database
     init_db()
     logger.info("Database initialized")
+
+    # Verify critical tables exist (fail-closed startup check)
+    try:
+        engine = get_engine()
+        verify_pending_actions_table(engine, debug=settings.debug)
+    except RuntimeError as e:
+        # Fail closed: exit if critical table is missing
+        sanitized = sanitize_error(e, debug=False)
+        logger.error("Startup check failed: %s", sanitized)
+        print(f"\n❌ Startup Error: {sanitized}\n", file=sys.stderr)
+        sys.exit(1)
 
     # Start scheduler
     scheduler = get_scheduler()
