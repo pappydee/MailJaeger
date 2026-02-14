@@ -1,7 +1,7 @@
 """
 FastAPI application for MailJaeger
 """
-from fastapi import FastAPI, Depends, HTTPException, Query, Request, status
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -1026,10 +1026,18 @@ async def apply_all_approved_actions(
 @app.post("/api/pending-actions/{action_id}/apply", dependencies=[Depends(require_authentication)])
 async def apply_single_action(
     action_id: int,
-    request: ApplyActionsRequest = ApplyActionsRequest(),
+    request: ApplyActionsRequest = Body(default_factory=lambda: ApplyActionsRequest()),
     db: Session = Depends(get_db)
 ):
-    """Apply a single approved pending action to IMAP mailbox"""
+    """
+    Apply a single approved pending action to IMAP mailbox with strict safety controls.
+    
+    Safety requirements:
+    - SAFE_MODE always wins (returns 409 if enabled)
+    - Requires apply_token from preview endpoint (two-step safety)
+    - Blocks DELETE operations unless ALLOW_DESTRUCTIVE_IMAP=true
+    - Validates target folders against allowlist
+    """
     # Check SAFE_MODE first - it always wins
     if settings.safe_mode:
         return JSONResponse(
@@ -1037,6 +1045,50 @@ async def apply_single_action(
             content={
                 "success": False,
                 "message": "SAFE_MODE enabled; no actions applied"
+            }
+        )
+    
+    # Require apply_token (two-step safety) - must be provided and valid
+    if not request.apply_token:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "Apply token required. Use /api/pending-actions/preview to generate token."
+            }
+        )
+    
+    # Validate and consume apply_token
+    token_record = db.query(ApplyToken).filter(
+        ApplyToken.token == request.apply_token,
+        ApplyToken.is_used == False
+    ).first()
+    
+    if not token_record:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "Invalid or already used apply token"
+            }
+        )
+    
+    if token_record.expires_at < datetime.utcnow():
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "Apply token has expired. Generate a new token with /api/pending-actions/preview"
+            }
+        )
+    
+    # Verify action_id is in the token's action_ids (token must be bound to this specific action)
+    if action_id not in token_record.action_ids:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "Apply token is not valid for this action"
             }
         )
     
@@ -1055,6 +1107,53 @@ async def apply_single_action(
     
     if not email or not email.uid:
         raise HTTPException(status_code=404, detail="Email or UID not found")
+    
+    # Get safe folders for validation
+    safe_folders = settings.get_safe_folders()
+    
+    # Safety check: Block DELETE unless explicitly enabled
+    if action.action_type == "DELETE":
+        if not settings.allow_destructive_imap:
+            # Do NOT connect to IMAP - refuse immediately
+            action.status = "REJECTED"
+            action.error_message = "DELETE blocked: ALLOW_DESTRUCTIVE_IMAP is false"
+            db.commit()
+            logger.warning(f"Blocked DELETE action {action.id}: destructive operations disabled")
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "message": "DELETE operations are not allowed",
+                    "action_id": action.id,
+                    "status": "REJECTED"
+                }
+            )
+    
+    # Safety check: Validate target folder against allowlist (BEFORE IMAP connection)
+    if action.action_type == "MOVE_FOLDER":
+        if action.target_folder not in safe_folders:
+            # Do NOT connect to IMAP - refuse immediately
+            action.status = "FAILED"
+            action.error_message = sanitize_error(
+                ValueError(f"Target folder not in safe folder allowlist. Allowed: {', '.join(safe_folders)}"),
+                settings.debug
+            )
+            db.commit()
+            logger.error(f"Failed action {action.id}: target folder '{action.target_folder}' not in allowlist")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "message": "Target folder not in safe folder allowlist",
+                    "action_id": action.id,
+                    "status": "FAILED"
+                }
+            )
+    
+    # Mark token as used (only after all validation passes)
+    token_record.is_used = True
+    token_record.used_at = datetime.utcnow()
+    db.commit()
     
     if request.dry_run:
         # Preview mode
