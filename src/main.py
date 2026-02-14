@@ -834,16 +834,12 @@ async def apply_all_approved_actions(
             }
         )
     
-    # Mark token as used
-    token_record.is_used = True
-    token_record.used_at = datetime.utcnow()
-    db.commit()
-    
     # Get safe folders
     safe_folders = settings.get_safe_folders()
     
     if request.dry_run:
         # Preview mode - just return what would be done
+        # DO NOT mark token as used for dry run
         preview = []
         for action in actions:
             email = db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
@@ -880,8 +876,8 @@ async def apply_all_approved_actions(
         with IMAPService() as imap:
             # Check if connection succeeded
             if not imap.client:
-                # Connection failed - DO NOT change status from APPROVED to FAILED
-                # Return 503 without mutating database
+                # Connection failed - DO NOT mark token as used
+                # Return 503 without mutating database or consuming token
                 sanitized_error = sanitize_error(
                     Exception("IMAP connection failed"), 
                     settings.debug
@@ -1006,10 +1002,17 @@ async def apply_all_approved_actions(
             
             # Commit all changes at once
             db.commit()
+            
+            # Mark token as used ONLY after successful completion
+            # This happens after all actions are processed and committed
+            token_record.is_used = True
+            token_record.used_at = datetime.utcnow()
+            db.commit()
         
     except Exception as e:
         sanitized_error = sanitize_error(e, settings.debug)
         logger.error(f"Error in apply_all_approved_actions: {sanitized_error}")
+        # DO NOT mark token as used on exception
         raise HTTPException(
             status_code=500, 
             detail="Failed to apply actions" if not settings.debug else f"Failed to apply actions: {sanitized_error}"
@@ -1150,13 +1153,8 @@ async def apply_single_action(
                 }
             )
     
-    # Mark token as used (only after all validation passes)
-    token_record.is_used = True
-    token_record.used_at = datetime.utcnow()
-    db.commit()
-    
     if request.dry_run:
-        # Preview mode
+        # Preview mode - DO NOT mark token as used
         return {
             "success": True,
             "dry_run": True,
@@ -1173,8 +1171,8 @@ async def apply_single_action(
         with IMAPService() as imap:
             # Check if connection succeeded
             if not imap.client:
-                # Connection failed - DO NOT change status from APPROVED to FAILED
-                # Return 503 without mutating database
+                # Connection failed - DO NOT mark token as used
+                # Return 503 without mutating database or consuming token
                 sanitized_error = sanitize_error(
                     Exception("IMAP connection failed"),
                     settings.debug
@@ -1215,6 +1213,12 @@ async def apply_single_action(
                 action.status = "APPLIED"
                 action.applied_at = datetime.utcnow()
                 db.commit()
+                
+                # Mark token as used ONLY after successful application
+                token_record.is_used = True
+                token_record.used_at = datetime.utcnow()
+                db.commit()
+                
                 logger.info(f"Applied action {action.id}: {action.action_type} for email {email.message_id}")
                 
                 return {
@@ -1227,6 +1231,7 @@ async def apply_single_action(
                 action.status = "FAILED"
                 action.error_message = "IMAP operation failed"
                 db.commit()
+                # DO NOT mark token as used on failure
                 logger.error(f"Failed to apply action {action.id}: {action.action_type}")
                 
                 raise HTTPException(
@@ -1240,6 +1245,7 @@ async def apply_single_action(
         action.status = "FAILED"
         action.error_message = sanitize_error(e, settings.debug)
         db.commit()
+        # DO NOT mark token as used on exception
         sanitized_error = sanitize_error(e, settings.debug)
         logger.error(f"Error applying action {action.id}: {sanitized_error}")
         raise HTTPException(
