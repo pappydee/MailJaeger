@@ -145,3 +145,72 @@ class SettingsUpdate(BaseModel):
     learning_confidence_threshold: Optional[float] = Field(None, ge=0.0, le=1.0)
     store_email_body: Optional[bool] = None
     store_attachments: Optional[bool] = None
+
+
+class ActionType(str, Enum):
+    MARK_READ = "MARK_READ"
+    MOVE_FOLDER = "MOVE_FOLDER"
+    FLAG = "FLAG"
+    DELETE = "DELETE"
+
+
+class ActionStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    APPLIED = "APPLIED"
+    FAILED = "FAILED"
+
+
+class PendingActionResponse(BaseModel):
+    id: int
+    created_at: datetime
+    approved_at: Optional[datetime] = None
+    applied_at: Optional[datetime] = None
+    email_id: int
+    action_type: str
+    target_folder: Optional[str] = None
+    reason: Optional[str] = None
+    proposed_by: str
+    status: str
+    approved_by: Optional[str] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
+
+
+class PendingActionsListRequest(BaseModel):
+    status: Optional[ActionStatus] = None
+    action_type: Optional[ActionType] = None
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=100)
+
+
+class PendingActionsSummary(BaseModel):
+    status_pending: int
+    status_approved: int
+    status_rejected: int
+    status_applied: int
+    status_failed: int
+    type_mark_read: int
+    type_move_folder: int
+    type_flag: int
+    type_delete: int
+
+
+class ApproveActionRequest(BaseModel):
+    pass  # No additional fields needed
+
+
+class RejectActionRequest(BaseModel):
+    pass  # No additional fields needed
+
+
+class ApplyActionRequest(BaseModel):
+    pass  # No additional fields needed
+
+
+class BatchApplyRequest(BaseModel):
+    max_count: Optional[int] = Field(default=None, ge=1, le=1000)

@@ -26,14 +26,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # X-Frame-Options: Prevent clickjacking
         response.headers["X-Frame-Options"] = "DENY"
         
-        # Referrer-Policy: Control referrer information
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        # Referrer-Policy: Control referrer information (more restrictive)
+        response.headers["Referrer-Policy"] = "no-referrer"
         
-        # Permissions-Policy: Restrict browser features
+        # Permissions-Policy: Restrict browser features (more restrictive)
         response.headers["Permissions-Policy"] = (
             "geolocation=(), microphone=(), camera=(), "
             "payment=(), usb=(), magnetometer=(), gyroscope=(), "
-            "accelerometer=(), midi=(), sync-xhr=()"
+            "accelerometer=(), midi=(), sync-xhr=(), "
+            "fullscreen=(), display-capture=()"
         )
         
         # Content-Security-Policy: Prevent XSS and data injection
@@ -53,11 +54,31 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         ]
         response.headers["Content-Security-Policy"] = "; ".join(csp_directives)
         
-        # HSTS: Force HTTPS (only if behind HTTPS proxy)
-        # Check if request came through HTTPS proxy
-        forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
-        if settings.trust_proxy and forwarded_proto.lower() == "https":
-            # 1 year max-age, include subdomains
-            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        # HSTS: Force HTTPS (only if behind HTTPS proxy or direct HTTPS)
+        # Check if request came through HTTPS proxy or is direct HTTPS
+        is_https = False
+        
+        # Check direct HTTPS
+        if request.url.scheme == "https":
+            is_https = True
+        
+        # Check trusted proxy forwarded headers
+        if settings.trust_proxy:
+            forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
+            if forwarded_proto.lower() == "https":
+                # Optionally validate proxy IP
+                trusted_ips = settings.get_trusted_proxy_ips()
+                if not trusted_ips:
+                    # Trust all proxies when no specific IPs configured
+                    is_https = True
+                else:
+                    # Validate proxy IP
+                    client_host = request.client.host if request.client else None
+                    if client_host in trusted_ips:
+                        is_https = True
+        
+        if is_https:
+            # 1 year max-age, include subdomains, preload
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
         
         return response

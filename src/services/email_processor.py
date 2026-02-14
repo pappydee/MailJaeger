@@ -10,6 +10,7 @@ from src.config import get_settings
 from src.models.database import ProcessedEmail, EmailTask, ProcessingRun, AuditLog
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
+from src.services.pending_actions_service import PendingActionsService
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -23,6 +24,7 @@ class EmailProcessor:
         self.db = db_session
         self.imap_service = IMAPService()
         self.ai_service = AIService()
+        self.pending_actions = PendingActionsService(db_session)
         self.stats = {
             'processed': 0,
             'spam': 0,
@@ -174,13 +176,76 @@ class EmailProcessor:
             )
             email_record.tasks.append(task)
         
-        # Step 5: Mailbox Actions (with safe mode check)
+        # Step 5: Mailbox Actions (with safe mode and approval workflow checks)
         actions_taken = []
+        
+        # First, save the email record so we have an ID for pending actions
+        self.db.add(email_record)
+        self.db.flush()  # Get the ID without committing
         
         if self.settings.safe_mode:
             logger.info(f"SAFE MODE: Skipping IMAP actions for {message_id}")
             actions_taken.append("safe_mode_skip")
+        elif self.settings.require_approval:
+            # Approval workflow enabled - enqueue actions instead of applying
+            logger.info(f"REQUIRE_APPROVAL: Enqueuing actions for {message_id}")
+            
+            if is_spam:
+                # Propose move to quarantine (not delete)
+                self.pending_actions.enqueue_action(
+                    email_id=email_record.id,
+                    action_type="MOVE_FOLDER",
+                    target_folder=self.settings.quarantine_folder,
+                    reason="spam",
+                    proposed_by="system"
+                )
+                actions_taken.append("enqueued_move_to_quarantine")
+            else:
+                # For non-spam emails
+                
+                # Enqueue mark as read if configured
+                if self.settings.mark_as_read:
+                    self.pending_actions.enqueue_action(
+                        email_id=email_record.id,
+                        action_type="MARK_READ",
+                        reason="archive_policy",
+                        proposed_by="system"
+                    )
+                    actions_taken.append("enqueued_mark_as_read")
+                
+                # Enqueue move to archive or AI-suggested folder
+                target_folder = None
+                move_reason = "archive_policy"
+                
+                if analysis.get('suggested_folder'):
+                    # AI suggested a folder
+                    target_folder = analysis['suggested_folder']
+                    move_reason = "ai_suggestion"
+                else:
+                    target_folder = self.settings.archive_folder
+                
+                # Enqueue the move (will be validated against allowlist)
+                self.pending_actions.enqueue_action(
+                    email_id=email_record.id,
+                    action_type="MOVE_FOLDER",
+                    target_folder=target_folder,
+                    reason=move_reason,
+                    proposed_by="system"
+                )
+                actions_taken.append(f"enqueued_move_to_{target_folder}")
+                
+                # Enqueue flag if action required
+                if action_required:
+                    self.pending_actions.enqueue_action(
+                        email_id=email_record.id,
+                        action_type="FLAG",
+                        reason="action_required",
+                        proposed_by="system"
+                    )
+                    actions_taken.append("enqueued_flag")
+                    self.stats['action_required'] += 1
         else:
+            # Normal mode - apply actions immediately (existing behavior)
             if is_spam:
                 # Handle spam based on configuration
                 if self.settings.delete_spam:
@@ -218,19 +283,20 @@ class EmailProcessor:
         
         email_record.actions_taken = {"actions": actions_taken}
         
-        # Step 6: Persistence
-        self.db.add(email_record)
+        # Step 6: Persistence (already added above, just commit now)
+        # self.db.add(email_record) - already done in flush above
         
         # Add audit log
         audit = AuditLog(
             event_type="EMAIL_PROCESSED",
             email_message_id=message_id,
-            description=f"Email processed: spam={is_spam}, action_required={action_required}, safe_mode={self.settings.safe_mode}",
+            description=f"Email processed: spam={is_spam}, action_required={action_required}, safe_mode={self.settings.safe_mode}, require_approval={self.settings.require_approval}",
             data={
                 "category": analysis['category'],
                 "priority": priority,
                 "actions": actions_taken,
-                "safe_mode": self.settings.safe_mode
+                "safe_mode": self.settings.safe_mode,
+                "require_approval": self.settings.require_approval
             }
         )
         self.db.add(audit)
