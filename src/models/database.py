@@ -218,3 +218,32 @@ class PendingAction(Base):
     __table_args__ = (
         Index('idx_status_created', 'status', 'created_at'),
     )
+
+
+class ApplyToken(Base):
+    """Short-lived tokens for two-step action application"""
+    __tablename__ = "apply_tokens"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    
+    # Token metadata
+    action_ids = Column(JSON, nullable=False)  # List of action IDs this token is valid for
+    action_count = Column(Integer, nullable=False)  # Number of actions
+    
+    # Summary for verification
+    summary = Column(JSON)  # Summary of actions by type and folder
+    
+    # Expiry
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    used_at = Column(DateTime)
+    
+    # Status
+    is_used = Column(Boolean, default=False, index=True)
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_token_expires', 'token', 'expires_at'),
+        Index('idx_used_expires', 'is_used', 'expires_at'),
+    )

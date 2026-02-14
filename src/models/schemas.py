@@ -180,3 +180,27 @@ class ApproveActionRequest(BaseModel):
 
 class ApplyActionsRequest(BaseModel):
     dry_run: bool = False
+    action_ids: Optional[List[int]] = None
+    max_count: Optional[int] = None
+    apply_token: Optional[str] = None
+
+
+class PreviewActionsRequest(BaseModel):
+    action_ids: Optional[List[int]] = None
+    max_count: Optional[int] = None
+
+
+class PreviewActionsResponse(BaseModel):
+    success: bool
+    apply_token: str
+    token_expires_at: datetime
+    action_count: int
+    summary: dict
+    actions: List[dict]
+
+
+class ApplyActionsResponse(BaseModel):
+    success: bool
+    applied: int
+    failed: int
+    actions: List[dict]
