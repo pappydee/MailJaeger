@@ -12,6 +12,7 @@ from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
 from src.config import get_settings
 from src.database.connection import get_db_session
 from src.services.email_processor import EmailProcessor
+from src.services.purge_service import PurgeService
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -39,7 +40,7 @@ class SchedulerService:
         # Parse schedule time
         hour, minute = self._parse_schedule_time()
         
-        # Add daily job
+        # Add daily email processing job
         trigger = CronTrigger(
             hour=hour,
             minute=minute,
@@ -54,12 +55,27 @@ class SchedulerService:
             replace_existing=True
         )
         
+        # Add daily purge job (runs at 03:30 local time)
+        purge_trigger = CronTrigger(
+            hour=3,
+            minute=30,
+            timezone=self.settings.schedule_timezone
+        )
+        
+        self.scheduler.add_job(
+            self._run_purge,
+            trigger=purge_trigger,
+            id='daily_purge',
+            name='Daily Data Purge',
+            replace_existing=True
+        )
+        
         self.scheduler.start()
         self.is_running = True
         
         logger.info(
-            f"Scheduler started - daily run at {hour:02d}:{minute:02d} "
-            f"{self.settings.schedule_timezone}"
+            f"Scheduler started - email processing at {hour:02d}:{minute:02d}, "
+            f"purge at 03:30 {self.settings.schedule_timezone}"
         )
     
     def stop(self):
@@ -102,6 +118,27 @@ class SchedulerService:
             logger.error(f"Processing run failed: {e}", exc_info=True)
         finally:
             self.lock = False
+    
+    def _run_purge(self):
+        """Execute scheduled purge job"""
+        logger.info("Starting scheduled purge job")
+        
+        try:
+            with get_db_session() as db:
+                purge_service = PurgeService(db)
+                stats = purge_service.execute_purge(dry_run=False)
+                
+                if stats['errors']:
+                    logger.error(f"Purge completed with errors: {stats['errors']}")
+                else:
+                    logger.info(
+                        f"Purge completed successfully: "
+                        f"{stats['emails_deleted']} emails, "
+                        f"{stats['actions_deleted']} actions, "
+                        f"{stats['audit_logs_deleted']} audit logs deleted"
+                    )
+        except Exception as e:
+            logger.error(f"Purge job failed: {e}", exc_info=True)
     
     def _parse_schedule_time(self) -> tuple:
         """Parse schedule time string"""

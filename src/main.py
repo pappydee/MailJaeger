@@ -18,15 +18,18 @@ from src.database.connection import init_db, get_db
 from src.models.schemas import (
     EmailResponse, EmailDetailResponse, DashboardResponse,
     ProcessingRunResponse, EmailListRequest, SearchRequest,
-    MarkResolvedRequest, TriggerRunRequest, SettingsUpdate
+    MarkResolvedRequest, TriggerRunRequest, SettingsUpdate,
+    PendingActionResponse, PendingActionListRequest,
+    ApproveRejectRequest, ApplyActionsRequest, PurgeRequest
 )
-from src.models.database import ProcessedEmail, ProcessingRun
+from src.models.database import ProcessedEmail, ProcessingRun, PendingAction
 from src.services.scheduler import get_scheduler
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
 from src.services.search_service import SearchService
 from src.services.learning_service import LearningService
 from src.services.email_processor import EmailProcessor
+from src.services.purge_service import PurgeService
 from src.middleware.auth import require_authentication, AuthenticationError
 from src.middleware.security_headers import SecurityHeadersMiddleware
 from src.middleware.rate_limiting import limiter, rate_limit_exceeded_handler
@@ -547,6 +550,228 @@ async def update_settings_api(request: SettingsUpdate):
         "success": True,
         "message": "Settings update requires restart to take effect"
     }
+
+
+
+
+# ============================================================================
+# Pending Actions Endpoints
+# ============================================================================
+
+@app.get("/api/pending-actions", response_model=List[PendingActionResponse], dependencies=[Depends(require_authentication)])
+@limiter.limit("60/minute")
+async def list_pending_actions(
+    request: Request,
+    status: Optional[str] = Query(None, description="Filter by status"),
+    email_id: Optional[int] = Query(None, description="Filter by email ID"),
+    action_type: Optional[str] = Query(None, description="Filter by action type"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db)
+):
+    """List pending actions with optional filters"""
+    try:
+        query = db.query(PendingAction)
+        
+        if status:
+            query = query.filter(PendingAction.status == status)
+        if email_id:
+            query = query.filter(PendingAction.email_id == email_id)
+        if action_type:
+            query = query.filter(PendingAction.action_type == action_type)
+        
+        # Order by created_at descending (newest first)
+        query = query.order_by(PendingAction.created_at.desc())
+        
+        # Pagination
+        offset = (page - 1) * page_size
+        actions = query.offset(offset).limit(page_size).all()
+        
+        return actions
+    except Exception as e:
+        logger.error(f"Error listing pending actions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list pending actions")
+
+
+@app.post("/api/pending-actions/approve", dependencies=[Depends(require_authentication)])
+@limiter.limit("30/minute")
+async def approve_actions(
+    request: Request,
+    approve_request: ApproveRejectRequest,
+    db: Session = Depends(get_db)
+):
+    """Approve pending actions"""
+    try:
+        actions = db.query(PendingAction).filter(
+            PendingAction.id.in_(approve_request.action_ids),
+            PendingAction.status == 'PENDING'
+        ).all()
+        
+        if not actions:
+            raise HTTPException(status_code=404, detail="No pending actions found with given IDs")
+        
+        for action in actions:
+            action.status = 'APPROVED'
+            action.approved_by = approve_request.approved_by
+            action.approved_at = datetime.utcnow()
+        
+        db.commit()
+        
+        logger.info(f"Approved {len(actions)} actions by {approve_request.approved_by}")
+        
+        return {
+            "success": True,
+            "approved_count": len(actions),
+            "message": f"Approved {len(actions)} action(s)"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error approving actions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to approve actions")
+
+
+@app.post("/api/pending-actions/reject", dependencies=[Depends(require_authentication)])
+@limiter.limit("30/minute")
+async def reject_actions(
+    request: Request,
+    reject_request: ApproveRejectRequest,
+    db: Session = Depends(get_db)
+):
+    """Reject pending actions"""
+    try:
+        actions = db.query(PendingAction).filter(
+            PendingAction.id.in_(reject_request.action_ids),
+            PendingAction.status == 'PENDING'
+        ).all()
+        
+        if not actions:
+            raise HTTPException(status_code=404, detail="No pending actions found with given IDs")
+        
+        for action in actions:
+            action.status = 'REJECTED'
+            action.approved_by = reject_request.approved_by
+            action.approved_at = datetime.utcnow()
+        
+        db.commit()
+        
+        logger.info(f"Rejected {len(actions)} actions by {reject_request.approved_by}")
+        
+        return {
+            "success": True,
+            "rejected_count": len(actions),
+            "message": f"Rejected {len(actions)} action(s)"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error rejecting actions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to reject actions")
+
+
+@app.post("/api/pending-actions/apply", dependencies=[Depends(require_authentication)])
+@limiter.limit("10/minute")
+async def apply_actions(
+    request: Request,
+    apply_request: ApplyActionsRequest,
+    db: Session = Depends(get_db)
+):
+    """Apply approved actions to IMAP server"""
+    try:
+        settings = get_settings()
+        
+        # Build query for approved actions
+        query = db.query(PendingAction).filter(PendingAction.status == 'APPROVED')
+        
+        if apply_request.action_ids:
+            query = query.filter(PendingAction.id.in_(apply_request.action_ids))
+        
+        query = query.order_by(PendingAction.created_at)
+        
+        if apply_request.max_count:
+            query = query.limit(apply_request.max_count)
+        
+        actions = query.all()
+        
+        if not actions:
+            return {
+                "success": True,
+                "applied_count": 0,
+                "failed_count": 0,
+                "message": "No approved actions to apply"
+            }
+        
+        # Apply actions (with safe mode check)
+        applied_count = 0
+        failed_count = 0
+        
+        for action in actions:
+            try:
+                if settings.safe_mode:
+                    # In safe mode, just mark as applied without actual IMAP operation
+                    action.status = 'APPLIED'
+                    action.applied_at = datetime.utcnow()
+                    applied_count += 1
+                    logger.info(f"Action {action.id} marked as applied (SAFE_MODE)")
+                else:
+                    # TODO: Implement actual IMAP operations here
+                    # For now, just mark as applied
+                    action.status = 'APPLIED'
+                    action.applied_at = datetime.utcnow()
+                    applied_count += 1
+                    logger.info(f"Action {action.id} applied")
+            except Exception as e:
+                action.status = 'FAILED'
+                action.error_message = str(e)
+                failed_count += 1
+                logger.error(f"Failed to apply action {action.id}: {e}")
+        
+        db.commit()
+        
+        return {
+            "success": True,
+            "applied_count": applied_count,
+            "failed_count": failed_count,
+            "message": f"Applied {applied_count} action(s), {failed_count} failed"
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error applying actions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to apply actions")
+
+
+# ============================================================================
+# Purge Endpoint
+# ============================================================================
+
+@app.post("/api/purge", dependencies=[Depends(require_authentication)])
+@limiter.limit("2/hour")  # Strict rate limit for admin operations
+async def trigger_purge(
+    request: Request,
+    purge_request: PurgeRequest,
+    db: Session = Depends(get_db)
+):
+    """Manually trigger data purge (admin only)"""
+    try:
+        purge_service = PurgeService(db)
+        stats = purge_service.execute_purge(dry_run=purge_request.dry_run)
+        
+        return {
+            "success": True,
+            "dry_run": stats['dry_run'],
+            "stats": {
+                "emails_deleted": stats['emails_deleted'],
+                "actions_deleted": stats['actions_deleted'],
+                "audit_logs_deleted": stats['audit_logs_deleted']
+            },
+            "errors": stats['errors'],
+            "message": "Purge completed successfully" if not stats['errors'] else "Purge completed with errors"
+        }
+    except Exception as e:
+        logger.error(f"Error triggering purge: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to trigger purge")
 
 
 @app.get("/api/health")

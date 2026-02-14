@@ -15,21 +15,41 @@ logger = get_logger(__name__)
 
 def get_client_identifier(request: Request) -> str:
     """
-    Get client identifier for rate limiting
+    Get client identifier for rate limiting with strict proxy validation
     
-    Uses X-Forwarded-For if TRUST_PROXY is enabled, otherwise uses direct IP
+    Uses X-Forwarded-For / X-Real-IP headers ONLY when:
+    1. TRUST_PROXY is enabled AND
+    2. Either:
+       a. Direct client IP is in TRUSTED_PROXY_IPS, OR
+       b. TRUSTED_PROXY_IPS is empty (trust all proxies - use with caution)
+    
+    Otherwise falls back to direct connection IP for security.
     """
     settings = get_settings()
     
+    # Get direct client IP
+    direct_ip = get_remote_address(request)
+    
     if settings.trust_proxy:
-        # Check X-Forwarded-For header
-        forwarded_for = request.headers.get("X-Forwarded-For")
-        if forwarded_for:
-            # Use first IP in the chain (original client)
-            return forwarded_for.split(",")[0].strip()
+        # Get list of trusted proxy IPs
+        trusted_ips = settings.get_trusted_proxy_ips()
+        
+        # If trusted IPs list is empty, trust all proxies (as per documentation requirement)
+        # If list exists, only trust if direct IP is in the list
+        if not trusted_ips or direct_ip in trusted_ips:
+            # Try X-Real-IP first (single IP, simpler)
+            real_ip = request.headers.get("X-Real-IP")
+            if real_ip:
+                return real_ip.strip()
+            
+            # Fall back to X-Forwarded-For (can be a chain)
+            forwarded_for = request.headers.get("X-Forwarded-For")
+            if forwarded_for:
+                # Use first IP in the chain (original client)
+                return forwarded_for.split(",")[0].strip()
     
     # Fall back to direct connection IP
-    return get_remote_address(request)
+    return direct_ip
 
 
 # Create limiter instance

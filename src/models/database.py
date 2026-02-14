@@ -186,3 +186,37 @@ class AuditLog(Base):
     
     # Timestamp
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class PendingAction(Base):
+    """Pending IMAP action requiring approval"""
+    __tablename__ = "pending_actions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    
+    # Related email
+    email_id = Column(Integer, ForeignKey("processed_emails.id"), nullable=False, index=True)
+    
+    # Action details
+    action_type = Column(String(50), nullable=False, index=True)  # MOVE, DELETE, MARK_READ, etc.
+    target_folder = Column(String(200))  # Target folder for MOVE actions
+    reason = Column(Text)  # Why this action is proposed
+    
+    # Workflow
+    status = Column(String(20), default='PENDING', index=True)  # PENDING, APPROVED, REJECTED, APPLIED, FAILED
+    proposed_by = Column(String(50), default='AI')  # AI, USER, SYSTEM
+    approved_by = Column(String(200))  # User identifier who approved
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    approved_at = Column(DateTime)
+    applied_at = Column(DateTime)
+    
+    # Result
+    error_message = Column(Text)
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_status_created', 'status', 'created_at'),
+        Index('idx_email_status', 'email_id', 'status'),
+    )
