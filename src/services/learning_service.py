@@ -10,6 +10,7 @@ from sqlalchemy import func
 from src.config import get_settings
 from src.models.database import ProcessedEmail, LearningSignal, FolderPattern, AuditLog
 from src.utils.logging import get_logger
+from src.utils.error_handling import sanitize_error
 
 logger = get_logger(__name__)
 
@@ -65,7 +66,8 @@ class LearningService:
                 self._update_folder_pattern(email_id, new_value)
         
         except Exception as e:
-            logger.error(f"Failed to record learning signal: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to record learning signal: {sanitized_error}")
             self.db.rollback()
     
     def _update_folder_pattern(self, email_id: int, target_folder: str):
@@ -115,7 +117,8 @@ class LearningService:
             logger.debug(f"Updated folder pattern: {sender_pattern} -> {target_folder}")
         
         except Exception as e:
-            logger.error(f"Failed to update folder pattern: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to update folder pattern: {sanitized_error}")
             self.db.rollback()
     
     def _extract_sender_pattern(self, sender: str) -> str:
@@ -159,7 +162,8 @@ class LearningService:
             return None
         
         except Exception as e:
-            logger.error(f"Failed to get suggested folder: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to get suggested folder: {sanitized_error}")
             return None
     
     def apply_learned_routing(self, email: ProcessedEmail) -> bool:
@@ -203,5 +207,6 @@ class LearningService:
             }
         
         except Exception as e:
-            logger.error(f"Failed to get pattern statistics: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to get pattern statistics: {sanitized_error}")
             return {}

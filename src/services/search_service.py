@@ -16,6 +16,7 @@ from whoosh.query import DateRange
 from src.config import get_settings
 from src.models.database import ProcessedEmail, EmailTask
 from src.utils.logging import get_logger
+from src.utils.error_handling import sanitize_error
 
 logger = get_logger(__name__)
 
@@ -56,7 +57,8 @@ class SearchService:
                 logger.info("Created new search index")
         
         except Exception as e:
-            logger.error(f"Failed to initialize search index: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to initialize search index: {sanitized_error}")
             self.ix = None
     
     def index_email(self, email: ProcessedEmail):
@@ -87,7 +89,8 @@ class SearchService:
             logger.debug(f"Indexed email: {email.message_id}")
         
         except Exception as e:
-            logger.error(f"Failed to index email {email.message_id}: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to index email {email.message_id}: {sanitized_error}")
     
     def search(
         self,
@@ -147,7 +150,8 @@ class SearchService:
                 }
         
         except Exception as e:
-            logger.error(f"Search failed: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Search failed: {sanitized_error}")
             return {"results": [], "total": 0}
     
     def rebuild_index(self):
@@ -186,4 +190,5 @@ class SearchService:
             logger.info(f"Rebuilt search index with {len(emails)} emails")
         
         except Exception as e:
-            logger.error(f"Failed to rebuild index: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to rebuild index: {sanitized_error}")

@@ -14,6 +14,7 @@ from imapclient import IMAPClient
 
 from src.config import get_settings
 from src.utils.logging import get_logger
+from src.utils.error_handling import sanitize_error
 
 logger = get_logger(__name__)
 
@@ -42,11 +43,8 @@ class IMAPService:
             logger.info(f"Connected to IMAP server: {self.settings.imap_host}")
             return True
         except Exception as e:
-            error_type = type(e).__name__
-            if self.settings.debug:
-                logger.error(f"Failed to connect to IMAP server {self.settings.imap_host}: {e}")
-            else:
-                logger.error(f"Failed to connect to IMAP server {self.settings.imap_host}: {error_type}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to connect to IMAP server {self.settings.imap_host}: {sanitized_error}")
             return False
     
     def disconnect(self):
@@ -56,11 +54,8 @@ class IMAPService:
                 self.client.logout()
                 logger.info("Disconnected from IMAP server")
             except Exception as e:
-                error_type = type(e).__name__
-                if self.settings.debug:
-                    logger.warning(f"Error during IMAP disconnect: {e}")
-                else:
-                    logger.warning(f"Error during IMAP disconnect: {error_type}")
+                sanitized_error = sanitize_error(e, debug=self.settings.debug)
+                logger.warning(f"Error during IMAP disconnect: {sanitized_error}")
             finally:
                 self.client = None
     
@@ -105,21 +100,15 @@ class IMAPService:
                     if email_data:
                         emails.append(email_data)
                 except Exception as e:
-                    error_type = type(e).__name__
-                    if self.settings.debug:
-                        logger.error(f"Failed to parse email UID {uid}: {e}")
-                    else:
-                        logger.error(f"Failed to parse email UID {uid}: {error_type}")
+                    sanitized_error = sanitize_error(e, debug=self.settings.debug)
+                    logger.error(f"Failed to parse email UID {uid}: {sanitized_error}")
                     continue
             
             return emails
             
         except Exception as e:
-            error_type = type(e).__name__
-            if self.settings.debug:
-                logger.error(f"Failed to retrieve unread emails: {e}")
-            else:
-                logger.error(f"Failed to retrieve unread emails: {error_type}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to retrieve unread emails: {sanitized_error}")
             return []
     
     def _parse_email(self, uid: int, message_data: Dict) -> Optional[Dict[str, Any]]:
@@ -141,7 +130,8 @@ class IMAPService:
                 try:
                     email_date = parsedate_to_datetime(date_str)
                 except (ValueError, TypeError) as e:
-                    logger.warning(f"Failed to parse date '{date_str}': {e}")
+                    sanitized_error = sanitize_error(e, debug=self.settings.debug)
+                    logger.warning(f"Failed to parse date '{date_str}': {sanitized_error}")
                     email_date = datetime.utcnow()
             else:
                 email_date = datetime.utcnow()
@@ -157,12 +147,14 @@ class IMAPService:
                         try:
                             body_plain += part.get_payload(decode=True).decode('utf-8', errors='ignore')
                         except (UnicodeDecodeError, AttributeError) as e:
-                            logger.warning(f"Failed to decode plain text part: {e}")
+                            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+                            logger.warning(f"Failed to decode plain text part: {sanitized_error}")
                     elif content_type == "text/html":
                         try:
                             body_html += part.get_payload(decode=True).decode('utf-8', errors='ignore')
                         except (UnicodeDecodeError, AttributeError) as e:
-                            logger.warning(f"Failed to decode HTML part: {e}")
+                            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+                            logger.warning(f"Failed to decode HTML part: {sanitized_error}")
             else:
                 content_type = msg.get_content_type()
                 try:
@@ -172,7 +164,8 @@ class IMAPService:
                     elif content_type == "text/html":
                         body_html = payload
                 except (UnicodeDecodeError, AttributeError) as e:
-                    logger.warning(f"Failed to decode email body: {e}")
+                    sanitized_error = sanitize_error(e, debug=self.settings.debug)
+                    logger.warning(f"Failed to decode email body: {sanitized_error}")
             
             # Calculate integrity hash
             integrity_hash = hashlib.sha256(raw_email).hexdigest()
@@ -191,11 +184,8 @@ class IMAPService:
             }
             
         except Exception as e:
-            error_type = type(e).__name__
-            if self.settings.debug:
-                logger.error(f"Failed to parse email: {e}")
-            else:
-                logger.error(f"Failed to parse email: {error_type}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to parse email: {sanitized_error}")
             return None
     
     def _decode_header(self, header: str) -> str:
@@ -224,11 +214,8 @@ class IMAPService:
             self.client.add_flags([uid], [imapclient.SEEN])
             return True
         except Exception as e:
-            error_type = type(e).__name__
-            if self.settings.debug:
-                logger.error(f"Failed to mark email {uid} as read: {e}")
-            else:
-                logger.error(f"Failed to mark email {uid} as read: {error_type}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to mark email {uid} as read: {sanitized_error}")
             return False
     
     def move_to_folder(self, uid: int, folder: str) -> bool:
@@ -245,11 +232,8 @@ class IMAPService:
             logger.debug(f"Moved email {uid} to {folder}")
             return True
         except Exception as e:
-            error_type = type(e).__name__
-            if self.settings.debug:
-                logger.error(f"Failed to move email {uid} to {folder}: {e}")
-            else:
-                logger.error(f"Failed to move email {uid} to {folder}: {error_type}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to move email {uid} to {folder}: {sanitized_error}")
             return False
     
     def add_flag(self, uid: int) -> bool:
@@ -261,11 +245,8 @@ class IMAPService:
             self.client.add_flags([uid], [imapclient.FLAGGED])
             return True
         except Exception as e:
-            error_type = type(e).__name__
-            if self.settings.debug:
-                logger.error(f"Failed to flag email {uid}: {e}")
-            else:
-                logger.error(f"Failed to flag email {uid}: {error_type}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to flag email {uid}: {sanitized_error}")
             return False
     
     def _ensure_folder_exists(self, folder: str):
@@ -276,11 +257,8 @@ class IMAPService:
                 self.client.create_folder(folder)
                 logger.info(f"Created folder: {folder}")
         except Exception as e:
-            error_type = type(e).__name__
-            if self.settings.debug:
-                logger.warning(f"Could not ensure folder exists: {e}")
-            else:
-                logger.warning(f"Could not ensure folder exists: {error_type}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.warning(f"Could not ensure folder exists: {sanitized_error}")
     
     def check_health(self) -> Dict[str, Any]:
         """Check IMAP connection health"""

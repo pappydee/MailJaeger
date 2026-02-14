@@ -13,6 +13,7 @@ from src.config import get_settings
 from src.database.connection import get_db_session
 from src.services.email_processor import EmailProcessor
 from src.utils.logging import get_logger
+from src.utils.error_handling import sanitize_error
 
 logger = get_logger(__name__)
 
@@ -81,7 +82,9 @@ class SchedulerService:
             self._run_processing(trigger_type="MANUAL")
             return True
         except Exception as e:
-            logger.error(f"Manual run failed: {e}")
+            settings = get_settings()
+            sanitized_error = sanitize_error(e, debug=settings.debug)
+            logger.error(f"Manual run failed: {sanitized_error}")
             return False
     
     def _run_processing(self, trigger_type: str = "SCHEDULED"):
@@ -99,7 +102,8 @@ class SchedulerService:
                 run = processor.process_emails(trigger_type=trigger_type)
                 logger.info(f"Processing run completed: {run.status}")
         except Exception as e:
-            logger.error(f"Processing run failed: {e}", exc_info=True)
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Processing run failed: {sanitized_error}", exc_info=self.settings.debug)
         finally:
             self.lock = False
     

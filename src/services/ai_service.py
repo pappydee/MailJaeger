@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 
 from src.config import get_settings
 from src.utils.logging import get_logger
+from src.utils.error_handling import sanitize_error
 
 logger = get_logger(__name__)
 
@@ -53,7 +54,8 @@ class AIService:
                 return self._fallback_classification(email_data)
                 
         except Exception as e:
-            logger.error(f"AI analysis failed: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"AI analysis failed: {sanitized_error}")
             return self._fallback_classification(email_data)
     
     def _prepare_content(self, email_data: Dict[str, Any]) -> str:
@@ -90,7 +92,8 @@ class AIService:
             lines = (line.strip() for line in text.splitlines())
             return '\n'.join(line for line in lines if line)
         except Exception as e:
-            logger.warning(f"Failed to extract text from HTML: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.warning(f"Failed to extract text from HTML: {sanitized_error}")
             return html
     
     def _create_analysis_prompt(self, content: str) -> str:
@@ -156,10 +159,12 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
             logger.error("AI service timeout")
             return None
         except httpx.HTTPError as e:
-            logger.error(f"AI service HTTP error: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"AI service HTTP error: {sanitized_error}")
             return None
         except Exception as e:
-            logger.error(f"AI service error: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"AI service error: {sanitized_error}")
             return None
     
     def _parse_ai_response(self, response: str) -> Dict[str, Any]:
@@ -198,10 +203,12 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
             return analysis
             
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON from AI response: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to parse JSON from AI response: {sanitized_error}")
             raise
         except Exception as e:
-            logger.error(f"Failed to validate AI response: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to validate AI response: {sanitized_error}")
             raise
     
     def _validate_string(self, value: Any, max_length: int = 1000) -> str:

@@ -11,6 +11,7 @@ from src.models.database import ProcessedEmail, EmailTask, ProcessingRun, AuditL
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
 from src.utils.logging import get_logger
+from src.utils.error_handling import sanitize_error
 
 logger = get_logger(__name__)
 
@@ -78,7 +79,8 @@ class EmailProcessor:
                     try:
                         self._process_single_email(email_data, imap)
                     except Exception as e:
-                        logger.error(f"Failed to process email {email_data.get('message_id')}: {e}")
+                        sanitized_error = sanitize_error(e, debug=self.settings.debug)
+                        logger.error(f"Failed to process email {email_data.get('message_id')}: {sanitized_error}")
                         self.stats['failed'] += 1
                         # Continue with next email (error isolation)
                         continue
@@ -103,9 +105,10 @@ class EmailProcessor:
             return run
             
         except Exception as e:
-            logger.error(f"Processing run failed: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Processing run failed: {sanitized_error}")
             run.status = "FAILURE"
-            run.error_message = str(e)
+            run.error_message = sanitize_error(e, debug=self.settings.debug)
             run.completed_at = datetime.utcnow()
             self.db.commit()
             return run
@@ -130,7 +133,8 @@ class EmailProcessor:
         try:
             analysis = self.ai_service.analyze_email(email_data)
         except Exception as e:
-            logger.error(f"AI analysis failed for {message_id}: {e}")
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"AI analysis failed for {message_id}: {sanitized_error}")
             # Use fallback classification if AI fails
             analysis = self.ai_service._fallback_classification(email_data)
         
