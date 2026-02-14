@@ -66,13 +66,17 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if settings.trust_proxy:
             forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
             if forwarded_proto.lower() == "https":
-                # Optionally validate proxy IP
+                # Optionally validate proxy IP from X-Forwarded-For rightmost IP
+                # Note: request.client.host is the direct connection (typically the proxy itself)
+                # For stricter validation, parse X-Forwarded-For header
                 trusted_ips = settings.get_trusted_proxy_ips()
                 if not trusted_ips:
                     # Trust all proxies when no specific IPs configured
                     is_https = True
                 else:
-                    # Validate proxy IP
+                    # In production, you should validate the proxy IP from X-Forwarded-For
+                    # For now, we trust if the direct connection is from a trusted IP
+                    # This is a simplified check - consider using a library for proper validation
                     client_host = request.client.host if request.client else None
                     if client_host in trusted_ips:
                         is_https = True

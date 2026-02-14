@@ -75,6 +75,11 @@ class RetentionService:
         Note: Only purges if STORE_EMAIL_BODY is enabled,
         otherwise we keep metadata for analysis
         """
+        if self.settings.retention_days_emails == 0:
+            # Never purge when set to 0
+            logger.info("Email purge disabled (RETENTION_DAYS_EMAILS=0)")
+            return 0
+        
         if not self.settings.store_email_body:
             # Don't purge if we're not storing bodies (minimal footprint)
             logger.info("Skipping email purge (STORE_EMAIL_BODY=false)")
@@ -105,6 +110,11 @@ class RetentionService:
         
         Note: Never purges PENDING or APPROVED actions automatically
         """
+        if self.settings.retention_days_actions == 0:
+            # Never purge when set to 0
+            logger.info("Action purge disabled (RETENTION_DAYS_ACTIONS=0)")
+            return 0
+        
         cutoff_date = datetime.utcnow() - timedelta(days=self.settings.retention_days_actions)
         
         # Find old completed/failed/rejected actions

@@ -131,8 +131,15 @@ async def host_allowlist_middleware(request: Request, call_next):
     
     if allowed_hosts:
         host_header = request.headers.get("host", "")
-        # Remove port if present for comparison
-        host = host_header.split(":")[0] if ":" in host_header else host_header
+        
+        # Handle IPv6 addresses: [::1]:8000 -> [::1]
+        # Handle IPv4/hostname with port: example.com:8000 -> example.com
+        if host_header.startswith("["):
+            # IPv6 address
+            host = host_header.split("]")[0] + "]" if "]" in host_header else host_header
+        else:
+            # IPv4 or hostname
+            host = host_header.split(":")[0] if ":" in host_header else host_header
         
         if host not in allowed_hosts:
             logger.warning(f"Rejected request with invalid Host header: {host}")

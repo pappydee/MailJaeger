@@ -223,13 +223,13 @@ class Settings(BaseSettings):
     # Retention and Purge
     retention_days_emails: int = Field(
         default=30,
-        ge=1,
-        description="Days to retain processed emails before purging"
+        ge=0,
+        description="Days to retain processed emails before purging (0 = never purge)"
     )
     retention_days_actions: int = Field(
         default=90,
-        ge=1,
-        description="Days to retain completed/failed actions before purging"
+        ge=0,
+        description="Days to retain completed/failed actions before purging (0 = never purge)"
     )
     
     # Timeouts

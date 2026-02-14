@@ -226,8 +226,10 @@ class PendingActionsService:
             return False
         
         action.status = "REJECTED"
+        # Store rejection time and user in approved_at/approved_by for now
+        # (Consider renaming to reviewed_at/reviewed_by in future schema update)
         action.approved_at = datetime.utcnow()
-        action.approved_by = rejected_by
+        action.approved_by = f"rejected_by:{rejected_by}"
         
         self.db.commit()
         
@@ -490,15 +492,25 @@ class PendingActionsService:
         if len(message) > 500:
             message = message[:500] + "..."
         
-        # Remove common sensitive patterns
+        # Check for common credential patterns (more specific)
+        import re
+        
+        # Patterns for actual credentials (not just words)
         sensitive_patterns = [
-            "password", "passwd", "pwd", "secret", "token", "key",
-            "authorization", "credential", "banner"
+            r'password["\s:=]+[^\s]+',  # password="xxx" or password: xxx
+            r'passwd["\s:=]+[^\s]+',
+            r'secret["\s:=]+[^\s]+',
+            r'token["\s:=]+[^\s]+',
+            r'key["\s:=]+[^\s]+',
+            r'authorization["\s:=]+[^\s]+',
+            r'bearer\s+[a-zA-Z0-9_-]+',  # bearer tokens
+            r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',  # email addresses
         ]
         
         lower_msg = message.lower()
-        if any(pattern in lower_msg for pattern in sensitive_patterns):
-            return "Operation failed (details omitted for security)"
+        for pattern in sensitive_patterns:
+            if re.search(pattern, lower_msg):
+                return "Operation failed (details omitted for security)"
         
         return message
     
