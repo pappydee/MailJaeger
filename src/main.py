@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 import sys
 import secrets
+import os
 
 from src.config import get_settings
 from src.database.connection import init_db, get_db
@@ -47,14 +48,24 @@ except ValueError as e:
     # Use sanitize_error to prevent credential leakage in logs
     sanitized = sanitize_error(e, debug=False)
     logger.error("Configuration validation failed: %s", sanitized)
-    print(f"\n❌ Configuration Error:\n{e}\n", file=sys.stderr)
+    # In production (DEBUG=false), don't print raw exception to stderr
+    debug_mode = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
+    if debug_mode:
+        print(f"\n❌ Configuration Error:\n{e}\n", file=sys.stderr)
+    else:
+        print(f"\n❌ Configuration Error: Configuration validation failed\n", file=sys.stderr)
     print("Please check your .env file and environment variables.", file=sys.stderr)
     sys.exit(1)
 except Exception as e:
     # Use sanitize_error to prevent credential leakage in logs
     sanitized = sanitize_error(e, debug=False)
     logger.error("Failed to load configuration: %s", sanitized)
-    print(f"\n❌ Configuration Error: {e}\n", file=sys.stderr)
+    # In production (DEBUG=false), don't print raw exception to stderr
+    debug_mode = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
+    if debug_mode:
+        print(f"\n❌ Configuration Error: {e}\n", file=sys.stderr)
+    else:
+        print(f"\n❌ Configuration Error: Failed to load configuration\n", file=sys.stderr)
     sys.exit(1)
 
 # Create app
