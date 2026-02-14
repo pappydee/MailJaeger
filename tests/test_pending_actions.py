@@ -306,3 +306,199 @@ def test_config_has_require_approval():
     
     assert hasattr(settings, 'require_approval')
     assert settings.require_approval is False  # Default should be False
+
+
+# E2E Tests for approval workflow fixes
+
+
+def test_error_sanitization():
+    """Test that error sanitization works correctly"""
+    from src.utils.error_handling import sanitize_error
+    
+    # Test in debug mode - should return full error
+    test_error = ValueError("Authentication failed for user test@example.com with password secret123")
+    result_debug = sanitize_error(test_error, debug=True)
+    assert "test@example.com" in result_debug
+    assert "secret123" in result_debug
+    
+    # Test in production mode - should return only error type
+    result_prod = sanitize_error(test_error, debug=False)
+    assert result_prod == "ValueError"
+    assert "test@example.com" not in result_prod
+    assert "secret123" not in result_prod
+    assert "Authentication" not in result_prod
+
+
+def test_imap_connection_in_apply_endpoints():
+    """Test that apply endpoints properly connect to IMAP"""
+    from fastapi.testclient import TestClient
+    from src.main import app
+    
+    # This test verifies that IMAPService is instantiated with context manager
+    # The actual connection test would require mock setup, but we verify
+    # the code structure uses the context manager pattern
+    
+    # Check that the code uses 'with IMAPService() as imap:'
+    import inspect
+    from src.main import apply_all_approved_actions, apply_single_action
+    
+    source_apply_all = inspect.getsource(apply_all_approved_actions)
+    source_apply_single = inspect.getsource(apply_single_action)
+    
+    # Verify context manager pattern is used
+    assert "with IMAPService() as imap:" in source_apply_all
+    assert "with IMAPService() as imap:" in source_apply_single
+    
+    # Verify no disconnect() calls (handled by context manager)
+    assert "imap.disconnect()" not in source_apply_all
+    assert "imap.disconnect()" not in source_apply_single
+
+
+def test_safe_mode_blocks_apply_endpoints():
+    """Test that SAFE_MODE blocks execution in apply endpoints"""
+    from fastapi.testclient import TestClient
+    from src.main import app
+    from unittest.mock import patch
+    
+    client = TestClient(app)
+    
+    # Mock settings with safe_mode=True
+    with patch('src.main.settings') as mock_settings:
+        mock_settings.safe_mode = True
+        mock_settings.debug = False
+        
+        # Mock authentication
+        with patch('src.main.require_authentication'):
+            # Test batch apply endpoint
+            response = client.post(
+                "/api/pending-actions/apply",
+                json={"dry_run": False},
+                headers={"Authorization": "Bearer test-token"}
+            )
+            
+            assert response.status_code == 409
+            assert "SAFE_MODE enabled" in response.json()["message"]
+            
+            # Test single apply endpoint
+            response = client.post(
+                "/api/pending-actions/1/apply",
+                json={"dry_run": False},
+                headers={"Authorization": "Bearer test-token"}
+            )
+            
+            assert response.status_code == 409
+            assert "SAFE_MODE enabled" in response.json()["message"]
+
+
+def test_preview_endpoint_routing():
+    """Test that preview endpoint is reachable and doesn't conflict with {action_id}"""
+    from fastapi.testclient import TestClient
+    from src.main import app
+    from unittest.mock import patch
+    
+    client = TestClient(app)
+    
+    # Mock authentication
+    with patch('src.main.require_authentication'):
+        # Mock database
+        with patch('src.main.get_db'):
+            # Test that /api/pending-actions/preview is reachable
+            response = client.get(
+                "/api/pending-actions/preview",
+                headers={"Authorization": "Bearer test-token"}
+            )
+            
+            # Should not return 422 (would indicate routing collision)
+            # Should return 200 or other valid response
+            assert response.status_code != 422
+            
+            # The endpoint should return preview data structure
+            if response.status_code == 200:
+                data = response.json()
+                assert "count" in data or "actions" in data
+
+
+def test_approval_sets_timestamp_for_rejection():
+    """Test that rejecting an action sets approved_at timestamp"""
+    from fastapi.testclient import TestClient
+    from src.main import app
+    from unittest.mock import patch, MagicMock
+    
+    client = TestClient(app)
+    
+    # Create mock pending action
+    mock_action = MagicMock()
+    mock_action.id = 1
+    mock_action.status = "PENDING"
+    mock_action.approved_at = None
+    
+    # Mock database query
+    mock_db = MagicMock()
+    mock_query = MagicMock()
+    mock_query.filter.return_value.first.return_value = mock_action
+    mock_db.query.return_value = mock_query
+    
+    with patch('src.main.require_authentication'):
+        with patch('src.main.get_db', return_value=mock_db):
+            # Test rejection sets approved_at
+            response = client.post(
+                "/api/pending-actions/1/approve",
+                json={"approve": False},
+                headers={"Authorization": "Bearer test-token"}
+            )
+            
+            # Verify the action object had approved_at set
+            assert mock_action.approved_at is not None
+            assert mock_action.status == "REJECTED"
+
+
+def test_sanitized_errors_in_api_responses():
+    """Test that API responses use sanitized errors in production mode"""
+    from fastapi.testclient import TestClient
+    from src.main import app
+    from unittest.mock import patch, MagicMock
+    
+    client = TestClient(app)
+    
+    # Mock settings with debug=False (production)
+    with patch('src.main.settings') as mock_settings:
+        mock_settings.safe_mode = False
+        mock_settings.debug = False
+        
+        # Mock IMAP service that fails to connect
+        with patch('src.services.imap_service.IMAPService') as MockIMAP:
+            mock_imap_instance = MagicMock()
+            mock_imap_instance.client = None  # Connection failed
+            mock_imap_instance.__enter__ = MagicMock(return_value=mock_imap_instance)
+            mock_imap_instance.__exit__ = MagicMock(return_value=False)
+            MockIMAP.return_value = mock_imap_instance
+            
+            # Create mock approved action
+            mock_action = MagicMock()
+            mock_action.id = 1
+            mock_action.status = "APPROVED"
+            
+            mock_db = MagicMock()
+            mock_query = MagicMock()
+            mock_query.filter.return_value.all.return_value = [mock_action]
+            mock_db.query.return_value = mock_query
+            
+            with patch('src.main.require_authentication'):
+                with patch('src.main.get_db', return_value=mock_db):
+                    response = client.post(
+                        "/api/pending-actions/apply",
+                        json={"dry_run": False},
+                        headers={"Authorization": "Bearer test-token"}
+                    )
+                    
+                    # Should return 503 for connection failure
+                    assert response.status_code == 503
+                    
+                    # Error message should be sanitized (no credentials)
+                    response_data = response.json()
+                    message = response_data.get("message", "")
+                    
+                    # Should not contain sensitive info
+                    assert "password" not in message.lower()
+                    assert "secret" not in message.lower()
+                    assert "authentication" not in message.lower() or message == "Service temporarily unavailable"
