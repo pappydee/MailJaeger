@@ -614,10 +614,25 @@ async def approve_actions(
             action.status = 'APPROVED'
             action.approved_by = approve_request.approved_by
             action.approved_at = datetime.utcnow()
+            
+            # Add audit log
+            audit = AuditLog(
+                event_type="ACTION_APPROVED",
+                email_message_id=None,
+                description=f"Action {action.id} approved by {approve_request.approved_by}",
+                data={
+                    "action_id": action.id,
+                    "action_type": action.action_type,
+                    "approved_by": approve_request.approved_by
+                }
+            )
+            db.add(audit)
         
         db.commit()
         
-        logger.info(f"Approved {len(actions)} actions by {approve_request.approved_by}")
+        logger.info(
+            f"Approved {len(actions)} actions by {approve_request.approved_by}"
+        )
         
         return {
             "success": True,
@@ -653,10 +668,25 @@ async def reject_actions(
             action.status = 'REJECTED'
             action.approved_by = reject_request.approved_by
             action.approved_at = datetime.utcnow()
+            
+            # Add audit log
+            audit = AuditLog(
+                event_type="ACTION_REJECTED",
+                email_message_id=None,
+                description=f"Action {action.id} rejected by {reject_request.approved_by}",
+                data={
+                    "action_id": action.id,
+                    "action_type": action.action_type,
+                    "approved_by": reject_request.approved_by
+                }
+            )
+            db.add(audit)
         
         db.commit()
         
-        logger.info(f"Rejected {len(actions)} actions by {reject_request.approved_by}")
+        logger.info(
+            f"Rejected {len(actions)} actions by {reject_request.approved_by}"
+        )
         
         return {
             "success": True,
@@ -683,7 +713,9 @@ async def apply_actions(
         settings = get_settings()
         
         # Build query for approved actions
-        query = db.query(PendingAction).filter(PendingAction.status == 'APPROVED')
+        query = db.query(PendingAction).filter(
+            PendingAction.status == 'APPROVED'
+        )
         
         if apply_request.action_ids:
             query = query.filter(PendingAction.id.in_(apply_request.action_ids))
@@ -703,36 +735,154 @@ async def apply_actions(
                 "message": "No approved actions to apply"
             }
         
-        # Apply actions (with safe mode check)
+        # Apply actions atomically (each action isolated)
         applied_count = 0
         failed_count = 0
+        imap_service = None
+        
+        try:
+            # Initialize IMAP connection once for all actions
+            if not settings.safe_mode:
+                imap_service = IMAPService()
+        except Exception as e:
+            logger.error(f"Failed to initialize IMAP service: {e}", exc_info=True)
+            # Mark all actions as failed
+            for action in actions:
+                action.status = 'FAILED'
+                action.error_message = "IMAP connection failed"
+                action.applied_at = datetime.utcnow()
+                failed_count += 1
+            
+            db.commit()
+            return {
+                "success": False,
+                "applied_count": 0,
+                "failed_count": failed_count,
+                "message": "IMAP connection failed"
+            }
         
         for action in actions:
             try:
                 if settings.safe_mode:
-                    # In safe mode, just mark as applied without actual IMAP operation
+                    # In safe mode, just mark as applied without actual IMAP
                     action.status = 'APPLIED'
                     action.applied_at = datetime.utcnow()
                     applied_count += 1
-                    logger.info(f"Action {action.id} marked as applied (SAFE_MODE)")
-                else:
-                    # TODO: Implement actual IMAP operations
-                    # For now, reject application when safe mode is disabled
-                    # until IMAP operations are implemented
-                    raise NotImplementedError(
-                        "IMAP operations not yet implemented. "
-                        "Please enable SAFE_MODE to test approval workflow."
+                    logger.info(
+                        f"Action {action.id} marked as applied (SAFE_MODE)"
                     )
-            except NotImplementedError as e:
-                action.status = 'FAILED'
-                action.error_message = str(e)
-                failed_count += 1
-                logger.warning(f"Action {action.id} failed: {e}")
+                    
+                    # Add audit log
+                    audit = AuditLog(
+                        event_type="ACTION_APPLIED",
+                        email_message_id=None,
+                        description=f"Action {action.id} applied in safe mode",
+                        data={
+                            "action_id": action.id,
+                            "action_type": action.action_type,
+                            "safe_mode": True
+                        }
+                    )
+                    db.add(audit)
+                else:
+                    # Execute actual IMAP operation
+                    # Get the email to find UID
+                    email = db.query(ProcessedEmail).filter(
+                        ProcessedEmail.id == action.email_id
+                    ).first()
+                    
+                    if not email or not email.uid:
+                        raise ValueError("Email or UID not found")
+                    
+                    uid = email.uid
+                    success = False
+                    
+                    # Execute action based on type
+                    if action.action_type == "MOVE":
+                        if not action.target_folder:
+                            raise ValueError("Target folder required for MOVE")
+                        success = imap_service.move_to_folder(
+                            uid,
+                            action.target_folder
+                        )
+                        if success:
+                            email.is_archived = True
+                    
+                    elif action.action_type == "MARK_READ":
+                        success = imap_service.mark_as_read(uid)
+                    
+                    elif action.action_type == "FLAG":
+                        success = imap_service.add_flag(uid)
+                        if success:
+                            email.is_flagged = True
+                    
+                    elif action.action_type == "DELETE":
+                        # DELETE would move to trash/delete folder
+                        # For safety, treat as MOVE to spam
+                        success = imap_service.move_to_folder(
+                            uid,
+                            settings.spam_folder
+                        )
+                        if success:
+                            email.is_archived = True
+                    
+                    else:
+                        raise ValueError(
+                            f"Unknown action type: {action.action_type}"
+                        )
+                    
+                    if success:
+                        action.status = 'APPLIED'
+                        action.applied_at = datetime.utcnow()
+                        applied_count += 1
+                        logger.info(
+                            f"Action {action.id} applied successfully: "
+                            f"{action.action_type}"
+                        )
+                        
+                        # Add audit log
+                        audit = AuditLog(
+                            event_type="ACTION_APPLIED",
+                            email_message_id=email.message_id,
+                            description=(
+                                f"Action {action.action_type} applied "
+                                f"to email {email.message_id}"
+                            ),
+                            data={
+                                "action_id": action.id,
+                                "action_type": action.action_type,
+                                "target_folder": action.target_folder,
+                                "safe_mode": False
+                            }
+                        )
+                        db.add(audit)
+                    else:
+                        raise RuntimeError("IMAP operation failed")
+                        
             except Exception as e:
+                # Sanitize error message - never expose credentials or internal details
+                error_msg = "Operation failed"
+                if settings.debug:
+                    error_msg = str(e)
+                else:
+                    # In production, use generic error message
+                    if "password" in str(e).lower() or "credential" in str(e).lower():
+                        error_msg = "Authentication error"
+                    elif "connection" in str(e).lower():
+                        error_msg = "Connection error"
+                    elif "not found" in str(e).lower():
+                        error_msg = "Resource not found"
+                    else:
+                        error_msg = "Operation failed"
+                
                 action.status = 'FAILED'
-                action.error_message = str(e)
+                action.error_message = error_msg
+                action.applied_at = datetime.utcnow()
                 failed_count += 1
-                logger.error(f"Failed to apply action {action.id}: {e}")
+                logger.error(
+                    f"Failed to apply action {action.id}: {type(e).__name__}",
+                    exc_info=settings.debug
+                )
         
         db.commit()
         
