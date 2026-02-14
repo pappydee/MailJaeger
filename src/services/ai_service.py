@@ -184,7 +184,7 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
                 'action_required': bool(data.get('action_required', False)),
                 'priority': self._validate_priority(data.get('priority', 'LOW')),
                 'tasks': self._validate_tasks(data.get('tasks', [])),
-                'suggested_folder': self._validate_string(data.get('suggested_folder', ''), max_length=100),
+                'suggested_folder': self._validate_folder(data.get('suggested_folder', 'Archive')),
                 'reasoning': self._validate_string(data.get('reasoning', ''), max_length=500)
             }
             
@@ -267,6 +267,33 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
             })
         
         return validated
+    
+    def _validate_folder(self, folder: str) -> str:
+        """Validate suggested folder against allowlist"""
+        # Allowlist of safe folder names - AI can only suggest these
+        # This prevents prompt injection attacks where AI suggests malicious folder operations
+        allowed_folders = [
+            'Archive',
+            'Klinik',
+            'Forschung',
+            'Privat',
+            'Verwaltung',
+            'Important',
+            'Later',
+            self.settings.archive_folder,
+            self.settings.inbox_folder,
+            # Note: Spam/Quarantine folders are NOT in allowlist - 
+            # spam handling is done by system logic, not AI suggestions
+        ]
+        
+        # Normalize and check
+        folder_clean = self._validate_string(folder, max_length=50)
+        if folder_clean in allowed_folders:
+            return folder_clean
+        
+        # Default to Archive if not in allowlist
+        logger.warning(f"AI suggested non-allowed folder '{folder}', defaulting to Archive")
+        return 'Archive'
     
     def _fallback_classification(self, email_data: Dict[str, Any]) -> Dict[str, Any]:
         """Fallback classification when AI fails"""

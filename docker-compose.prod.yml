@@ -1,0 +1,122 @@
+# Production Docker Compose with Secrets Support
+# Use with: docker compose -f docker-compose.prod.yml up -d
+
+version: '3.8'
+
+secrets:
+  mailjaeger_api_key:
+    file: ./secrets/api_key.txt
+  imap_password:
+    file: ./secrets/imap_password.txt
+
+services:
+  # Ollama AI Service
+  ollama:
+    image: ollama/ollama:latest
+    container_name: mailjaeger-ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    # DO NOT expose ports - only accessible via internal Docker network
+    networks:
+      - mailjaeger_internal
+    restart: unless-stopped
+    # Uncomment for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # MailJaeger Application
+  mailjaeger:
+    build: .
+    container_name: mailjaeger-app
+    # DO NOT expose ports - use reverse proxy instead
+    # For testing, uncomment: ports: ["127.0.0.1:8000:8000"]
+    networks:
+      - mailjaeger_internal
+    secrets:
+      - mailjaeger_api_key
+      - imap_password
+    environment:
+      # Security - Read API key from Docker secret
+      - API_KEY_FILE=/run/secrets/mailjaeger_api_key
+      - TRUST_PROXY=true  # Enable when behind reverse proxy
+      
+      # Server Configuration
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+      # Update CORS_ORIGINS to match your domain
+      - CORS_ORIGINS=https://mail.yourdomain.com
+      
+      # IMAP Configuration
+      - IMAP_HOST=${IMAP_HOST}
+      - IMAP_PORT=${IMAP_PORT:-993}
+      - IMAP_USERNAME=${IMAP_USERNAME}
+      # IMAP password from Docker secret (read in entrypoint or config)
+      - IMAP_PASSWORD_FILE=/run/secrets/imap_password
+      
+      # AI Configuration
+      - AI_ENDPOINT=http://ollama:11434
+      - AI_MODEL=${AI_MODEL:-mistral:7b-instruct-q4_0}
+      - AI_TIMEOUT=${AI_TIMEOUT:-120}
+      
+      # Database
+      - DATABASE_URL=sqlite:///./data/mailjaeger.db
+      
+      # Processing
+      - SPAM_THRESHOLD=${SPAM_THRESHOLD:-0.7}
+      - MAX_EMAILS_PER_RUN=${MAX_EMAILS_PER_RUN:-200}
+      
+      # Mail Action Safety
+      - SAFE_MODE=${SAFE_MODE:-true}
+      - MARK_AS_READ=${MARK_AS_READ:-false}
+      - DELETE_SPAM=${DELETE_SPAM:-false}
+      - QUARANTINE_FOLDER=${QUARANTINE_FOLDER:-Quarantine}
+      
+      # Scheduling
+      - SCHEDULE_TIME=${SCHEDULE_TIME:-08:00}
+      - SCHEDULE_TIMEZONE=${SCHEDULE_TIMEZONE:-Europe/Berlin}
+      
+      # Learning
+      - LEARNING_ENABLED=${LEARNING_ENABLED:-true}
+      - LEARNING_CONFIDENCE_THRESHOLD=${LEARNING_CONFIDENCE_THRESHOLD:-0.8}
+      
+      # Storage & Privacy
+      - STORE_EMAIL_BODY=${STORE_EMAIL_BODY:-false}
+      - STORE_ATTACHMENTS=${STORE_ATTACHMENTS:-false}
+      
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=false  # Never enable in production
+    
+    volumes:
+      - mailjaeger_data:/app/data
+    
+    depends_on:
+      - ollama
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # Security: Run as non-root user
+    user: "1000:1000"
+
+networks:
+  mailjaeger_internal:
+    driver: bridge
+    internal: false  # Set to true for even stricter isolation (but need external network for IMAP)
+
+volumes:
+  ollama_data:
+    driver: local
+  mailjaeger_data:
+    driver: local

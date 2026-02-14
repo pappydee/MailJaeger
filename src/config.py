@@ -18,7 +18,15 @@ class Settings(BaseSettings):
     # Security
     api_key: str = Field(
         default="",
-        description="API authentication key - REQUIRED in production. Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+        description="API authentication key(s) - REQUIRED in production. Comma-separated for multiple keys. Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+    )
+    api_key_file: Optional[str] = Field(
+        default=None,
+        description="Path to file containing API keys (one per line) - alternative to API_KEY env var"
+    )
+    trust_proxy: bool = Field(
+        default=False,
+        description="Trust X-Forwarded-* headers from reverse proxy (enable only when behind trusted proxy)"
     )
     
     # Server Configuration
@@ -45,7 +53,28 @@ class Settings(BaseSettings):
     imap_port: int = Field(default=993, description="IMAP server port")
     imap_use_ssl: bool = Field(default=True, description="Use SSL for IMAP")
     imap_username: str = Field(description="IMAP username")
-    imap_password: str = Field(description="IMAP password")
+    imap_password: str = Field(default="", description="IMAP password")
+    imap_password_file: Optional[str] = Field(
+        default=None,
+        description="Path to file containing IMAP password (alternative to IMAP_PASSWORD)"
+    )
+    
+    def get_imap_password(self) -> str:
+        """Get IMAP password from environment or file"""
+        if self.imap_password:
+            return self.imap_password
+        
+        if self.imap_password_file:
+            try:
+                with open(self.imap_password_file, 'r') as f:
+                    return f.read().strip()
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to load IMAP password from file: {type(e).__name__}")
+                raise ValueError(f"Cannot read IMAP password from {self.imap_password_file}")
+        
+        return ""
     
     # Folder Configuration
     inbox_folder: str = Field(default="INBOX", description="Inbox folder name")
@@ -168,6 +197,27 @@ class Settings(BaseSettings):
             )
         return v
     
+    def get_api_keys(self) -> List[str]:
+        """Get list of valid API keys from environment or file"""
+        keys = []
+        
+        # Load from environment variable (comma-separated)
+        if self.api_key:
+            keys.extend([k.strip() for k in self.api_key.split(',') if k.strip()])
+        
+        # Load from file if specified
+        if self.api_key_file:
+            try:
+                with open(self.api_key_file, 'r') as f:
+                    file_keys = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                    keys.extend(file_keys)
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to load API keys from file {self.api_key_file}: {type(e).__name__}")
+        
+        return keys
+    
     def validate_required_settings(self):
         """Validate that required settings are present"""
         errors = []
@@ -177,8 +227,14 @@ class Settings(BaseSettings):
             errors.append("IMAP_HOST is required")
         if not self.imap_username:
             errors.append("IMAP_USERNAME is required")
-        if not self.imap_password:
-            errors.append("IMAP_PASSWORD is required")
+        
+        # Check IMAP password (from env or file)
+        try:
+            password = self.get_imap_password()
+            if not password:
+                errors.append("IMAP_PASSWORD or IMAP_PASSWORD_FILE is required")
+        except Exception:
+            errors.append("IMAP_PASSWORD or IMAP_PASSWORD_FILE is required and must be readable")
         
         # Check AI configuration
         if not self.ai_endpoint:
@@ -187,10 +243,11 @@ class Settings(BaseSettings):
             errors.append("AI_MODEL is required")
         
         # Security warnings (not errors)
-        if not self.api_key and not self.debug:
+        api_keys = self.get_api_keys()
+        if not api_keys and not self.debug:
             errors.append("API_KEY not set - authentication disabled (SECURITY RISK)")
         
-        if self.server_host == "0.0.0.0" and not self.api_key:
+        if self.server_host == "0.0.0.0" and not api_keys:
             errors.append("SERVER_HOST is 0.0.0.0 without API_KEY - publicly accessible without auth (CRITICAL SECURITY RISK)")
         
         if errors:

@@ -33,9 +33,11 @@ class IMAPService:
                 port=self.settings.imap_port,
                 ssl=self.settings.imap_use_ssl
             )
+            # Get password from settings (handles file-based secrets)
+            password = self.settings.get_imap_password()
             self.client.login(
                 self.settings.imap_username,
-                self.settings.imap_password
+                password
             )
             logger.info(f"Connected to IMAP server: {self.settings.imap_host}")
             return True
