@@ -502,3 +502,198 @@ def test_sanitized_errors_in_api_responses():
                     assert "password" not in message.lower()
                     assert "secret" not in message.lower()
                     assert "authentication" not in message.lower() or message == "Service temporarily unavailable"
+
+
+# Production-safe tests for approval workflow
+
+def test_global_exception_handler_sanitizes_errors():
+    """Test that global exception handler sanitizes errors in non-debug mode"""
+    from fastapi.testclient import TestClient
+    from src.main import app
+    from unittest.mock import patch
+    
+    client = TestClient(app)
+    
+    # Create a route that will raise an exception
+    @app.get("/test-exception")
+    async def test_exception_route():
+        raise ValueError("Secret password: mypassword123 for user@example.com")
+    
+    # Test in non-debug mode
+    with patch('src.main.settings') as mock_settings:
+        mock_settings.debug = False
+        
+        response = client.get("/test-exception")
+        
+        assert response.status_code == 500
+        response_data = response.json()
+        
+        # Should return generic message in production
+        assert response_data["detail"] == "An internal error occurred"
+        
+        # Should NOT contain sensitive info
+        assert "mypassword123" not in str(response_data)
+        assert "user@example.com" not in str(response_data)
+
+
+def test_connection_failure_does_not_mutate_approved_actions():
+    """Test that IMAP connection failure does NOT change APPROVED actions to FAILED"""
+    from fastapi.testclient import TestClient
+    from src.main import app
+    from unittest.mock import patch, MagicMock
+    
+    client = TestClient(app)
+    
+    # Create mock approved action
+    mock_action = MagicMock()
+    mock_action.id = 1
+    mock_action.status = "APPROVED"
+    mock_action.email_id = 1
+    
+    # Mock database
+    mock_db = MagicMock()
+    mock_query = MagicMock()
+    mock_query.filter.return_value.all.return_value = [mock_action]
+    mock_db.query.return_value = mock_query
+    
+    # Mock IMAP service with failed connection
+    with patch('src.services.imap_service.IMAPService') as MockIMAP:
+        mock_imap_instance = MagicMock()
+        mock_imap_instance.client = None  # Connection failed
+        mock_imap_instance.__enter__ = MagicMock(return_value=mock_imap_instance)
+        mock_imap_instance.__exit__ = MagicMock(return_value=False)
+        MockIMAP.return_value = mock_imap_instance
+        
+        with patch('src.main.settings') as mock_settings:
+            mock_settings.safe_mode = False
+            mock_settings.debug = False
+            
+            with patch('src.main.require_authentication'):
+                with patch('src.main.get_db', return_value=mock_db):
+                    response = client.post(
+                        "/api/pending-actions/apply",
+                        json={"dry_run": False},
+                        headers={"Authorization": "Bearer test-token"}
+                    )
+                    
+                    # Should return 503
+                    assert response.status_code == 503
+                    
+                    # Action status should NOT have been changed to FAILED
+                    assert mock_action.status == "APPROVED"
+                    
+                    # commit should NOT have been called (no DB mutation)
+                    mock_db.commit.assert_not_called()
+
+
+def test_safe_mode_blocks_before_connection_attempt():
+    """Test that SAFE_MODE blocks apply operations before attempting IMAP connection"""
+    from fastapi.testclient import TestClient
+    from src.main import app
+    from unittest.mock import patch, MagicMock
+    
+    client = TestClient(app)
+    
+    # Mock IMAP service - should NOT be instantiated in SAFE_MODE
+    with patch('src.services.imap_service.IMAPService') as MockIMAP:
+        mock_imap_instance = MagicMock()
+        MockIMAP.return_value = mock_imap_instance
+        
+        with patch('src.main.settings') as mock_settings:
+            mock_settings.safe_mode = True  # SAFE_MODE enabled
+            mock_settings.debug = False
+            
+            with patch('src.main.require_authentication'):
+                with patch('src.main.get_db') as mock_get_db:
+                    mock_db = MagicMock()
+                    mock_get_db.return_value = mock_db
+                    
+                    # Test batch apply endpoint
+                    response = client.post(
+                        "/api/pending-actions/apply",
+                        json={"dry_run": False},
+                        headers={"Authorization": "Bearer test-token"}
+                    )
+                    
+                    # Should return 409 (Conflict)
+                    assert response.status_code == 409
+                    
+                    response_data = response.json()
+                    assert "SAFE_MODE enabled" in response_data["message"]
+                    
+                    # IMAPService should NOT have been instantiated
+                    MockIMAP.assert_not_called()
+                    
+                    # Test single action apply endpoint
+                    response = client.post(
+                        "/api/pending-actions/1/apply",
+                        json={"dry_run": False},
+                        headers={"Authorization": "Bearer test-token"}
+                    )
+                    
+                    # Should also return 409
+                    assert response.status_code == 409
+                    assert "SAFE_MODE enabled" in response.json()["message"]
+                    
+                    # Still no IMAP connection attempt
+                    MockIMAP.assert_not_called()
+
+
+def test_connection_failure_single_action_preserves_approved():
+    """Test that single action apply with connection failure preserves APPROVED status"""
+    from fastapi.testclient import TestClient
+    from src.main import app
+    from unittest.mock import patch, MagicMock
+    
+    client = TestClient(app)
+    
+    # Create mock approved action
+    mock_action = MagicMock()
+    mock_action.id = 1
+    mock_action.status = "APPROVED"
+    mock_action.email_id = 1
+    
+    # Create mock email
+    mock_email = MagicMock()
+    mock_email.id = 1
+    mock_email.uid = "12345"
+    mock_email.subject = "Test"
+    
+    # Mock database with proper query routing
+    mock_db = MagicMock()
+    
+    # First call returns action, second returns email
+    mock_db.query.return_value.filter.return_value.first.side_effect = [mock_action, mock_email]
+    
+    # Mock IMAP service with failed connection
+    with patch('src.services.imap_service.IMAPService') as MockIMAP:
+        mock_imap_instance = MagicMock()
+        mock_imap_instance.client = None  # Connection failed
+        mock_imap_instance.__enter__ = MagicMock(return_value=mock_imap_instance)
+        mock_imap_instance.__exit__ = MagicMock(return_value=False)
+        MockIMAP.return_value = mock_imap_instance
+        
+        with patch('src.main.settings') as mock_settings:
+            mock_settings.safe_mode = False
+            mock_settings.debug = False
+            
+            with patch('src.main.require_authentication'):
+                with patch('src.main.get_db', return_value=mock_db):
+                    response = client.post(
+                        "/api/pending-actions/1/apply",
+                        json={"dry_run": False},
+                        headers={"Authorization": "Bearer test-token"}
+                    )
+                    
+                    # Should return 503
+                    assert response.status_code == 503
+                    
+                    # Response should indicate status is still APPROVED
+                    response_data = response.json()
+                    assert response_data.get("status") == "APPROVED"
+                    
+                    # Action status should NOT have been changed to FAILED
+                    assert mock_action.status == "APPROVED"
+                    
+                    # commit should NOT have been called
+                    mock_db.commit.assert_not_called()
