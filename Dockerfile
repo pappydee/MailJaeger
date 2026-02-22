@@ -25,11 +25,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy Python packages from builder
-COPY --from=builder /root/.local /root/.local
+# Install Python dependencies directly in runtime
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Make sure scripts in .local are usable
-ENV PATH=/root/.local/bin:$PATH
+# Verify uvicorn is available (fail-fast)
+RUN python -c "import uvicorn; print(uvicorn.__version__)"
 
 # Copy application code
 COPY src/ ./src/
