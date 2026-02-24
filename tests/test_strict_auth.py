@@ -102,8 +102,6 @@ class TestStrictFailClosedAuthentication:
                 404,
             ), "Root should be accessible without auth (login page)"
 
-    def test_root_returns_401_with_invalid_token(self):
-        """Root route should return 401 with invalid token"""
     def test_root_returns_200_with_invalid_token(self):
         """Root route should return 200 (login page) even with invalid Bearer token - user sees login"""
         with patch.dict(
