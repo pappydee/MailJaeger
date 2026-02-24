@@ -9,148 +9,106 @@ let currentFilters = {
     priority: '',
     action_required: ''
 };
-let apiKey = '';  // Keep in memory only
+let _statusPollInterval = null;
+let _dashboardPollInterval = null;
 
 // Initialize dashboard
 document.addEventListener('DOMContentLoaded', async () => {
-    // Check for API key in sessionStorage (session-only, not persistent)
-    apiKey = sessionStorage.getItem('mailjaeger_api_key') || '';
-    
-    // Check if authentication is required
-    const authRequired = await checkAuthRequired();
-    
-    if (authRequired && !apiKey) {
-        showLoginUI();
+    // Check authentication via /api/auth/verify (uses session cookie automatically)
+    const authenticated = await checkAuthenticated();
+
+    if (!authenticated) {
+        showLoginModal();
         return;
     }
-    
-    await loadDashboard();
-    await loadEmails();
-    setupEventListeners();
-    
-    // Refresh dashboard every 30 seconds
-    setInterval(loadDashboard, 30000);
+
+    await initDashboard();
 });
 
-// Check if authentication is required
-async function checkAuthRequired() {
+// Check if already authenticated (session cookie)
+async function checkAuthenticated() {
     try {
-        // Health endpoint is unauthenticated for monitoring
-        const response = await fetch(`${API_BASE}/api/health`);
-        
-        // Try to access root - if 401, auth is required
-        const rootResponse = await fetch(`${API_BASE}/`);
-        return rootResponse.status === 401;
+        const response = await fetch(`${API_BASE}/api/auth/verify`);
+        return response.ok;
     } catch (error) {
-        console.error('Error checking auth:', error);
-        return true; // Assume auth required on error
+        console.error('Auth check failed:', error);
+        return false;
     }
 }
 
-// Show login UI
-function showLoginUI() {
-    document.body.innerHTML = `
-        <div style="display: flex; justify-content: center; align-items: center; min-height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
-            <div style="background: white; padding: 40px; border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); max-width: 400px; width: 90%;">
-                <div style="text-align: center; margin-bottom: 30px;">
-                    <svg width="60" height="60" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin: 0 auto;">
-                        <rect width="40" height="40" rx="8" fill="#4F46E5"/>
-                        <path d="M12 14L20 22L28 14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                        <path d="M12 26H28" stroke="white" stroke-width="2" stroke-linecap="round"/>
-                    </svg>
-                    <h1 style="margin: 20px 0 10px; color: #1a202c; font-size: 28px;">MailJaeger</h1>
-                    <p style="color: #718096; margin: 0;">Secure AI Email Processing</p>
-                </div>
-                <form id="loginForm" style="margin-top: 20px;">
-                    <div style="margin-bottom: 20px;">
-                        <label style="display: block; margin-bottom: 8px; color: #2d3748; font-weight: 500;">API Key</label>
-                        <input type="password" id="apiKeyInput" 
-                            placeholder="Enter your API key" 
-                            style="width: 100%; padding: 12px; border: 2px solid #e2e8f0; border-radius: 8px; font-size: 14px; box-sizing: border-box;"
-                            required
-                            autocomplete="off"
-                        />
-                        <p style="margin-top: 8px; font-size: 12px; color: #718096;">
-                            🔒 Stored for this session only
-                        </p>
-                    </div>
-                    <button type="submit" 
-                        style="width: 100%; padding: 12px; background: #4F46E5; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s;"
-                        onmouseover="this.style.background='#4338ca'"
-                        onmouseout="this.style.background='#4F46E5'"
-                    >
-                        Sign In
-                    </button>
-                </form>
-                <div id="loginError" style="margin-top: 15px; padding: 12px; background: #fed7d7; color: #c53030; border-radius: 8px; display: none; font-size: 14px;"></div>
-            </div>
-        </div>
-    `;
-    
+// Show login modal
+function showLoginModal() {
+    const modal = document.getElementById('loginModal');
+    modal.style.display = 'flex';
+    modal.style.alignItems = 'center';
+    modal.style.justifyContent = 'center';
+    modal.style.position = 'fixed';
+    modal.style.inset = '0';
+    modal.style.background = 'linear-gradient(135deg,#667eea 0%,#764ba2 100%)';
+    modal.style.zIndex = '1000';
+
     document.getElementById('loginForm').addEventListener('submit', handleLogin);
+    document.getElementById('apiKeyInput').focus();
 }
 
-// Handle login
+// Handle login form submit
 async function handleLogin(e) {
     e.preventDefault();
     const keyInput = document.getElementById('apiKeyInput');
     const errorDiv = document.getElementById('loginError');
     const key = keyInput.value.trim();
-    
+
+    errorDiv.style.display = 'none';
+
     if (!key) {
         errorDiv.textContent = 'Please enter an API key';
         errorDiv.style.display = 'block';
         return;
     }
-    
-    // Test the key by trying to access dashboard
-    apiKey = key;
+
     try {
-        const response = await fetch(`${API_BASE}/api/dashboard`, {
-            headers: getAuthHeaders()
+        const response = await fetch(`${API_BASE}/api/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_key: key }),
         });
-        
+
         if (response.ok) {
-            // Store in sessionStorage (cleared when tab/browser closes)
-            sessionStorage.setItem('mailjaeger_api_key', key);
+            // Cookie is now set by the server; reload to enter authenticated state
             location.reload();
         } else {
-            apiKey = '';
-            errorDiv.textContent = 'Invalid API key. Please try again.';
+            const data = await response.json().catch(() => ({}));
+            errorDiv.textContent = data.detail || 'Invalid API key. Please try again.';
             errorDiv.style.display = 'block';
             keyInput.value = '';
             keyInput.focus();
         }
     } catch (error) {
-        apiKey = '';
         errorDiv.textContent = 'Connection error. Please try again.';
         errorDiv.style.display = 'block';
     }
 }
 
-// Get headers with authentication
-function getAuthHeaders() {
-    const headers = {
-        'Content-Type': 'application/json'
-    };
-    
-    if (apiKey) {
-        headers['Authorization'] = `Bearer ${apiKey}`;
-    }
-    
-    return headers;
-}
-
-// Handle authentication errors
+// Handle authentication errors from API calls
 function handleAuthError(response) {
     if (response.status === 401) {
-        sessionStorage.removeItem('mailjaeger_api_key');
-        apiKey = '';
-        showError('Session expired. Reloading...');
+        showError('Session expired. Bitte neu einloggen…');
         setTimeout(() => location.reload(), 2000);
         return true;
     }
     return false;
+}
+
+// Initialize the main dashboard after login
+async function initDashboard() {
+    await loadVersion();
+    await loadDashboard();
+    await loadEmails();
+    setupEventListeners();
+    startStatusPolling();
+
+    // Refresh dashboard every 30 seconds
+    _dashboardPollInterval = setInterval(loadDashboard, 30000);
 }
 
 // Setup event listeners
@@ -158,30 +116,122 @@ function setupEventListeners() {
     document.getElementById('triggerProcessing').addEventListener('click', triggerProcessing);
     document.getElementById('applyFilters').addEventListener('click', applyFilters);
     document.getElementById('closeModal').addEventListener('click', closeModal);
-    
-    // Close modal on background click
+    document.getElementById('logoutBtn').addEventListener('click', handleLogout);
+
+    // Version badge → open version history modal
+    document.getElementById('versionBadge').addEventListener('click', openVersionModal);
+    document.getElementById('closeVersionModal').addEventListener('click', closeVersionModal);
+
+    // Close modals on background click
     document.getElementById('emailModal').addEventListener('click', (e) => {
-        if (e.target.id === 'emailModal') {
-            closeModal();
-        }
+        if (e.target.id === 'emailModal') closeModal();
+    });
+    document.getElementById('versionModal').addEventListener('click', (e) => {
+        if (e.target.id === 'versionModal') closeVersionModal();
     });
 }
 
-// Load dashboard data
+// Logout
+async function handleLogout() {
+    try {
+        await fetch(`${API_BASE}/api/auth/logout`, { method: 'POST' });
+    } catch (_) { /* ignore */ }
+    location.reload();
+}
+
+// Load version and show badge
+async function loadVersion() {
+    try {
+        const response = await fetch(`${API_BASE}/api/version`);
+        if (!response.ok) return;
+        const data = await response.json();
+        const badge = document.getElementById('versionBadge');
+        if (badge) badge.textContent = `v${data.version}`;
+        // Store changelog for modal
+        window._changelog = data.changelog || [];
+    } catch (error) {
+        console.error('Version load failed:', error);
+    }
+}
+
+// Open version history modal
+function openVersionModal() {
+    const modal = document.getElementById('versionModal');
+    const body = document.getElementById('versionModalBody');
+    modal.classList.add('active');
+
+    const changelog = window._changelog || [];
+    if (changelog.length === 0) {
+        body.innerHTML = '<p style="color:#718096;">No version history available.</p>';
+        return;
+    }
+
+    body.innerHTML = changelog.map(entry => `
+        <div style="margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid #e2e8f0;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                <strong style="font-size:16px;color:#2d3748;">v${entry.version}</strong>
+                <span style="font-size:13px;color:#718096;">${entry.date || ''}</span>
+            </div>
+            <ul style="margin:0;padding-left:20px;">
+                ${(entry.changes || []).map(c => `<li style="font-size:14px;color:#4a5568;margin-bottom:4px;">${escapeHtml(c)}</li>`).join('')}
+            </ul>
+        </div>
+    `).join('');
+}
+
+function closeVersionModal() {
+    document.getElementById('versionModal').classList.remove('active');
+}
+
+// ─── Status / Progress polling ────────────────────────────────────────────────
+
+function startStatusPolling() {
+    updateStatus();
+    _statusPollInterval = setInterval(updateStatus, 2000);
+}
+
+async function updateStatus() {
+    try {
+        const response = await fetch(`${API_BASE}/api/status`);
+        if (!response.ok) return;
+        const data = await response.json();
+        renderStatus(data);
+    } catch (error) {
+        console.error('Status poll error:', error);
+    }
+}
+
+function renderStatus(data) {
+    const section = document.getElementById('progressSection');
+    const label = document.getElementById('progressLabel');
+    const percent = document.getElementById('progressPercent');
+    const bar = document.getElementById('progressBar');
+
+    if (data.status === 'running') {
+        section.style.display = 'block';
+        label.textContent = data.current_step || 'Verarbeitung läuft…';
+        const pct = data.progress_percent || 0;
+        percent.textContent = `${pct}%`;
+        bar.style.width = `${pct}%`;
+    } else {
+        section.style.display = 'none';
+    }
+}
+
+// ─── Dashboard ────────────────────────────────────────────────────────────────
+
 async function loadDashboard() {
     try {
-        const response = await fetch(`${API_BASE}/api/dashboard`, {
-            headers: getAuthHeaders()
-        });
-        
+        const response = await fetch(`${API_BASE}/api/dashboard`);
+
         if (handleAuthError(response)) return;
-        
+
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
-        
+
         const data = await response.json();
-        
+
         updateDashboardStats(data);
         updateLastRunInfo(data);
         updateHealthStatus(data.health_status);
@@ -191,38 +241,34 @@ async function loadDashboard() {
     }
 }
 
-// Update dashboard statistics
 function updateDashboardStats(data) {
     document.getElementById('totalEmails').textContent = data.total_emails || 0;
     document.getElementById('actionRequired').textContent = data.action_required_count || 0;
     document.getElementById('unresolvedCount').textContent = data.unresolved_count || 0;
-    
-    // Calculate spam from last run if available
+
     const spamCount = data.last_run?.emails_spam || 0;
     document.getElementById('spamFiltered').textContent = spamCount;
 }
 
-// Update last run information
 function updateLastRunInfo(data) {
     const lastRun = data.last_run;
-    
+
     if (lastRun) {
         const startTime = new Date(lastRun.started_at);
         document.getElementById('lastRunTime').textContent = formatDateTime(startTime);
-        
+
         const statusBadge = document.getElementById('lastRunStatus');
         statusBadge.textContent = lastRun.status;
         statusBadge.className = 'info-badge ' + getStatusClass(lastRun.status);
-        
-        document.getElementById('lastRunProcessed').textContent = 
+
+        document.getElementById('lastRunProcessed').textContent =
             `${lastRun.emails_processed} Emails (${lastRun.emails_failed} Fehler)`;
     } else {
         document.getElementById('lastRunTime').textContent = 'Noch keine Verarbeitung';
         document.getElementById('lastRunStatus').textContent = '-';
         document.getElementById('lastRunProcessed').textContent = '-';
     }
-    
-    // Next scheduled run
+
     if (data.next_scheduled_run) {
         const nextRun = new Date(data.next_scheduled_run);
         document.getElementById('nextRunTime').textContent = formatDateTime(nextRun);
@@ -231,20 +277,19 @@ function updateLastRunInfo(data) {
     }
 }
 
-// Update health status
 function updateHealthStatus(healthStatus) {
     const statusDot = document.querySelector('.status-dot');
     const statusText = document.querySelector('.status-text');
-    
+
     if (!healthStatus) {
         statusText.textContent = 'Status unbekannt';
         return;
     }
-    
-    const allHealthy = 
+
+    const allHealthy =
         healthStatus.mail_server?.status === 'healthy' &&
         healthStatus.ai_service?.status === 'healthy';
-    
+
     if (allHealthy) {
         statusDot.className = 'status-dot healthy';
         statusText.textContent = 'System läuft';
@@ -254,15 +299,16 @@ function updateHealthStatus(healthStatus) {
     }
 }
 
-// Load emails
+// ─── Email list ───────────────────────────────────────────────────────────────
+
 async function loadEmails() {
     const emailList = document.getElementById('emailList');
     emailList.innerHTML = '<div class="loading">Lade Emails...</div>';
-    
+
     try {
         const response = await fetch(`${API_BASE}/api/emails/list`, {
             method: 'POST',
-            headers: getAuthHeaders(),
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 page: 1,
                 page_size: 50,
@@ -271,13 +317,13 @@ async function loadEmails() {
                 ...currentFilters
             })
         });
-        
+
         if (handleAuthError(response)) return;
-        
+
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
-        
+
         allEmails = await response.json();
         renderEmailList(allEmails);
     } catch (error) {
@@ -286,22 +332,20 @@ async function loadEmails() {
     }
 }
 
-// Render email list
 function renderEmailList(emails) {
     const emailList = document.getElementById('emailList');
-    
-    // Ensure emails is an array
+
     if (!Array.isArray(emails)) {
         console.error('Expected array but got:', typeof emails, emails);
         emailList.innerHTML = '<div class="loading">Fehler beim Laden der Emails</div>';
         return;
     }
-    
+
     if (emails.length === 0) {
         emailList.innerHTML = '<div class="loading">Keine Emails gefunden</div>';
         return;
     }
-    
+
     emailList.innerHTML = emails.map(email => `
         <div class="email-item" onclick="showEmailDetail(${email.id})">
             <div class="email-priority ${email.priority || 'LOW'}"></div>
@@ -327,29 +371,26 @@ function renderEmailList(emails) {
     `).join('');
 }
 
-// Show email detail
 async function showEmailDetail(emailId) {
     const modal = document.getElementById('emailModal');
     const modalBody = document.getElementById('modalBody');
-    
+
     modal.classList.add('active');
     modalBody.innerHTML = '<div class="loading">Lade Details...</div>';
-    
+
     try {
-        const response = await fetch(`${API_BASE}/api/emails/${emailId}`, {
-            headers: getAuthHeaders()
-        });
-        
+        const response = await fetch(`${API_BASE}/api/emails/${emailId}`);
+
         if (handleAuthError(response)) return;
-        
+
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
-        
+
         const email = await response.json();
-        
+
         document.getElementById('modalSubject').textContent = email.subject || 'Kein Betreff';
-        
+
         modalBody.innerHTML = `
             <div class="detail-section">
                 <h3>Email-Informationen</h3>
@@ -382,21 +423,21 @@ async function showEmailDetail(emailId) {
                     </div>
                 </div>
             </div>
-            
+
             ${email.summary ? `
                 <div class="detail-section">
                     <h3>Zusammenfassung</h3>
                     <div class="detail-value">${escapeHtml(email.summary)}</div>
                 </div>
             ` : ''}
-            
+
             ${email.reasoning ? `
                 <div class="detail-section">
                     <h3>KI-Analyse</h3>
                     <div class="detail-value">${escapeHtml(email.reasoning)}</div>
                 </div>
             ` : ''}
-            
+
             ${email.tasks && email.tasks.length > 0 ? `
                 <div class="detail-section">
                     <h3>Aufgaben (${email.tasks.length})</h3>
@@ -413,14 +454,14 @@ async function showEmailDetail(emailId) {
                     </div>
                 </div>
             ` : ''}
-            
+
             ${email.suggested_folder ? `
                 <div class="detail-section">
                     <h3>Vorgeschlagener Ordner</h3>
                     <div class="detail-value">📁 ${escapeHtml(email.suggested_folder)}</div>
                 </div>
             ` : ''}
-            
+
             ${!email.is_resolved ? `
                 <div class="detail-section">
                     <button class="btn btn-primary" onclick="markAsResolved(${email.id})">
@@ -435,25 +476,20 @@ async function showEmailDetail(emailId) {
     }
 }
 
-// Close modal
 function closeModal() {
     document.getElementById('emailModal').classList.remove('active');
 }
 
-// Mark email as resolved
 async function markAsResolved(emailId) {
     try {
         const response = await fetch(`${API_BASE}/api/emails/${emailId}/resolve`, {
             method: 'POST',
-            headers: getAuthHeaders(),
-            body: JSON.stringify({
-                email_id: emailId,
-                resolved: true
-            })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email_id: emailId, resolved: true })
         });
-        
+
         if (handleAuthError(response)) return;
-        
+
         if (response.ok) {
             closeModal();
             await loadDashboard();
@@ -466,42 +502,49 @@ async function markAsResolved(emailId) {
     }
 }
 
-// Trigger manual processing
+// ─── Trigger processing ───────────────────────────────────────────────────────
+
 async function triggerProcessing() {
     const button = document.getElementById('triggerProcessing');
     button.disabled = true;
     button.textContent = 'Verarbeitung läuft...';
-    
+
+    // Show progress bar immediately
+    document.getElementById('progressSection').style.display = 'block';
+    document.getElementById('progressLabel').textContent = 'Starte Verarbeitung…';
+    document.getElementById('progressPercent').textContent = '0%';
+    document.getElementById('progressBar').style.width = '0%';
+
     try {
         const response = await fetch(`${API_BASE}/api/processing/trigger`, {
             method: 'POST',
-            headers: getAuthHeaders(),
-            body: JSON.stringify({
-                trigger_type: 'MANUAL'
-            })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ trigger_type: 'MANUAL' })
         });
-        
+
         if (handleAuthError(response)) {
             button.disabled = false;
             button.textContent = 'Jetzt verarbeiten';
             return;
         }
-        
+
         const result = await response.json();
-        
+
         if (result.success) {
             showSuccess('Verarbeitung gestartet');
-            // Refresh dashboard after a delay
+            // Dashboard refresh after processing (status polling handles progress)
             setTimeout(async () => {
                 await loadDashboard();
                 await loadEmails();
-            }, 3000);
+            }, 5000);
         } else {
             showError(result.message || 'Verarbeitung konnte nicht gestartet werden');
+            document.getElementById('progressSection').style.display = 'none';
         }
     } catch (error) {
         console.error('Error triggering processing:', error);
         showError('Fehler beim Starten der Verarbeitung');
+        document.getElementById('progressSection').style.display = 'none';
     } finally {
         button.disabled = false;
         button.innerHTML = `
@@ -514,40 +557,42 @@ async function triggerProcessing() {
     }
 }
 
-// Apply filters
+// ─── Filters ──────────────────────────────────────────────────────────────────
+
 function applyFilters() {
     currentFilters = {
         category: document.getElementById('filterCategory').value || null,
         priority: document.getElementById('filterPriority').value || null,
-        action_required: document.getElementById('filterAction').value ? 
+        action_required: document.getElementById('filterAction').value ?
             document.getElementById('filterAction').value === 'true' : null
     };
-    
+
     // Remove null values
-    Object.keys(currentFilters).forEach(key => 
+    Object.keys(currentFilters).forEach(key =>
         currentFilters[key] === null && delete currentFilters[key]
     );
-    
+
     loadEmails();
 }
 
-// Utility functions
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
 function formatDate(dateString) {
     if (!dateString) return '-';
     const date = new Date(dateString);
-    return date.toLocaleDateString('de-DE', { 
-        year: 'numeric', 
-        month: '2-digit', 
-        day: '2-digit' 
+    return date.toLocaleDateString('de-DE', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
     });
 }
 
 function formatDateTime(dateString) {
     if (!dateString) return '-';
     const date = new Date(dateString);
-    return date.toLocaleString('de-DE', { 
-        year: 'numeric', 
-        month: '2-digit', 
+    return date.toLocaleString('de-DE', {
+        year: 'numeric',
+        month: '2-digit',
         day: '2-digit',
         hour: '2-digit',
         minute: '2-digit'
@@ -570,12 +615,10 @@ function escapeHtml(text) {
 }
 
 function showSuccess(message) {
-    // Simple alert for now - could be replaced with toast notification
     console.log('Success:', message);
 }
 
 function showError(message) {
-    // Simple alert for now - could be replaced with toast notification
     console.error('Error:', message);
     alert(message);
 }

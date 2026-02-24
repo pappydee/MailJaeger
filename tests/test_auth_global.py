@@ -44,8 +44,8 @@ class TestGlobalAuthMiddleware:
                     response.status_code == 200
                 ), "Health endpoint should be accessible without auth"
 
-    def test_root_returns_401_without_auth(self):
-        """Root route should return 401 without authentication"""
+    def test_root_is_accessible_without_auth(self):
+        """Root route should return 200 (login page) without authentication"""
         with patch.dict(
             os.environ,
             {
@@ -63,17 +63,12 @@ class TestGlobalAuthMiddleware:
 
             client = TestClient(app)
 
+            # Root is now public so the login page can load in a plain browser
             response = client.get("/")
-            assert response.status_code == 401, "Root should return 401 without auth"
-            assert response.json() == {
-                "detail": "Unauthorized"
-            }, "Should return minimal error"
-            assert (
-                "WWW-Authenticate" in response.headers
-            ), "Should include WWW-Authenticate header"
-            assert (
-                response.headers["WWW-Authenticate"] == "Bearer"
-            ), "Should be Bearer auth"
+            assert response.status_code in (
+                200,
+                404,
+            ), "Root should be accessible (login page)"
 
     def test_root_returns_200_with_valid_auth(self):
         """Root route should return 200 with valid authentication"""
@@ -180,8 +175,8 @@ class TestGlobalAuthMiddleware:
                 "detail": "Unauthorized"
             }, "Should return minimal error"
 
-    def test_static_files_return_401_without_auth(self):
-        """Static files should return 401 without authentication"""
+    def test_static_files_accessible_without_auth(self):
+        """Static files should be accessible without authentication (needed for login page)"""
         with patch.dict(
             os.environ,
             {
@@ -199,14 +194,12 @@ class TestGlobalAuthMiddleware:
 
             client = TestClient(app)
 
-            # Try to access a static file
+            # Static files must be public so the login page CSS/JS loads in a plain browser
             response = client.get("/static/app.js")
-            assert (
-                response.status_code == 401
-            ), "Static files should return 401 without auth"
-            assert response.json() == {
-                "detail": "Unauthorized"
-            }, "Should return minimal error"
+            assert response.status_code in (
+                200,
+                404,
+            ), "Static files should not require auth (needed for login page)"
 
     def test_api_endpoint_returns_401_without_auth(self):
         """Regular API endpoints should return 401 without authentication"""
@@ -236,7 +229,7 @@ class TestGlobalAuthMiddleware:
             }, "Should return minimal error"
 
     def test_invalid_token_returns_401(self):
-        """Invalid Bearer token should return 401"""
+        """Invalid Bearer token should return 401 for protected endpoints"""
         with patch.dict(
             os.environ,
             {
@@ -254,14 +247,17 @@ class TestGlobalAuthMiddleware:
 
             client = TestClient(app)
 
-            response = client.get("/", headers={"Authorization": "Bearer wrong_key"})
+            # Use a protected API endpoint (not /, which is now public)
+            response = client.get(
+                "/api/settings", headers={"Authorization": "Bearer wrong_key"}
+            )
             assert response.status_code == 401, "Invalid token should return 401"
             assert response.json() == {
                 "detail": "Unauthorized"
             }, "Should return minimal error"
 
     def test_malformed_auth_header_returns_401(self):
-        """Malformed auth header should return 401"""
+        """Malformed auth header should return 401 for protected endpoints"""
         with patch.dict(
             os.environ,
             {
@@ -279,14 +275,17 @@ class TestGlobalAuthMiddleware:
 
             client = TestClient(app)
 
-            response = client.get("/", headers={"Authorization": "Bearer"})
+            # Use a protected API endpoint (not /, which is now public)
+            response = client.get(
+                "/api/settings", headers={"Authorization": "Bearer"}
+            )
             assert response.status_code == 401, "Malformed header should return 401"
             assert response.json() == {
                 "detail": "Unauthorized"
             }, "Should return minimal error"
 
     def test_no_api_key_configured_returns_401(self):
-        """When no API key is configured, all routes except health should return 401"""
+        """When no API key is configured, protected API routes should return 401"""
         with patch.dict(
             os.environ,
             {
@@ -304,13 +303,14 @@ class TestGlobalAuthMiddleware:
 
             client = TestClient(app)
 
-            # Root should return 401
+            # Root is now public (serves login page) even without API keys
             response = client.get("/")
-            assert (
-                response.status_code == 401
-            ), "Root should return 401 when no API key configured"
+            assert response.status_code in (
+                200,
+                404,
+            ), "Root should be accessible even when no API key configured"
 
-            # Docs should return 401
+            # Protected API endpoints should still return 401
             response = client.get("/api/docs")
             assert (
                 response.status_code == 401

@@ -50,8 +50,8 @@ class TestStrictFailClosedAuthentication:
                     response.status_code == 200
                 ), "Health endpoint should be accessible without auth"
 
-    def test_root_returns_401_without_api_key_configured(self):
-        """Root route should return 401 when no API key configured"""
+    def test_root_returns_200_without_api_key_configured(self):
+        """Root route should return 200 (login page) even when no API key configured"""
         with patch.dict(
             os.environ,
             {
@@ -70,15 +70,14 @@ class TestStrictFailClosedAuthentication:
             client = TestClient(app)
 
             response = client.get("/")
-            assert (
-                response.status_code == 401
-            ), "Root should return 401 when no API key configured"
-            assert (
-                response.json()["detail"] == "Unauthorized"
-            ), "Should return minimal error message"
+            # Root serves the login page regardless of API key configuration
+            assert response.status_code in (
+                200,
+                404,
+            ), "Root should return 200 (login page) or 404 (frontend not found in test env)"
 
-    def test_root_returns_401_without_auth_header(self):
-        """Root route should return 401 when API key configured but no auth header"""
+    def test_root_returns_200_without_auth_header(self):
+        """Root route should return 200 (login page) without auth header - user can then log in"""
         with patch.dict(
             os.environ,
             {
@@ -97,15 +96,16 @@ class TestStrictFailClosedAuthentication:
             client = TestClient(app)
 
             response = client.get("/")
-            assert (
-                response.status_code == 401
-            ), "Root should return 401 without auth header"
-            assert (
-                response.json()["detail"] == "Unauthorized"
-            ), "Should return minimal error message"
+            # Root is now public so the browser can load the login page
+            assert response.status_code in (
+                200,
+                404,
+            ), "Root should be accessible without auth (login page)"
 
     def test_root_returns_401_with_invalid_token(self):
         """Root route should return 401 with invalid token"""
+    def test_root_returns_200_with_invalid_token(self):
+        """Root route should return 200 (login page) even with invalid Bearer token - user sees login"""
         with patch.dict(
             os.environ,
             {
@@ -123,13 +123,12 @@ class TestStrictFailClosedAuthentication:
 
             client = TestClient(app)
 
+            # Root is now in the unauthenticated allowlist so it is always accessible
             response = client.get("/", headers={"Authorization": "Bearer wrong_token"})
-            assert (
-                response.status_code == 401
-            ), "Root should return 401 with invalid token"
-            assert (
-                response.json()["detail"] == "Unauthorized"
-            ), "Should return minimal error message"
+            assert response.status_code in (
+                200,
+                404,
+            ), "Root should be accessible (login page served)"
 
     def test_root_returns_200_with_valid_auth(self):
         """Root route should return 200 with valid authentication"""
@@ -182,8 +181,8 @@ class TestStrictFailClosedAuthentication:
                 response.json()["detail"] == "Unauthorized"
             ), "Should return minimal error message"
 
-    def test_static_files_return_401_without_auth(self):
-        """Static files should return 401 without authentication"""
+    def test_static_files_accessible_without_auth(self):
+        """Static files should be accessible without authentication (needed for login page CSS/JS)"""
         with patch.dict(
             os.environ,
             {
@@ -201,14 +200,13 @@ class TestStrictFailClosedAuthentication:
 
             client = TestClient(app)
 
-            # Try to access a static file without auth
-            response = client.get("/static/index.html")
-            assert (
-                response.status_code == 401
-            ), "Static files should return 401 without auth"
-            assert (
-                response.json()["detail"] == "Unauthorized"
-            ), "Should return minimal error message"
+            # Static files must be accessible without auth so the login page renders correctly
+            response = client.get("/static/style.css")
+            # Either 200 (file found) or 404 (file not mounted in test env); never 401
+            assert response.status_code in (
+                200,
+                404,
+            ), "Static files should not return 401 - they are needed for the login page"
 
     def test_401_responses_do_not_leak_details(self):
         """401 responses should not contain sensitive information"""
@@ -229,8 +227,8 @@ class TestStrictFailClosedAuthentication:
 
             client = TestClient(app)
 
-            # Test various endpoints
-            endpoints = ["/", "/api/settings", "/api/dashboard"]
+            # Test API endpoints that still require auth (not the public login page)
+            endpoints = ["/api/settings", "/api/dashboard"]
 
             for endpoint in endpoints:
                 response = client.get(endpoint)

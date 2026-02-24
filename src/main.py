@@ -5,10 +5,10 @@ FastAPI application for MailJaeger
 from fastapi import FastAPI, Depends, HTTPException, Query, Request, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
@@ -49,10 +49,17 @@ from src.middleware.allowed_hosts import AllowedHostsMiddleware
 from src.middleware.rate_limiting import limiter, rate_limit_exceeded_handler
 from src.utils.logging import setup_logging, get_logger
 from src.utils.error_handling import sanitize_error
+from src import __version__, CHANGELOG
 
 # Setup logging
 setup_logging()
 logger = get_logger(__name__)
+
+# In-memory session store: token -> expiry datetime
+# Sessions are lost on restart (acceptable for a local tool).
+_sessions: Dict[str, datetime] = {}
+SESSION_COOKIE = "mailjaeger_session"
+SESSION_EXPIRY_HOURS = 24
 
 # Settings with validation
 try:
@@ -82,7 +89,7 @@ except Exception as e:
 app = FastAPI(
     title="MailJaeger",
     description="Local AI-powered email processing system (Secure)",
-    version="1.0.0",
+    version=__version__,
     docs_url="/api/docs",
     redoc_url="/api/redoc",
 )
@@ -93,14 +100,25 @@ app = FastAPI(
 @app.middleware("http")
 async def global_auth_middleware(request: Request, call_next):
     """
-    Global authentication middleware that enforces Bearer token auth for all routes
+    Global authentication middleware that enforces auth for all routes
     except those in the explicit allowlist. This is fail-closed by default.
-    """
-    # Explicit allowlist of unauthenticated routes
-    UNAUTHENTICATED_ROUTES = {"/api/health"}
 
-    # Allow unauthenticated access only to explicitly allowed routes
-    if request.url.path in UNAUTHENTICATED_ROUTES:
+    Accepts either:
+    - Authorization: Bearer <API_KEY>  (CLI/curl compatibility)
+    - Session cookie set by POST /api/auth/login  (browser usage)
+    """
+    # Explicit allowlist of unauthenticated routes.
+    # "/" is allowed so the browser can load the login page.
+    # "/api/auth/*" is allowed so login/logout work without credentials.
+    UNAUTHENTICATED_ROUTES = {"/api/health", "/", "/api/version"}
+    UNAUTHENTICATED_PREFIXES = ("/api/auth/", "/static/")
+
+    path = request.url.path
+
+    # Allow unauthenticated access to explicitly allowed routes and prefixes
+    if path in UNAUTHENTICATED_ROUTES or any(
+        path.startswith(p) for p in UNAUTHENTICATED_PREFIXES
+    ):
         return await call_next(request)
 
     # Check authentication for all other routes
@@ -109,18 +127,25 @@ async def global_auth_middleware(request: Request, call_next):
 
     # Fail-closed: If no API keys configured, deny all access except allowlist
     if not api_keys:
-        logger.error(f"No API keys configured - denying access to {request.url.path}")
+        logger.error(f"No API keys configured - denying access to {path}")
         return JSONResponse(
             status_code=401,
             content={"detail": "Unauthorized"},
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Get credentials from header
+    # --- Option 1: Bearer token (CLI / curl) ---
     auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
+    if auth_header and auth_header.startswith("Bearer "):
+        try:
+            token = auth_header.split(" ", 1)[1]
+            if any(secrets.compare_digest(token, key) for key in api_keys):
+                logger.debug(f"Bearer-authenticated request to {path}")
+                return await call_next(request)
+        except IndexError:
+            pass
         logger.warning(
-            f"Unauthenticated request to {request.url.path} from {request.client.host if request.client else 'unknown'}"
+            f"Failed Bearer auth for {path} from {request.client.host if request.client else 'unknown'}"
         )
         return JSONResponse(
             status_code=401,
@@ -128,29 +153,25 @@ async def global_auth_middleware(request: Request, call_next):
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Extract and verify token
-    try:
-        token = auth_header.split(" ", 1)[1]
-        if not any(secrets.compare_digest(token, key) for key in api_keys):
-            logger.warning(
-                f"Failed authentication attempt for {request.url.path} from {request.client.host if request.client else 'unknown'}"
-            )
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Unauthorized"},
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-    except IndexError:
-        logger.warning(f"Malformed auth header for {request.url.path}")
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Unauthorized"},
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    # --- Option 2: Session cookie (browser) ---
+    session_token = request.cookies.get(SESSION_COOKIE)
+    if session_token:
+        expiry = _sessions.get(session_token)
+        if expiry and expiry > datetime.utcnow():
+            logger.debug(f"Cookie-authenticated request to {path}")
+            return await call_next(request)
+        # Expired or invalid session
+        if session_token in _sessions:
+            del _sessions[session_token]
 
-    # Authentication successful, log and proceed
-    logger.debug(f"Authenticated request to {request.url.path}")
-    return await call_next(request)
+    logger.warning(
+        f"Unauthenticated request to {path} from {request.client.host if request.client else 'unknown'}"
+    )
+    return JSONResponse(
+        status_code=401,
+        content={"detail": "Unauthorized"},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 # Request size limit (10MB default for API requests)
@@ -271,7 +292,7 @@ async def startup_event():
     """Initialize application on startup"""
     logger.info("=" * 60)
     logger.info("Starting MailJaeger...")
-    logger.info(f"Version: 1.0.0")
+    logger.info(f"Version: {__version__}")
     logger.info(f"Server: {settings.server_host}:{settings.server_port}")
     logger.info(f"Debug mode: {settings.debug}")
     logger.info(f"Safe mode: {settings.safe_mode}")
@@ -348,9 +369,164 @@ async def root(request: Request):
 
     return {
         "name": "MailJaeger",
-        "version": "1.0.0",
+        "version": __version__,
         "status": "running",
         "message": "Frontend not found. Access API at /api/docs",
+    }
+
+
+# ─── Auth endpoints (no authentication required) ──────────────────────────────
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request, response: Response):
+    """
+    Exchange API key for a session cookie.
+    Accepts JSON body: {"api_key": "..."}
+    On success sets an HttpOnly session cookie and returns {"success": true}.
+    Keeps Bearer token support intact for CLI usage.
+    """
+    try:
+        body = await request.json()
+        provided_key = body.get("api_key", "")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if not provided_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+
+    settings = get_settings()
+    api_keys = settings.get_api_keys()
+
+    if not api_keys:
+        raise HTTPException(status_code=503, detail="No API keys configured on server")
+
+    if not any(secrets.compare_digest(provided_key, key) for key in api_keys):
+        logger.warning(
+            f"Failed login from {request.client.host if request.client else 'unknown'}"
+        )
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # Create session token
+    token = secrets.token_urlsafe(32)
+    _sessions[token] = datetime.utcnow() + timedelta(hours=SESSION_EXPIRY_HOURS)
+    logger.info(
+        f"Session created for {request.client.host if request.client else 'unknown'}"
+    )
+
+    # Set HttpOnly cookie.
+    # SameSite=Lax: works for normal LAN navigation and is safe against CSRF.
+    # Secure=False: required for plain HTTP on a local network; a HTTPS reverse
+    # proxy can add Secure=True via its own cookie rewriting.
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        max_age=SESSION_EXPIRY_HOURS * 3600,
+        httponly=True,
+        samesite="lax",
+        secure=False,  # Allow HTTP for LAN deployments
+    )
+    return {"success": True}
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request, response: Response):
+    """Invalidate current session cookie."""
+    token = request.cookies.get(SESSION_COOKIE)
+    if token and token in _sessions:
+        del _sessions[token]
+    response.delete_cookie(key=SESSION_COOKIE, samesite="lax")
+    return {"success": True}
+
+
+@app.get("/api/auth/verify")
+async def auth_verify(request: Request):
+    """
+    Check whether the current request is authenticated.
+    Returns 200 if authenticated (Bearer or session cookie), 401 otherwise.
+    This is called by the frontend to decide whether to show the login screen.
+    """
+    settings = get_settings()
+    api_keys = settings.get_api_keys()
+
+    if not api_keys:
+        return JSONResponse(status_code=401, content={"authenticated": False})
+
+    # Check Bearer
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1]
+        if any(secrets.compare_digest(token, key) for key in api_keys):
+            return {"authenticated": True}
+
+    # Check session cookie
+    session_token = request.cookies.get(SESSION_COOKIE)
+    if session_token:
+        expiry = _sessions.get(session_token)
+        if expiry and expiry > datetime.utcnow():
+            return {"authenticated": True}
+
+    return JSONResponse(status_code=401, content={"authenticated": False})
+
+
+# ─── Version endpoint ──────────────────────────────────────────────────────────
+
+@app.get("/api/version")
+async def get_version():
+    """Return current version and changelog."""
+    return {"version": __version__, "changelog": CHANGELOG}
+
+
+# ─── Status endpoint ───────────────────────────────────────────────────────────
+
+@app.get("/api/status", dependencies=[Depends(require_authentication)])
+async def get_status(db: Session = Depends(get_db)):
+    """
+    Return real-time system status for the UI progress bar.
+    Fields: run_id, status (idle/running/success/failed), current_step,
+            progress_percent (0-100), started_at, last_update, message.
+    """
+    scheduler = get_scheduler()
+    sched_status = scheduler.get_status()
+    is_locked = sched_status.get("is_locked", False)
+
+    if is_locked:
+        # A run is actively in progress
+        return {
+            "run_id": None,
+            "status": "running",
+            "current_step": "Processing emails…",
+            "progress_percent": 50,
+            "started_at": None,
+            "last_update": datetime.utcnow().isoformat(),
+            "message": "Email processing in progress",
+        }
+
+    # Check last run for status
+    last_run = (
+        db.query(ProcessingRun).order_by(ProcessingRun.started_at.desc()).first()
+    )
+
+    if last_run:
+        status_map = {"SUCCESS": "success", "FAILURE": "failed", "PARTIAL": "success"}
+        run_status = status_map.get(last_run.status, "idle")
+        return {
+            "run_id": last_run.id,
+            "status": run_status,
+            "current_step": None,
+            "progress_percent": 100 if run_status in ("success", "failed") else 0,
+            "started_at": last_run.started_at.isoformat() if last_run.started_at else None,
+            "last_update": last_run.completed_at.isoformat() if last_run.completed_at else None,
+            "message": f"Last run: {last_run.status}",
+        }
+
+    return {
+        "run_id": None,
+        "status": "idle",
+        "current_step": None,
+        "progress_percent": 0,
+        "started_at": None,
+        "last_update": None,
+        "message": "No processing runs yet",
     }
 
 

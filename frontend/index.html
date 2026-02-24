@@ -7,6 +7,49 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+    <!-- Login Modal (shown when not authenticated) -->
+    <div class="modal" id="loginModal" style="display:none;">
+        <div class="modal-content" style="max-width:400px;">
+            <div style="text-align:center;margin-bottom:24px;">
+                <svg width="48" height="48" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin:0 auto 12px;">
+                    <rect width="40" height="40" rx="8" fill="#4F46E5"/>
+                    <path d="M12 14L20 22L28 14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M12 26H28" stroke="white" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+                <h2 style="margin:0;color:#1a202c;">MailJaeger</h2>
+                <p style="color:#718096;margin:4px 0 0;">Secure AI Email Processing</p>
+            </div>
+            <form id="loginForm">
+                <div style="margin-bottom:16px;">
+                    <label style="display:block;margin-bottom:6px;font-weight:500;color:#2d3748;">API Key</label>
+                    <input type="password" id="apiKeyInput"
+                        placeholder="Enter your API key"
+                        style="width:100%;padding:10px 12px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;box-sizing:border-box;"
+                        required autocomplete="off"/>
+                    <p style="margin:6px 0 0;font-size:12px;color:#718096;">🔒 Stored as a secure session cookie</p>
+                </div>
+                <button type="submit"
+                    style="width:100%;padding:11px;background:#4F46E5;color:white;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;">
+                    Sign In
+                </button>
+            </form>
+            <div id="loginError" style="margin-top:12px;padding:10px 12px;background:#fed7d7;color:#c53030;border-radius:8px;display:none;font-size:14px;"></div>
+        </div>
+    </div>
+
+    <!-- Version History Modal -->
+    <div class="modal" id="versionModal">
+        <div class="modal-content" style="max-width:560px;">
+            <div class="modal-header">
+                <h2>Version History</h2>
+                <button class="modal-close" id="closeVersionModal">&times;</button>
+            </div>
+            <div class="modal-body" id="versionModalBody">
+                <div class="loading">Lade…</div>
+            </div>
+        </div>
+    </div>
+
     <div class="container">
         <!-- Header -->
         <header class="header">
@@ -17,6 +60,7 @@
                     <path d="M12 26H28" stroke="white" stroke-width="2" stroke-linecap="round"/>
                 </svg>
                 <h1>MailJaeger</h1>
+                <button id="versionBadge" class="version-badge" title="Version history" style="cursor:pointer;">v…</button>
             </div>
             <div class="header-actions">
                 <button id="triggerProcessing" class="btn btn-primary">
@@ -30,8 +74,20 @@
                     <span class="status-dot"></span>
                     <span class="status-text">System-Check läuft...</span>
                 </div>
+                <button id="logoutBtn" class="btn btn-secondary" style="font-size:13px;padding:6px 12px;">Logout</button>
             </div>
         </header>
+
+        <!-- Progress Bar (shown during active processing) -->
+        <div id="progressSection" style="display:none;margin-bottom:16px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                <span id="progressLabel" style="font-size:14px;color:#4a5568;font-weight:500;">Verarbeitung läuft…</span>
+                <span id="progressPercent" style="font-size:13px;color:#718096;">0%</span>
+            </div>
+            <div style="background:#e2e8f0;border-radius:8px;height:8px;overflow:hidden;">
+                <div id="progressBar" style="background:#4F46E5;height:100%;width:0%;transition:width 0.4s ease;border-radius:8px;"></div>
+            </div>
+        </div>
 
         <!-- Dashboard Stats -->
         <div class="dashboard-stats" id="dashboardStats">

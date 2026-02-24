@@ -57,6 +57,23 @@ body {
     color: var(--text);
 }
 
+.version-badge {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--primary);
+    background: #EEF2FF;
+    border: 1px solid #C7D2FE;
+    border-radius: 12px;
+    padding: 2px 8px;
+    text-decoration: none;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.version-badge:hover {
+    background: #E0E7FF;
+}
+
 .header-actions {
     display: flex;
     align-items: center;

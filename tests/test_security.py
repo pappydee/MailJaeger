@@ -36,11 +36,11 @@ def auth_headers():
 class TestAuthentication:
     """Test authentication and authorization"""
 
-    def test_root_requires_auth(self, client):
-        """Root endpoint should require authentication"""
+    def test_root_is_accessible_without_auth(self, client):
+        """Root endpoint serves the login page - no auth required"""
         response = client.get("/")
-        assert response.status_code == 401
-        assert "authentication required" in response.json()["detail"].lower()
+        # Root is now public (login page). May be 200 (HTML) or 404 (no frontend dir in tests).
+        assert response.status_code in (200, 404)
 
     def test_root_with_valid_auth(self, client, auth_headers):
         """Root endpoint should work with valid auth"""
