@@ -37,7 +37,7 @@ from src.models.schemas import (
     ApplyActionsResponse,
 )
 from src.models.database import ProcessedEmail, ProcessingRun, PendingAction, ApplyToken
-from src.services.scheduler import get_scheduler
+from src.services.scheduler import get_scheduler, get_run_status
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
 from src.services.search_service import SearchService
@@ -479,55 +479,14 @@ async def get_version():
 # ─── Status endpoint ───────────────────────────────────────────────────────────
 
 @app.get("/api/status", dependencies=[Depends(require_authentication)])
-async def get_status(db: Session = Depends(get_db)):
+async def get_status():
     """
     Return real-time system status for the UI progress bar.
-    Fields: run_id, status (idle/running/success/failed), current_step,
-            progress_percent (0-100), started_at, last_update, message.
+    Schema: run_id, status (idle/running/success/failed), current_step,
+            progress_percent (0-100), processed, total, spam,
+            action_required, failed, started_at, last_update, message.
     """
-    scheduler = get_scheduler()
-    sched_status = scheduler.get_status()
-    is_locked = sched_status.get("is_locked", False)
-
-    if is_locked:
-        # A run is actively in progress
-        return {
-            "run_id": None,
-            "status": "running",
-            "current_step": "Processing emails…",
-            "progress_percent": 50,
-            "started_at": None,
-            "last_update": datetime.utcnow().isoformat(),
-            "message": "Email processing in progress",
-        }
-
-    # Check last run for status
-    last_run = (
-        db.query(ProcessingRun).order_by(ProcessingRun.started_at.desc()).first()
-    )
-
-    if last_run:
-        status_map = {"SUCCESS": "success", "FAILURE": "failed", "PARTIAL": "success"}
-        run_status = status_map.get(last_run.status, "idle")
-        return {
-            "run_id": last_run.id,
-            "status": run_status,
-            "current_step": None,
-            "progress_percent": 100 if run_status in ("success", "failed") else 0,
-            "started_at": last_run.started_at.isoformat() if last_run.started_at else None,
-            "last_update": last_run.completed_at.isoformat() if last_run.completed_at else None,
-            "message": f"Last run: {last_run.status}",
-        }
-
-    return {
-        "run_id": None,
-        "status": "idle",
-        "current_step": None,
-        "progress_percent": 0,
-        "started_at": None,
-        "last_update": None,
-        "message": "No processing runs yet",
-    }
+    return get_run_status().to_dict()
 
 
 @app.get(
@@ -758,17 +717,26 @@ async def mark_email_resolved(
 @app.post("/api/processing/trigger", dependencies=[Depends(require_authentication)])
 @limiter.limit("5/minute")  # Strict rate limit on manual processing trigger
 async def trigger_processing(
-    request: Request, trigger_request: TriggerRunRequest, db: Session = Depends(get_db)
+    request: Request, trigger_request: TriggerRunRequest
 ):
-    """Manually trigger email processing"""
+    """
+    Manually trigger email processing.
+
+    Returns immediately with run_id.  Processing runs in a background thread.
+    If a run is already active returns success=false with the active run_id.
+    """
     try:
         scheduler = get_scheduler()
-        success = scheduler.trigger_manual_run()
+        started, run_id = scheduler.trigger_manual_run_async()
 
-        if success:
-            return {"success": True, "message": "Processing triggered"}
+        if started:
+            return {"success": True, "message": "Processing started", "run_id": run_id}
         else:
-            return {"success": False, "message": "Processing already in progress"}
+            return {
+                "success": False,
+                "message": "Processing already in progress",
+                "run_id": run_id,
+            }
 
     except Exception as e:
         sanitized_error = sanitize_error(e, settings.debug)

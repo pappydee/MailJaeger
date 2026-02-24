@@ -66,7 +66,7 @@ class AIService:
         body_plain = email_data.get("body_plain", "")
         body_html = email_data.get("body_html", "")
 
-        # Use plain text if available, otherwise extract from HTML
+        # Always prefer plain text; always strip HTML — never pass raw markup to AI
         if body_plain:
             content = body_plain
         elif body_html:
@@ -74,10 +74,14 @@ class AIService:
         else:
             content = ""
 
-        # Limit content length
-        max_length = 4000
+        # Strip any residual HTML even in "plain" body (some clients mix)
+        if "<" in content and ">" in content:
+            content = self._extract_text_from_html(content)
+
+        # Cap content length to keep prompts short and avoid timeout
+        max_length = 1500
         if len(content) > max_length:
-            content = content[:max_length] + "..."
+            content = content[:max_length] + "…"
 
         return f"Betreff: {subject}\nAbsender: {sender}\n\nInhalt:\n{content}"
 
@@ -143,7 +147,13 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
                 "model": self.settings.ai_model,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": 0.3, "top_p": 0.9},
+                "keep_alive": self.settings.ai_keep_alive,
+                "options": {
+                    "temperature": self.settings.ai_temperature,
+                    "top_p": self.settings.ai_top_p,
+                    "num_ctx": self.settings.ai_num_ctx,
+                    "num_predict": self.settings.ai_num_predict,
+                },
             }
 
             with httpx.Client(timeout=self.settings.ai_timeout) as client:
@@ -154,7 +164,9 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
                 return result.get("response", "")
 
         except httpx.TimeoutException:
-            logger.error("AI service timeout")
+            logger.error(
+                f"AI service timeout after {self.settings.ai_timeout}s - using fallback"
+            )
             return None
         except httpx.HTTPError as e:
             sanitized_error = sanitize_error(e, debug=self.settings.debug)
@@ -166,17 +178,16 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
             return None
 
     def _parse_ai_response(self, response: str) -> Dict[str, Any]:
-        """Parse AI response and validate structure"""
+        """Parse AI response and validate structure.
+
+        Handles:
+        - Bare JSON
+        - JSON wrapped in ```json ... ``` code fences
+        - Leading/trailing prose text
+        - Missing or invalid field values (clamped/defaulted)
+        """
         try:
-            # Extract JSON from response
-            json_start = response.find("{")
-            json_end = response.rfind("}") + 1
-
-            if json_start == -1 or json_end == 0:
-                logger.warning("No JSON found in AI response, using fallback")
-                raise ValueError("No JSON found in response")
-
-            json_str = response[json_start:json_end]
+            json_str = self._extract_json_string(response)
             data = json.loads(json_str)
 
             # Strict validation and normalization
@@ -222,6 +233,30 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
             sanitized_error = sanitize_error(e, debug=self.settings.debug)
             logger.error(f"Failed to validate AI response: {sanitized_error}")
             raise
+
+    def _extract_json_string(self, text: str) -> str:
+        """Extract the JSON object string from an AI response.
+
+        Tries in order:
+        1. Strip ```json ... ``` or ``` ... ``` code fences
+        2. Find the first '{' to last '}' span
+        """
+        # 1. Strip code fences (```json or ```)
+        stripped = text.strip()
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", stripped)
+        if fence_match:
+            candidate = fence_match.group(1).strip()
+            # Validate it looks like an object
+            if candidate.startswith("{"):
+                return candidate
+
+        # 2. Find first { … last }
+        json_start = stripped.find("{")
+        json_end = stripped.rfind("}") + 1
+        if json_start != -1 and json_end > json_start:
+            return stripped[json_start:json_end]
+
+        raise ValueError("No JSON object found in AI response")
 
     def _validate_string(self, value: Any, max_length: int = 1000) -> str:
         """Validate and sanitize string values"""

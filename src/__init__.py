@@ -1,10 +1,25 @@
 """MailJaeger - Local AI email processing system"""
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 __author__ = "MailJaeger Team"
 __description__ = "Fully local, privacy-first AI email processing system"
 
 CHANGELOG = [
+    {
+        "version": "1.1.0",
+        "date": "2026-02-24",
+        "changes": [
+            "Non-blocking processing trigger: /api/processing/trigger returns run_id immediately",
+            "Real-time progress tracking: processed/total/spam/action_required counts in /api/status",
+            "AI stability: configurable timeout (default 30s), Ollama num_ctx/num_predict/temperature options",
+            "Improved AI JSON parsing: strip code fences, validate required fields, clamp enum values",
+            "HTML always stripped from email content; content capped at 1500 chars",
+            "Responsive mobile-first UI: flex-wrap header, stacked filters, touch-friendly buttons",
+            "Visible error banners/toasts for all API failures",
+            "SAFE MODE badge in UI header",
+            "Spinner on Process Now button during active run; auto-stop polling on completion",
+        ],
+    },
     {
         "version": "1.0.1",
         "date": "2026-02-24",

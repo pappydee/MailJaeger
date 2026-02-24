@@ -189,7 +189,7 @@ class TestVersionEndpoint:
                 assert "version" in entry
                 assert "changes" in entry
 
-    def test_version_is_1_0_1(self):
+    def test_version_is_1_1_0(self):
         with patch.dict(os.environ, ENV):
             from src.config import reload_settings
             reload_settings()
@@ -197,7 +197,7 @@ class TestVersionEndpoint:
 
             client = TestClient(app, raise_server_exceptions=False)
             response = client.get("/api/version")
-            assert response.json()["version"] == "1.0.1"
+            assert response.json()["version"] == "1.1.0"
 
 
 class TestStatusEndpoint:
@@ -220,26 +220,14 @@ class TestStatusEndpoint:
             from src.main import app
 
             client = TestClient(app, raise_server_exceptions=False)
-            with patch("src.main.get_scheduler") as mock_sched, patch(
-                "src.main.get_db"
-            ) as mock_db:
-                mock_sched.return_value.get_status.return_value = {
-                    "is_locked": False,
-                    "is_running": True,
-                }
-                # Make get_db return a usable mock session
-                mock_session = MagicMock()
-                mock_session.query.return_value.order_by.return_value.first.return_value = None
-                mock_db.return_value = iter([mock_session])
-
-                response = client.get(
-                    "/api/status",
-                    headers={"Authorization": "Bearer test_secret_key_12345"},
-                )
-                assert response.status_code == 200
-                data = response.json()
-                assert "status" in data
-                assert "progress_percent" in data
+            response = client.get(
+                "/api/status",
+                headers={"Authorization": "Bearer test_secret_key_12345"},
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert "status" in data
+            assert "progress_percent" in data
 
     def test_status_fields_present(self):
         with patch.dict(os.environ, ENV):
@@ -248,24 +236,29 @@ class TestStatusEndpoint:
             from src.main import app
 
             client = TestClient(app, raise_server_exceptions=False)
-            with patch("src.main.get_scheduler") as mock_sched, patch(
-                "src.main.get_db"
-            ) as mock_db:
-                mock_sched.return_value.get_status.return_value = {"is_locked": False}
-                mock_session = MagicMock()
-                mock_session.query.return_value.order_by.return_value.first.return_value = None
-                mock_db.return_value = iter([mock_session])
-
-                response = client.get(
-                    "/api/status",
-                    headers={"Authorization": "Bearer test_secret_key_12345"},
-                )
-                assert response.status_code == 200
-                data = response.json()
-                required_fields = {"status", "progress_percent", "run_id", "current_step"}
-                assert required_fields.issubset(data.keys()), (
-                    f"Missing fields: {required_fields - data.keys()}"
-                )
+            response = client.get(
+                "/api/status",
+                headers={"Authorization": "Bearer test_secret_key_12345"},
+            )
+            assert response.status_code == 200
+            data = response.json()
+            required_fields = {
+                "status",
+                "progress_percent",
+                "run_id",
+                "current_step",
+                "processed",
+                "total",
+                "spam",
+                "action_required",
+                "failed",
+                "started_at",
+                "last_update",
+                "message",
+            }
+            assert required_fields.issubset(data.keys()), (
+                f"Missing fields: {required_fields - data.keys()}"
+            )
 
 
 if __name__ == "__main__":

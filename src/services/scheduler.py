@@ -3,7 +3,9 @@ Scheduler service for automated email processing
 """
 
 import logging
-from datetime import datetime, time
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -19,6 +21,69 @@ from src.utils.error_handling import sanitize_error
 logger = get_logger(__name__)
 
 
+@dataclass
+class RunStatus:
+    """Shared mutable state describing the current or most-recent processing run."""
+
+    run_id: Optional[int] = None
+    status: str = "idle"  # idle | running | success | failed
+    current_step: Optional[str] = None
+    progress_percent: int = 0
+    processed: int = 0
+    total: int = 0
+    spam: int = 0
+    action_required: int = 0
+    failed: int = 0
+    started_at: Optional[str] = None
+    last_update: Optional[str] = None
+    message: str = ""
+
+    def reset(self) -> None:
+        self.run_id = None
+        self.status = "idle"
+        self.current_step = None
+        self.progress_percent = 0
+        self.processed = 0
+        self.total = 0
+        self.spam = 0
+        self.action_required = 0
+        self.failed = 0
+        self.started_at = None
+        self.last_update = None
+        self.message = ""
+
+    def update(self, **kwargs) -> None:
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+        self.last_update = datetime.utcnow().isoformat()
+
+    def to_dict(self) -> dict:
+        return {
+            "run_id": self.run_id,
+            "status": self.status,
+            "current_step": self.current_step,
+            "progress_percent": self.progress_percent,
+            "processed": self.processed,
+            "total": self.total,
+            "spam": self.spam,
+            "action_required": self.action_required,
+            "failed": self.failed,
+            "started_at": self.started_at,
+            "last_update": self.last_update,
+            "message": self.message,
+        }
+
+
+# Module-level singleton shared across the app process
+_run_status: RunStatus = RunStatus()
+
+
+def get_run_status() -> RunStatus:
+    """Return the singleton RunStatus."""
+    return _run_status
+
+
 class SchedulerService:
     """Service for scheduling email processing"""
 
@@ -26,7 +91,8 @@ class SchedulerService:
         self.settings = get_settings()
         self.scheduler = BackgroundScheduler(timezone=self.settings.schedule_timezone)
         self.is_running = False
-        self.lock = False
+        self.lock = threading.Lock()  # thread-safe lock
+        self._locked = False  # track whether a run is active
 
         # Add event listeners
         self.scheduler.add_listener(self._job_executed, EVENT_JOB_EXECUTED)
@@ -71,11 +137,34 @@ class SchedulerService:
         self.is_running = False
         logger.info("Scheduler stopped")
 
+    def trigger_manual_run_async(self) -> tuple[bool, Optional[int]]:
+        """
+        Trigger a manual processing run in a background thread.
+
+        Returns (started: bool, run_id_or_None).
+        Returns immediately — the run executes in a daemon thread.
+        """
+        with self.lock:
+            if self._locked:
+                logger.warning("Processing run already in progress")
+                return False, _run_status.run_id
+
+        t = threading.Thread(
+            target=self._run_processing,
+            args=("MANUAL",),
+            daemon=True,
+            name="mailjaeger-manual-run",
+        )
+        t.start()
+        return True, None  # run_id assigned once thread creates DB record
+
+    # Keep the old synchronous helper for backward compat with scheduled jobs
     def trigger_manual_run(self) -> bool:
-        """Trigger manual processing run"""
-        if self.lock:
-            logger.warning("Processing run already in progress")
-            return False
+        """Trigger manual processing run (blocks until complete)."""
+        with self.lock:
+            if self._locked:
+                logger.warning("Processing run already in progress")
+                return False
 
         try:
             self._run_processing(trigger_type="MANUAL")
@@ -87,27 +176,56 @@ class SchedulerService:
             return False
 
     def _run_processing(self, trigger_type: str = "SCHEDULED"):
-        """Execute processing run with lock"""
-        if self.lock:
-            logger.warning("Processing run already in progress, skipping")
-            return
+        """Execute processing run with lock and progress updates."""
+        with self.lock:
+            if self._locked:
+                logger.warning("Processing run already in progress, skipping")
+                return
+            self._locked = True
 
-        self.lock = True
+        _run_status.reset()
+        _run_status.update(
+            status="running",
+            current_step="Starting…",
+            started_at=datetime.utcnow().isoformat(),
+            message=f"Processing started ({trigger_type})",
+        )
+
         logger.info(f"Starting {trigger_type} processing run")
 
         try:
             with get_db_session() as db:
-                processor = EmailProcessor(db)
+                processor = EmailProcessor(db, status=_run_status)
                 run = processor.process_emails(trigger_type=trigger_type)
                 logger.info(f"Processing run completed: {run.status}")
+
+                status_map = {
+                    "SUCCESS": "success",
+                    "FAILURE": "failed",
+                    "PARTIAL": "success",
+                }
+                final_status = status_map.get(run.status, "idle")
+                _run_status.update(
+                    run_id=run.id,
+                    status=final_status,
+                    current_step=None,
+                    progress_percent=100,
+                    message=f"Completed: {run.status}",
+                )
         except Exception as e:
             sanitized_error = sanitize_error(e, debug=self.settings.debug)
             logger.error(
                 f"Processing run failed: {sanitized_error}",
                 exc_info=self.settings.debug,
             )
+            _run_status.update(
+                status="failed",
+                current_step=None,
+                message="Run failed with an unexpected error",
+            )
         finally:
-            self.lock = False
+            with self.lock:
+                self._locked = False
 
     def _parse_schedule_time(self) -> tuple:
         """Parse schedule time string"""
@@ -144,7 +262,7 @@ class SchedulerService:
 
         return {
             "is_running": self.is_running,
-            "is_locked": self.lock,
+            "is_locked": self._locked,
             "next_run_time": next_run.isoformat() if next_run else None,
             "timezone": self.settings.schedule_timezone,
             "schedule_time": self.settings.schedule_time,
