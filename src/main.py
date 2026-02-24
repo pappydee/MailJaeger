@@ -716,9 +716,7 @@ async def mark_email_resolved(
 
 @app.post("/api/processing/trigger", dependencies=[Depends(require_authentication)])
 @limiter.limit("5/minute")  # Strict rate limit on manual processing trigger
-async def trigger_processing(
-    request: Request, trigger_request: TriggerRunRequest
-):
+async def trigger_processing(request: Request):
     """
     Manually trigger email processing.
 
