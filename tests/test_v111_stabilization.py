@@ -4,6 +4,7 @@ Tests for v1.1.1 stabilization patch:
 2. ClassificationOverride DB model
 3. POST /api/emails/{id}/override endpoint
 4. EmailProcessor override-before-AI logic
+5. Backward-compatible body schemas for existing endpoints
 """
 
 import pytest
@@ -23,9 +24,21 @@ ENV = {
 AUTH = {"Authorization": "Bearer test_key_abc123"}
 
 
+def _reset_rate_limiter():
+    """Reset the in-memory rate limiter so tests don't interfere with each other."""
+    try:
+        from src.middleware.rate_limiting import limiter
+        limiter.reset()
+    except Exception:
+        pass  # Best-effort; don't fail tests if reset isn't available
+
+
 # 1. Trigger endpoint - optional body
 
 class TestTriggerOptionalBody:
+    def setup_method(self):
+        """Reset rate limiter before each trigger test to avoid cross-test pollution."""
+        _reset_rate_limiter()
     def test_trigger_without_body_returns_200(self):
         with patch.dict(os.environ, ENV):
             from src.config import reload_settings
@@ -301,6 +314,126 @@ class TestVersion111:
         versions = [e["version"] for e in CHANGELOG]
         assert "1.1.0" in versions
         assert "1.0.0" in versions
+
+
+# 6. Backward-compatible body schemas
+#    Problem statement requirement: verify that existing endpoints still accept
+#    flat (non-embedded) JSON bodies after the auth middleware credentials fix.
+
+class TestEndpointBodySchemas:
+    """Verify existing endpoints accept flat JSON body (not embedded in a wrapper key).
+
+    Root cause of 422 errors: require_authentication previously declared
+    ``credentials: Optional[HTTPAuthorizationCredentials] = None`` which caused
+    FastAPI to expect the endpoint body to be embedded as
+    {"<field_name>": {...}} instead of a flat object.  After removing that
+    parameter the endpoints must accept the exact flat structure the frontend sends.
+    """
+
+    def setup_method(self):
+        _reset_rate_limiter()
+
+    def _make_client(self):
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            reload_settings()
+            from src.main import app
+            return TestClient(app, raise_server_exceptions=False), AUTH
+
+    def test_emails_list_accepts_flat_body(self):
+        """POST /api/emails/list must accept flat JSON (no wrapping key)."""
+        client, auth = self._make_client()
+        with patch("src.main.get_db") as mock_db:
+            mock_session = MagicMock()
+            mock_session.query.return_value.filter.return_value.order_by.return_value.offset.return_value.limit.return_value.all.return_value = []
+            mock_session.query.return_value.filter.return_value.count.return_value = 0
+            mock_session.query.return_value.count.return_value = 0
+            mock_db.return_value = iter([mock_session])
+            resp = client.post(
+                "/api/emails/list",
+                json={"page": 1, "page_size": 10},
+                headers=auth,
+            )
+        assert resp.status_code != 422, f"Got 422 (embedded body bug): {resp.text}"
+
+    def test_emails_search_accepts_flat_body(self):
+        """POST /api/emails/search must accept flat JSON (no wrapping key)."""
+        client, auth = self._make_client()
+        with patch("src.main.get_db") as mock_db:
+            mock_session = MagicMock()
+            mock_session.query.return_value.filter.return_value.order_by.return_value.offset.return_value.limit.return_value.all.return_value = []
+            mock_session.query.return_value.filter.return_value.count.return_value = 0
+            mock_db.return_value = iter([mock_session])
+            resp = client.post(
+                "/api/emails/search",
+                json={"query": "test", "page": 1},
+                headers=auth,
+            )
+        assert resp.status_code != 422, f"Got 422 (embedded body bug): {resp.text}"
+
+    def test_settings_accepts_flat_body(self):
+        """POST /api/settings must accept flat JSON (no wrapping key)."""
+        client, auth = self._make_client()
+        resp = client.post(
+            "/api/settings",
+            json={"spam_threshold": 0.8},
+            headers=auth,
+        )
+        assert resp.status_code != 422, f"Got 422 (embedded body bug): {resp.text}"
+
+    def test_pending_actions_preview_accepts_flat_body(self):
+        """POST /api/pending-actions/preview must accept flat JSON (no wrapping key)."""
+        client, auth = self._make_client()
+        with patch("src.main.get_db") as mock_db:
+            mock_session = MagicMock()
+            mock_session.query.return_value.filter.return_value.all.return_value = []
+            mock_session.query.return_value.filter.return_value.limit.return_value.all.return_value = []
+            mock_db.return_value = iter([mock_session])
+            resp = client.post(
+                "/api/pending-actions/preview",
+                json={},
+                headers=auth,
+            )
+        assert resp.status_code != 422, f"Got 422 (embedded body bug): {resp.text}"
+
+    def test_openapi_does_not_embed_emails_list_body(self):
+        """OpenAPI schema for POST /api/emails/list must use a $ref, not an inline
+        wrapper object.  If the auth credentials bug returned, FastAPI would generate
+        a schema with a ``{"email_request": {...}}`` wrapper key."""
+        client, auth = self._make_client()
+        resp = client.get("/openapi.json", headers=auth)
+        assert resp.status_code == 200
+        spec = resp.json()
+        post_schema = spec["paths"]["/api/emails/list"]["post"]
+        # requestBody content schema must reference EmailListRequest directly
+        # (not wrap it in a property key)
+        body_schema = (
+            post_schema.get("requestBody", {})
+            .get("content", {})
+            .get("application/json", {})
+            .get("schema", {})
+        )
+        # A wrapped schema would look like {"properties": {"email_request": {...}}}
+        props = body_schema.get("properties", {})
+        assert "email_request" not in props, (
+            "Body is incorrectly wrapped in 'email_request' key — "
+            "auth credentials parameter bug is back"
+        )
+
+    def test_require_authentication_has_no_credentials_parameter(self):
+        """require_authentication must not declare HTTPAuthorizationCredentials
+        as a function parameter (this was the root cause of 422 errors)."""
+        import inspect
+        from src.middleware.auth import require_authentication
+        sig = inspect.signature(require_authentication)
+        for param_name, param in sig.parameters.items():
+            annotation = param.annotation
+            if annotation != inspect.Parameter.empty:
+                ann_str = str(annotation)
+                assert "HTTPAuthorizationCredentials" not in ann_str, (
+                    f"Parameter '{param_name}' uses HTTPAuthorizationCredentials — "
+                    "this causes FastAPI to embed request bodies in all protected endpoints"
+                )
 
 
 if __name__ == "__main__":
