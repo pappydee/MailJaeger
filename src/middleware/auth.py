@@ -53,9 +53,7 @@ def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials]) -> bool:
     return any(secrets.compare_digest(token, key) for key in api_keys)
 
 
-async def require_authentication(
-    request: Request, credentials: Optional[HTTPAuthorizationCredentials] = None
-) -> None:
+async def require_authentication(request: Request) -> None:
     """
     Dependency that requires authentication
 
@@ -63,6 +61,10 @@ async def require_authentication(
         @app.get("/protected", dependencies=[Depends(require_authentication)])
         async def protected_route():
             ...
+
+    Authentication is read directly from the Authorization header (Bearer token)
+    or from the global auth middleware (session cookie).  The credentials are NOT
+    accepted as a body parameter to avoid FastAPI embedding the request body.
     """
     settings = get_settings()
     api_keys = settings.get_api_keys()

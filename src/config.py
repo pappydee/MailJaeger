@@ -98,7 +98,22 @@ class Settings(BaseSettings):
         default="mistral:7b-instruct-q4_0",
         description="AI model to use (recommended: mistral:7b-instruct-q4_0, phi3:mini, or llama3.2:3b for Raspberry Pi 5)",
     )
-    ai_timeout: int = Field(default=120, description="AI request timeout in seconds")
+    ai_timeout: int = Field(default=30, description="AI request timeout in seconds")
+
+    # Ollama generation options (passed to /api/generate)
+    ai_num_ctx: int = Field(default=2048, description="Ollama context window size")
+    ai_num_predict: int = Field(
+        default=600, description="Ollama max tokens to predict"
+    )
+    ai_temperature: float = Field(
+        default=0.2, ge=0.0, le=2.0, description="Ollama sampling temperature"
+    )
+    ai_top_p: float = Field(
+        default=0.9, ge=0.0, le=1.0, description="Ollama top-p sampling"
+    )
+    ai_keep_alive: str = Field(
+        default="30m", description="How long Ollama keeps model in memory"
+    )
 
     # Processing Configuration
     spam_threshold: float = Field(

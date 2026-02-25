@@ -13,17 +13,31 @@ import sys
 
 
 def get_fresh_app(env_vars):
-    """Get a fresh app instance with given environment variables"""
-    # Reload modules to ensure clean state
-    for module in list(sys.modules.keys()):
-        if module.startswith('src.'):
-            del sys.modules[module]
-    
+    """Return a minimal FastAPI app wired with AllowedHostsMiddleware under env_vars.
+
+    This avoids reimporting src.main (which would invalidate module-level
+    `app` references in other test files and break their patches) while still
+    providing a properly-configured AllowedHostsMiddleware for host-validation
+    tests.
+    """
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
     with patch.dict(os.environ, env_vars, clear=True):
-        from src.config import reload_settings
+        from src.config import reload_settings, get_settings
         reload_settings()
-        from src.main import app
-        return app
+        cfg = get_settings()
+
+        from src.middleware.allowed_hosts import AllowedHostsMiddleware
+
+        mini_app = FastAPI()
+        mini_app.add_middleware(AllowedHostsMiddleware, settings=cfg)
+
+        @mini_app.get("/")
+        async def root():
+            return JSONResponse({"success": True, "message": "ok"})
+
+        return mini_app
 
 
 class TestAllowedHostsMiddleware:

@@ -5,10 +5,10 @@ FastAPI application for MailJaeger
 from fastapi import FastAPI, Depends, HTTPException, Query, Request, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
@@ -35,9 +35,11 @@ from src.models.schemas import (
     PreviewActionsRequest,
     PreviewActionsResponse,
     ApplyActionsResponse,
+    ClassificationOverrideRequest,
+    ClassificationOverrideResponse,
 )
-from src.models.database import ProcessedEmail, ProcessingRun, PendingAction, ApplyToken
-from src.services.scheduler import get_scheduler
+from src.models.database import ProcessedEmail, ProcessingRun, PendingAction, ApplyToken, ClassificationOverride
+from src.services.scheduler import get_scheduler, get_run_status
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
 from src.services.search_service import SearchService
@@ -49,10 +51,17 @@ from src.middleware.allowed_hosts import AllowedHostsMiddleware
 from src.middleware.rate_limiting import limiter, rate_limit_exceeded_handler
 from src.utils.logging import setup_logging, get_logger
 from src.utils.error_handling import sanitize_error
+from src import __version__, CHANGELOG
 
 # Setup logging
 setup_logging()
 logger = get_logger(__name__)
+
+# In-memory session store: token -> expiry datetime
+# Sessions are lost on restart (acceptable for a local tool).
+_sessions: Dict[str, datetime] = {}
+SESSION_COOKIE = "mailjaeger_session"
+SESSION_EXPIRY_HOURS = 24
 
 # Settings with validation
 try:
@@ -82,7 +91,7 @@ except Exception as e:
 app = FastAPI(
     title="MailJaeger",
     description="Local AI-powered email processing system (Secure)",
-    version="1.0.0",
+    version=__version__,
     docs_url="/api/docs",
     redoc_url="/api/redoc",
 )
@@ -93,14 +102,25 @@ app = FastAPI(
 @app.middleware("http")
 async def global_auth_middleware(request: Request, call_next):
     """
-    Global authentication middleware that enforces Bearer token auth for all routes
+    Global authentication middleware that enforces auth for all routes
     except those in the explicit allowlist. This is fail-closed by default.
-    """
-    # Explicit allowlist of unauthenticated routes
-    UNAUTHENTICATED_ROUTES = {"/api/health"}
 
-    # Allow unauthenticated access only to explicitly allowed routes
-    if request.url.path in UNAUTHENTICATED_ROUTES:
+    Accepts either:
+    - Authorization: Bearer <API_KEY>  (CLI/curl compatibility)
+    - Session cookie set by POST /api/auth/login  (browser usage)
+    """
+    # Explicit allowlist of unauthenticated routes.
+    # "/" is allowed so the browser can load the login page.
+    # "/api/auth/*" is allowed so login/logout work without credentials.
+    UNAUTHENTICATED_ROUTES = {"/api/health", "/", "/api/version"}
+    UNAUTHENTICATED_PREFIXES = ("/api/auth/", "/static/")
+
+    path = request.url.path
+
+    # Allow unauthenticated access to explicitly allowed routes and prefixes
+    if path in UNAUTHENTICATED_ROUTES or any(
+        path.startswith(p) for p in UNAUTHENTICATED_PREFIXES
+    ):
         return await call_next(request)
 
     # Check authentication for all other routes
@@ -109,18 +129,25 @@ async def global_auth_middleware(request: Request, call_next):
 
     # Fail-closed: If no API keys configured, deny all access except allowlist
     if not api_keys:
-        logger.error(f"No API keys configured - denying access to {request.url.path}")
+        logger.error(f"No API keys configured - denying access to {path}")
         return JSONResponse(
             status_code=401,
             content={"detail": "Unauthorized"},
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Get credentials from header
+    # --- Option 1: Bearer token (CLI / curl) ---
     auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
+    if auth_header and auth_header.startswith("Bearer "):
+        try:
+            token = auth_header.split(" ", 1)[1]
+            if any(secrets.compare_digest(token, key) for key in api_keys):
+                logger.debug(f"Bearer-authenticated request to {path}")
+                return await call_next(request)
+        except IndexError:
+            pass
         logger.warning(
-            f"Unauthenticated request to {request.url.path} from {request.client.host if request.client else 'unknown'}"
+            f"Failed Bearer auth for {path} from {request.client.host if request.client else 'unknown'}"
         )
         return JSONResponse(
             status_code=401,
@@ -128,29 +155,25 @@ async def global_auth_middleware(request: Request, call_next):
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Extract and verify token
-    try:
-        token = auth_header.split(" ", 1)[1]
-        if not any(secrets.compare_digest(token, key) for key in api_keys):
-            logger.warning(
-                f"Failed authentication attempt for {request.url.path} from {request.client.host if request.client else 'unknown'}"
-            )
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Unauthorized"},
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-    except IndexError:
-        logger.warning(f"Malformed auth header for {request.url.path}")
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Unauthorized"},
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    # --- Option 2: Session cookie (browser) ---
+    session_token = request.cookies.get(SESSION_COOKIE)
+    if session_token:
+        expiry = _sessions.get(session_token)
+        if expiry and expiry > datetime.utcnow():
+            logger.debug(f"Cookie-authenticated request to {path}")
+            return await call_next(request)
+        # Expired or invalid session
+        if session_token in _sessions:
+            del _sessions[session_token]
 
-    # Authentication successful, log and proceed
-    logger.debug(f"Authenticated request to {request.url.path}")
-    return await call_next(request)
+    logger.warning(
+        f"Unauthenticated request to {path} from {request.client.host if request.client else 'unknown'}"
+    )
+    return JSONResponse(
+        status_code=401,
+        content={"detail": "Unauthorized"},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 # Request size limit (10MB default for API requests)
@@ -271,7 +294,7 @@ async def startup_event():
     """Initialize application on startup"""
     logger.info("=" * 60)
     logger.info("Starting MailJaeger...")
-    logger.info(f"Version: 1.0.0")
+    logger.info(f"Version: {__version__}")
     logger.info(f"Server: {settings.server_host}:{settings.server_port}")
     logger.info(f"Debug mode: {settings.debug}")
     logger.info(f"Safe mode: {settings.safe_mode}")
@@ -348,10 +371,124 @@ async def root(request: Request):
 
     return {
         "name": "MailJaeger",
-        "version": "1.0.0",
+        "version": __version__,
         "status": "running",
         "message": "Frontend not found. Access API at /api/docs",
     }
+
+
+# ─── Auth endpoints (no authentication required) ──────────────────────────────
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request, response: Response):
+    """
+    Exchange API key for a session cookie.
+    Accepts JSON body: {"api_key": "..."}
+    On success sets an HttpOnly session cookie and returns {"success": true}.
+    Keeps Bearer token support intact for CLI usage.
+    """
+    try:
+        body = await request.json()
+        provided_key = body.get("api_key", "")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if not provided_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+
+    settings = get_settings()
+    api_keys = settings.get_api_keys()
+
+    if not api_keys:
+        raise HTTPException(status_code=503, detail="No API keys configured on server")
+
+    if not any(secrets.compare_digest(provided_key, key) for key in api_keys):
+        logger.warning(
+            f"Failed login from {request.client.host if request.client else 'unknown'}"
+        )
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # Create session token
+    token = secrets.token_urlsafe(32)
+    _sessions[token] = datetime.utcnow() + timedelta(hours=SESSION_EXPIRY_HOURS)
+    logger.info(
+        f"Session created for {request.client.host if request.client else 'unknown'}"
+    )
+
+    # Set HttpOnly cookie.
+    # SameSite=Lax: works for normal LAN navigation and is safe against CSRF.
+    # Secure=False: required for plain HTTP on a local network; a HTTPS reverse
+    # proxy can add Secure=True via its own cookie rewriting.
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        max_age=SESSION_EXPIRY_HOURS * 3600,
+        httponly=True,
+        samesite="lax",
+        secure=False,  # Allow HTTP for LAN deployments
+    )
+    return {"success": True}
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request, response: Response):
+    """Invalidate current session cookie."""
+    token = request.cookies.get(SESSION_COOKIE)
+    if token and token in _sessions:
+        del _sessions[token]
+    response.delete_cookie(key=SESSION_COOKIE, samesite="lax")
+    return {"success": True}
+
+
+@app.get("/api/auth/verify")
+async def auth_verify(request: Request):
+    """
+    Check whether the current request is authenticated.
+    Returns 200 if authenticated (Bearer or session cookie), 401 otherwise.
+    This is called by the frontend to decide whether to show the login screen.
+    """
+    settings = get_settings()
+    api_keys = settings.get_api_keys()
+
+    if not api_keys:
+        return JSONResponse(status_code=401, content={"authenticated": False})
+
+    # Check Bearer
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1]
+        if any(secrets.compare_digest(token, key) for key in api_keys):
+            return {"authenticated": True}
+
+    # Check session cookie
+    session_token = request.cookies.get(SESSION_COOKIE)
+    if session_token:
+        expiry = _sessions.get(session_token)
+        if expiry and expiry > datetime.utcnow():
+            return {"authenticated": True}
+
+    return JSONResponse(status_code=401, content={"authenticated": False})
+
+
+# ─── Version endpoint ──────────────────────────────────────────────────────────
+
+@app.get("/api/version")
+async def get_version():
+    """Return current version and changelog."""
+    return {"version": __version__, "changelog": CHANGELOG}
+
+
+# ─── Status endpoint ───────────────────────────────────────────────────────────
+
+@app.get("/api/status", dependencies=[Depends(require_authentication)])
+async def get_status():
+    """
+    Return real-time system status for the UI progress bar.
+    Schema: run_id, status (idle/running/success/failed), current_step,
+            progress_percent (0-100), processed, total, spam,
+            action_required, failed, started_at, last_update, message.
+    """
+    return get_run_status().to_dict()
 
 
 @app.get(
@@ -579,20 +716,127 @@ async def mark_email_resolved(
     return {"success": True, "email_id": email_id, "resolved": request.resolved}
 
 
+@app.post(
+    "/api/emails/{email_id}/override",
+    response_model=ClassificationOverrideResponse,
+    dependencies=[Depends(require_authentication)],
+)
+async def override_email_classification(
+    email_id: int,
+    override: ClassificationOverrideRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Override the AI classification of an email.
+
+    If LEARNING_ENABLED=true, a ClassificationOverride rule is created from the
+    sender domain so future emails from that domain are classified automatically.
+    """
+    email = db.query(ProcessedEmail).filter(ProcessedEmail.id == email_id).first()
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    # Snapshot current classification before overriding
+    if not email.overridden:
+        email.original_classification = {
+            "category": email.category,
+            "priority": email.priority,
+            "is_spam": email.is_spam,
+            "action_required": email.action_required,
+            "suggested_folder": email.suggested_folder,
+            "reasoning": email.reasoning,
+            "spam_probability": email.spam_probability,
+        }
+
+    # Apply the requested overrides
+    if override.category is not None:
+        email.category = override.category
+    if override.priority is not None:
+        email.priority = override.priority
+    if override.spam is not None:
+        email.is_spam = override.spam
+        email.spam_probability = 0.95 if override.spam else 0.05
+    if override.action_required is not None:
+        email.action_required = override.action_required
+    if override.suggested_folder is not None:
+        email.suggested_folder = override.suggested_folder
+
+    email.overridden = True
+    email.reasoning = "Manually overridden by user"
+
+    rule_id: Optional[int] = None
+    rule_created = False
+
+    # Persist a learning rule when learning is enabled
+    if settings.learning_enabled:
+        sender = email.sender or ""
+        # Derive domain pattern (use full address for exact senders)
+        if "@" in sender:
+            domain = sender.split("@", 1)[1].strip(">").lower()
+            sender_pattern = f"@{domain}"
+        else:
+            sender_pattern = sender.lower() if sender else None
+
+        if sender_pattern:
+            rule = ClassificationOverride(
+                sender_pattern=sender_pattern,
+                category=override.category,
+                priority=override.priority,
+                spam=override.spam,
+                action_required=override.action_required,
+                suggested_folder=override.suggested_folder,
+                created_from_email_id=email_id,
+            )
+            db.add(rule)
+            db.flush()  # get the id
+            email.override_rule_id = rule.id
+            rule_id = rule.id
+            rule_created = True
+
+    db.commit()
+
+    return ClassificationOverrideResponse(
+        success=True,
+        email_id=email_id,
+        overridden=True,
+        rule_id=rule_id,
+        rule_created=rule_created,
+        classification={
+            "category": email.category,
+            "priority": email.priority,
+            "is_spam": email.is_spam,
+            "action_required": email.action_required,
+            "suggested_folder": email.suggested_folder,
+            "spam_probability": email.spam_probability,
+        },
+    )
+
+
 @app.post("/api/processing/trigger", dependencies=[Depends(require_authentication)])
 @limiter.limit("5/minute")  # Strict rate limit on manual processing trigger
 async def trigger_processing(
-    request: Request, trigger_request: TriggerRunRequest, db: Session = Depends(get_db)
+    request: Request,
+    trigger_request: Optional[TriggerRunRequest] = Body(default=None),
 ):
-    """Manually trigger email processing"""
+    """
+    Manually trigger email processing.
+
+    Body is optional. When omitted trigger_type defaults to "MANUAL".
+    Returns immediately with run_id.  Processing runs in a background thread.
+    If a run is already active returns success=false with the active run_id.
+    """
     try:
         scheduler = get_scheduler()
-        success = scheduler.trigger_manual_run()
+        started, run_id = scheduler.trigger_manual_run_async()
 
-        if success:
-            return {"success": True, "message": "Processing triggered"}
+        if started:
+            return {"success": True, "message": "Processing started", "run_id": run_id}
         else:
-            return {"success": False, "message": "Processing already in progress"}
+            return {
+                "success": False,
+                "message": "Processing already in progress",
+                "run_id": run_id,
+            }
 
     except Exception as e:
         sanitized_error = sanitize_error(e, settings.debug)
@@ -883,7 +1127,7 @@ async def apply_all_approved_actions(
     - Validates target folders against allowlist
     """
     # Check SAFE_MODE first - it always wins
-    if settings.safe_mode:
+    if get_settings().safe_mode:
         return JSONResponse(
             status_code=409,
             content={
@@ -962,7 +1206,8 @@ async def apply_all_approved_actions(
         )
 
     # Get safe folders
-    safe_folders = settings.get_safe_folders()
+    _cur_settings = get_settings()
+    safe_folders = _cur_settings.get_safe_folders()
 
     if request.dry_run:
         # Preview mode - just return what would be done
@@ -977,7 +1222,7 @@ async def apply_all_approved_actions(
 
             # Check safety validations
             warnings = []
-            if action.action_type == "DELETE" and not settings.allow_destructive_imap:
+            if action.action_type == "DELETE" and not _cur_settings.allow_destructive_imap:
                 warnings.append("DELETE blocked (ALLOW_DESTRUCTIVE_IMAP=false)")
             if action.target_folder and action.target_folder not in safe_folders:
                 warnings.append(
@@ -1029,7 +1274,7 @@ async def apply_all_approved_actions(
 
                         # Safety check: Block DELETE unless explicitly enabled
                         if action.action_type == "DELETE":
-                            if not settings.allow_destructive_imap:
+                            if not _cur_settings.allow_destructive_imap:
                                 action.status = "REJECTED"
                                 action.error_message = (
                                     "DELETE blocked: ALLOW_DESTRUCTIVE_IMAP is false"
@@ -1163,15 +1408,6 @@ async def apply_all_approved_actions(
                 },
             )
 
-            # Commit all changes at once
-            db.commit()
-
-            # Mark token as used ONLY after successful completion
-            # This happens after all actions are processed and committed
-            token_record.is_used = True
-            token_record.used_at = datetime.utcnow()
-            db.commit()
-
     except Exception as e:
         sanitized_error = sanitize_error(e, settings.debug)
         logger.error(f"Error in apply_all_approved_actions: {sanitized_error}")
@@ -1184,6 +1420,15 @@ async def apply_all_approved_actions(
                 else f"Failed to apply actions: {sanitized_error}"
             ),
         )
+
+    # Commit all changes at once
+    db.commit()
+
+    # Mark token as used ONLY after successful completion
+    # This happens after all actions are processed and committed
+    token_record.is_used = True
+    token_record.used_at = datetime.utcnow()
+    db.commit()
 
     return ApplyActionsResponse(
         success=True, applied=applied, failed=failed, actions=results
@@ -1209,7 +1454,7 @@ async def apply_single_action(
     - Validates target folders against allowlist
     """
     # Check SAFE_MODE first - it always wins
-    if settings.safe_mode:
+    if get_settings().safe_mode:
         return JSONResponse(
             status_code=409,
             content={
@@ -1281,11 +1526,12 @@ async def apply_single_action(
         raise HTTPException(status_code=404, detail="Email or UID not found")
 
     # Get safe folders for validation
-    safe_folders = settings.get_safe_folders()
+    _cur_settings = get_settings()
+    safe_folders = _cur_settings.get_safe_folders()
 
     # Safety check: Block DELETE unless explicitly enabled
     if action.action_type == "DELETE":
-        if not settings.allow_destructive_imap:
+        if not _cur_settings.allow_destructive_imap:
             # Do NOT connect to IMAP - refuse immediately
             action.status = "REJECTED"
             action.error_message = "DELETE blocked: ALLOW_DESTRUCTIVE_IMAP is false"
@@ -1312,7 +1558,7 @@ async def apply_single_action(
                 ValueError(
                     f"Target folder not in safe folder allowlist. Allowed: {', '.join(safe_folders)}"
                 ),
-                settings.debug,
+                _cur_settings.debug,
             )
             db.commit()
             logger.error(

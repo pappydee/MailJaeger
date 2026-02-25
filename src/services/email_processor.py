@@ -3,7 +3,7 @@ Email processing service - orchestrates the email processing workflow
 """
 
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from datetime import datetime
 from sqlalchemy.orm import Session
 
@@ -14,11 +14,15 @@ from src.models.database import (
     ProcessingRun,
     AuditLog,
     PendingAction,
+    ClassificationOverride,
 )
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
 from src.utils.logging import get_logger
 from src.utils.error_handling import sanitize_error
+
+if TYPE_CHECKING:
+    from src.services.scheduler import RunStatus
 
 logger = get_logger(__name__)
 
@@ -26,11 +30,12 @@ logger = get_logger(__name__)
 class EmailProcessor:
     """Main email processing orchestrator"""
 
-    def __init__(self, db_session: Session):
+    def __init__(self, db_session: Session, status: Optional["RunStatus"] = None):
         self.settings = get_settings()
         self.db = db_session
         self.imap_service = IMAPService()
         self.ai_service = AIService()
+        self._status = status  # optional shared RunStatus for live progress updates
         self.stats = {
             "processed": 0,
             "spam": 0,
@@ -38,6 +43,16 @@ class EmailProcessor:
             "action_required": 0,
             "failed": 0,
         }
+
+    # ------------------------------------------------------------------
+    # Internal helper to push progress updates without crashing
+    # ------------------------------------------------------------------
+    def _update_status(self, **kwargs) -> None:
+        if self._status is not None:
+            try:
+                self._status.update(**kwargs)
+            except Exception:
+                pass  # never let status updates break the processor
 
     def process_emails(self, trigger_type: str = "SCHEDULED") -> ProcessingRun:
         """
@@ -60,29 +75,55 @@ class EmailProcessor:
         self.db.add(run)
         self.db.commit()
 
+        # Report run_id back to RunStatus as soon as we have it
+        self._update_status(run_id=run.id)
+
         logger.info(
             f"Starting email processing run (ID: {run.id}, Type: {trigger_type})"
         )
 
         try:
             # Step 1: Retrieve emails
+            self._update_status(current_step="Connecting to mail server…", progress_percent=5)
             try:
                 with self.imap_service as imap:
+                    self._update_status(current_step="Fetching unread emails…", progress_percent=10)
                     emails = imap.get_unread_emails(
                         max_count=self.settings.max_emails_per_run
                     )
 
                     if not emails:
                         logger.info("No unread emails to process")
+                        self._update_status(
+                            current_step=None,
+                            progress_percent=100,
+                            total=0,
+                            message="No new emails",
+                        )
                         run.status = "SUCCESS"
                         run.completed_at = datetime.utcnow()
                         self.db.commit()
                         return run
 
-                    logger.info(f"Retrieved {len(emails)} emails for processing")
+                    total = len(emails)
+                    logger.info(f"Retrieved {total} emails for processing")
+                    self._update_status(
+                        current_step=f"Analysing {total} email(s)…",
+                        progress_percent=15,
+                        total=total,
+                    )
 
                     # Process each email independently
-                    for email_data in emails:
+                    for idx, email_data in enumerate(emails, start=1):
+                        pct = 15 + int((idx / total) * 75)  # 15 → 90 %
+                        self._update_status(
+                            current_step=f"Analysing {idx}/{total}…",
+                            progress_percent=pct,
+                            processed=self.stats["processed"],
+                            spam=self.stats["spam"],
+                            action_required=self.stats["action_required"],
+                            failed=self.stats["failed"],
+                        )
                         try:
                             self._process_single_email(email_data, imap)
                         except Exception as e:
@@ -100,6 +141,11 @@ class EmailProcessor:
                 # IMAP connection failed - fail closed
                 sanitized_error = sanitize_error(e, debug=self.settings.debug)
                 logger.error(f"IMAP connection failed: {sanitized_error}")
+                self._update_status(
+                    status="failed",
+                    current_step=None,
+                    message="IMAP connection failed",
+                )
                 run.status = "FAILURE"
                 run.error_message = sanitize_error(e, debug=self.settings.debug)
                 run.completed_at = datetime.utcnow()
@@ -107,6 +153,7 @@ class EmailProcessor:
                 return run
 
             # Update run statistics
+            self._update_status(current_step="Saving results…", progress_percent=95)
             run.emails_processed = self.stats["processed"]
             run.emails_spam = self.stats["spam"]
             run.emails_archived = self.stats["archived"]
@@ -152,14 +199,26 @@ class EmailProcessor:
             logger.info(f"Email already processed: {message_id}")
             return
 
-        # Step 2: AI Analysis with safe fallback
-        try:
-            analysis = self.ai_service.analyze_email(email_data)
-        except Exception as e:
-            sanitized_error = sanitize_error(e, debug=self.settings.debug)
-            logger.error(f"AI analysis failed for {message_id}: {sanitized_error}")
-            # Use fallback classification if AI fails
-            analysis = self.ai_service._fallback_classification(email_data)
+        # Step 2: Check for a matching classification override rule first.
+        # If a rule matches, skip the AI call entirely.
+        override_rule = self._find_matching_override(email_data)
+        applied_override = override_rule is not None
+
+        if applied_override:
+            logger.info(
+                f"Override rule {override_rule.id} matched for {message_id} "
+                f"(pattern: {override_rule.sender_pattern!r})"
+            )
+            analysis = self._build_analysis_from_override(override_rule, email_data)
+        else:
+            # Step 2b: AI Analysis with safe fallback
+            try:
+                analysis = self.ai_service.analyze_email(email_data)
+            except Exception as e:
+                sanitized_error = sanitize_error(e, debug=self.settings.debug)
+                logger.error(f"AI analysis failed for {message_id}: {sanitized_error}")
+                # Use fallback classification if AI fails
+                analysis = self.ai_service._fallback_classification(email_data)
 
         # Step 3: Spam Classification
         is_spam = self._classify_spam(email_data, analysis)
@@ -193,6 +252,8 @@ class EmailProcessor:
             is_processed=True,
             integrity_hash=email_data.get("integrity_hash"),
             processed_at=datetime.utcnow(),
+            overridden=applied_override,
+            override_rule_id=override_rule.id if override_rule else None,
         )
 
         # Add tasks
@@ -358,3 +419,73 @@ class EmailProcessor:
 
         # Check against threshold
         return spam_prob >= self.settings.spam_threshold
+
+    # ------------------------------------------------------------------
+    # Override rule helpers
+    # ------------------------------------------------------------------
+
+    def _find_matching_override(
+        self, email_data: Dict[str, Any]
+    ) -> Optional["ClassificationOverride"]:
+        """
+        Look up a ClassificationOverride rule that matches this email.
+
+        Matching priority:
+        1. sender_pattern (domain match: sender ends with the pattern)
+        2. subject_pattern (case-insensitive substring of subject)
+
+        Returns the first matching rule, or None.
+        """
+        sender = (email_data.get("sender") or "").lower()
+        subject = (email_data.get("subject") or "").lower()
+
+        rules = self.db.query(ClassificationOverride).all()
+        for rule in rules:
+            # Check sender domain match
+            if rule.sender_pattern:
+                pattern = rule.sender_pattern.lower()
+                if sender.endswith(pattern) or sender == pattern.lstrip("@"):
+                    # Optionally also check subject if subject_pattern is set
+                    if rule.subject_pattern:
+                        if rule.subject_pattern.lower() in subject:
+                            return rule
+                    else:
+                        return rule
+            # Check subject-only rule (no sender_pattern)
+            elif rule.subject_pattern:
+                if rule.subject_pattern.lower() in subject:
+                    return rule
+        return None
+
+    def _build_analysis_from_override(
+        self,
+        rule: "ClassificationOverride",
+        email_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Build an AI-style analysis dict from a ClassificationOverride rule,
+        falling back to defaults for unset fields.
+        """
+        fallback = self.ai_service._fallback_classification(email_data)
+        return {
+            "summary": fallback.get("summary", ""),
+            "category": rule.category if rule.category else fallback["category"],
+            "spam_probability": (
+                0.95
+                if rule.spam is True
+                else (0.05 if rule.spam is False else fallback["spam_probability"])
+            ),
+            "action_required": (
+                rule.action_required
+                if rule.action_required is not None
+                else fallback["action_required"]
+            ),
+            "priority": rule.priority if rule.priority else fallback["priority"],
+            "tasks": fallback.get("tasks", []),
+            "suggested_folder": (
+                rule.suggested_folder
+                if rule.suggested_folder
+                else fallback["suggested_folder"]
+            ),
+            "reasoning": "Applied override rule",
+        }

@@ -43,12 +43,18 @@ class TestFailClosedAuthentication:
             ), "Health endpoint should be accessible without API key"
 
     def test_root_requires_auth_when_no_api_key(self, client):
-        """Root endpoint should require auth even when no API key configured (fail-closed)"""
+        """Root serves the login page even when no API key is configured.
+
+        Since v1.0.1 the root path is in the public allowlist so that users
+        can open the browser and enter their API key on the login screen.
+        The middleware returns the login HTML (200) or 404 if the frontend
+        build is absent in the test environment.
+        """
         response = client.get("/")
-        assert (
-            response.status_code == 401
-        ), "Root should return 401 when no API key configured"
-        assert "authentication required" in response.json()["detail"].lower()
+        assert response.status_code in (
+            200,
+            404,
+        ), "Root should serve login page (200) or 404 when frontend absent in test env"
 
     def test_dashboard_requires_auth_when_no_api_key(self, client):
         """Dashboard should require auth even when no API key configured (fail-closed)"""
