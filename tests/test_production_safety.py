@@ -63,6 +63,8 @@ def test_debug_false_allowed_with_web_exposed():
         debug=False,
         server_host="0.0.0.0",
         trust_proxy=True,
+        api_key="test-key-web-exposed",   # required when server_host=0.0.0.0
+        safe_mode=True,                    # required for web-exposed deployment
         imap_host="test.example.com",
         imap_username="test@example.com",
         imap_password="testpass",

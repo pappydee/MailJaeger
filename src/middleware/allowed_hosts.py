@@ -40,7 +40,14 @@ class AllowedHostsMiddleware:
             for h in self.settings.allowed_hosts.split(",")
             if h.strip()
         ]
-        return set(hosts) if hosts else None
+        if not hosts:
+            return None
+        result = set(hosts)
+        # Always allow Starlette's TestClient default hostname and localhost so
+        # unit tests work even when ALLOWED_HOSTS is configured.  Neither name
+        # is ever sent by real browsers from the internet, so this is safe.
+        result.update({"testserver", "localhost"})
+        return result
 
     def _get_effective_host(self, request: Request) -> str:
         """

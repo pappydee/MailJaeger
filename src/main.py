@@ -1127,7 +1127,7 @@ async def apply_all_approved_actions(
     - Validates target folders against allowlist
     """
     # Check SAFE_MODE first - it always wins
-    if settings.safe_mode:
+    if get_settings().safe_mode:
         return JSONResponse(
             status_code=409,
             content={
@@ -1206,7 +1206,8 @@ async def apply_all_approved_actions(
         )
 
     # Get safe folders
-    safe_folders = settings.get_safe_folders()
+    _cur_settings = get_settings()
+    safe_folders = _cur_settings.get_safe_folders()
 
     if request.dry_run:
         # Preview mode - just return what would be done
@@ -1221,7 +1222,7 @@ async def apply_all_approved_actions(
 
             # Check safety validations
             warnings = []
-            if action.action_type == "DELETE" and not settings.allow_destructive_imap:
+            if action.action_type == "DELETE" and not _cur_settings.allow_destructive_imap:
                 warnings.append("DELETE blocked (ALLOW_DESTRUCTIVE_IMAP=false)")
             if action.target_folder and action.target_folder not in safe_folders:
                 warnings.append(
@@ -1273,7 +1274,7 @@ async def apply_all_approved_actions(
 
                         # Safety check: Block DELETE unless explicitly enabled
                         if action.action_type == "DELETE":
-                            if not settings.allow_destructive_imap:
+                            if not _cur_settings.allow_destructive_imap:
                                 action.status = "REJECTED"
                                 action.error_message = (
                                     "DELETE blocked: ALLOW_DESTRUCTIVE_IMAP is false"
@@ -1407,15 +1408,6 @@ async def apply_all_approved_actions(
                 },
             )
 
-            # Commit all changes at once
-            db.commit()
-
-            # Mark token as used ONLY after successful completion
-            # This happens after all actions are processed and committed
-            token_record.is_used = True
-            token_record.used_at = datetime.utcnow()
-            db.commit()
-
     except Exception as e:
         sanitized_error = sanitize_error(e, settings.debug)
         logger.error(f"Error in apply_all_approved_actions: {sanitized_error}")
@@ -1428,6 +1420,15 @@ async def apply_all_approved_actions(
                 else f"Failed to apply actions: {sanitized_error}"
             ),
         )
+
+    # Commit all changes at once
+    db.commit()
+
+    # Mark token as used ONLY after successful completion
+    # This happens after all actions are processed and committed
+    token_record.is_used = True
+    token_record.used_at = datetime.utcnow()
+    db.commit()
 
     return ApplyActionsResponse(
         success=True, applied=applied, failed=failed, actions=results
@@ -1453,7 +1454,7 @@ async def apply_single_action(
     - Validates target folders against allowlist
     """
     # Check SAFE_MODE first - it always wins
-    if settings.safe_mode:
+    if get_settings().safe_mode:
         return JSONResponse(
             status_code=409,
             content={
@@ -1525,11 +1526,12 @@ async def apply_single_action(
         raise HTTPException(status_code=404, detail="Email or UID not found")
 
     # Get safe folders for validation
-    safe_folders = settings.get_safe_folders()
+    _cur_settings = get_settings()
+    safe_folders = _cur_settings.get_safe_folders()
 
     # Safety check: Block DELETE unless explicitly enabled
     if action.action_type == "DELETE":
-        if not settings.allow_destructive_imap:
+        if not _cur_settings.allow_destructive_imap:
             # Do NOT connect to IMAP - refuse immediately
             action.status = "REJECTED"
             action.error_message = "DELETE blocked: ALLOW_DESTRUCTIVE_IMAP is false"
@@ -1556,7 +1558,7 @@ async def apply_single_action(
                 ValueError(
                     f"Target folder not in safe folder allowlist. Allowed: {', '.join(safe_folders)}"
                 ),
-                settings.debug,
+                _cur_settings.debug,
             )
             db.commit()
             logger.error(

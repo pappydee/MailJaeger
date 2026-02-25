@@ -1,6 +1,10 @@
 """
 Unit tests for apply_token consumption logic
-Tests verify that tokens are only consumed when actions succeed and dry_run is false
+Tests verify that tokens are only consumed when actions succeed and dry_run is false.
+
+Uses app.dependency_overrides instead of patch("src.main.get_db") because FastAPI
+captures the get_db function object at route-definition time; patching the module
+attribute has no effect on already-registered routes.
 """
 
 import pytest
@@ -22,13 +26,16 @@ os.environ["ALLOW_DESTRUCTIVE_IMAP"] = "false"
 
 from src.main import app
 from src.config import get_settings, reload_settings
+from src.database.connection import get_db as _get_db  # key for dependency_overrides
 from src.models.database import Base, ProcessedEmail, PendingAction, ApplyToken
 
 
 @pytest.fixture
 def client():
-    """Create test client"""
+    """Create test client with fresh settings."""
     reload_settings()
+    import src.main
+    src.main.settings = get_settings()
     return TestClient(app)
 
 
@@ -49,175 +56,136 @@ def db_session():
     session.close()
 
 
+def _make_mock_db(
+    token=None, actions=None, action=None, email=None
+):
+    """Build a MagicMock DB that routes queries to the right mock objects."""
+    mock_db = MagicMock()
+
+    def query_side_effect(*args, **kw):
+        mock_query = MagicMock()
+        model = args[0] if args else None
+        if model == ApplyToken:
+            mock_query.filter.return_value.first.return_value = token
+        elif model == PendingAction:
+            mock_query.filter.return_value.first.return_value = action
+            mock_query.filter.return_value.all.return_value = actions or (
+                [action] if action else []
+            )
+        elif model == ProcessedEmail:
+            mock_query.filter.return_value.first.return_value = email
+        return mock_query
+
+    mock_db.query.side_effect = query_side_effect
+    return mock_db
+
+
 class TestTokenConsumptionBatchApply:
     """Test token consumption for batch apply endpoint"""
 
     def test_token_not_consumed_on_dry_run(self, client, auth_headers):
         """Test that token is NOT consumed when dry_run=true"""
-        with patch("src.main.get_db") as mock_get_db, patch(
-            "src.main.IMAPService"
-        ) as mock_imap:
+        mock_token = Mock()
+        mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
+        mock_token.action_ids = [1, 2]
+        mock_token.is_used = False
 
-            mock_db = MagicMock()
-            mock_get_db.return_value = mock_db
+        mock_action = Mock()
+        mock_action.id = 1
+        mock_action.status = "APPROVED"
+        mock_action.action_type = "MARK_READ"
+        mock_action.email_id = 1
+        mock_action.target_folder = None
 
-            # Mock token
-            mock_token = Mock()
-            mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
-            mock_token.action_ids = [1, 2]
-            mock_token.is_used = False
+        mock_email = Mock()
+        mock_email.id = 1
+        mock_email.uid = "12345"
+        mock_email.subject = "Test"
 
-            # Mock action
-            mock_action = Mock()
-            mock_action.id = 1
-            mock_action.status = "APPROVED"
-            mock_action.action_type = "MARK_READ"
-            mock_action.email_id = 1
-            mock_action.target_folder = None
+        mock_db = _make_mock_db(
+            token=mock_token, actions=[mock_action], action=mock_action, email=mock_email
+        )
+        app.dependency_overrides[_get_db] = lambda: mock_db
 
-            # Mock email
-            mock_email = Mock()
-            mock_email.id = 1
-            mock_email.uid = "12345"
-            mock_email.subject = "Test"
+        response = client.post(
+            "/api/pending-actions/apply",
+            json={"apply_token": "test_token", "dry_run": True},
+            headers=auth_headers,
+        )
 
-            # Setup query responses
-            def query_side_effect(*args, **kwargs):
-                mock_query = MagicMock()
-                if args[0] == ApplyToken:
-                    mock_query.filter.return_value.first.return_value = mock_token
-                elif args[0] == PendingAction:
-                    if hasattr(mock_query.filter.return_value, "all"):
-                        mock_query.filter.return_value.all.return_value = [mock_action]
-                    else:
-                        mock_query.filter.return_value.first.return_value = mock_action
-                elif args[0] == ProcessedEmail:
-                    mock_query.filter.return_value.first.return_value = mock_email
-                return mock_query
-
-            mock_db.query.side_effect = query_side_effect
-
-            # Call with dry_run=true
-            response = client.post(
-                "/api/pending-actions/apply",
-                json={"apply_token": "test_token", "dry_run": True},
-                headers=auth_headers,
-            )
-
-            # Should succeed
-            assert response.status_code == 200
-
-            # Token should NOT be marked as used
-            assert mock_token.is_used == False
+        assert response.status_code == 200
+        # Token should NOT be marked as used for dry run
+        assert mock_token.is_used == False
 
     def test_token_not_consumed_on_imap_failure(self, client, auth_headers):
         """Test that token is NOT consumed when IMAP connection fails"""
-        with patch("src.main.get_db") as mock_get_db, patch(
-            "src.main.IMAPService"
-        ) as mock_imap:
+        mock_token = Mock()
+        mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
+        mock_token.action_ids = [1]
+        mock_token.is_used = False
 
-            mock_db = MagicMock()
-            mock_get_db.return_value = mock_db
+        mock_action = Mock()
+        mock_action.id = 1
+        mock_action.status = "APPROVED"
+        mock_action.action_type = "MARK_READ"
+        mock_action.email_id = 1
 
-            # Mock IMAP failure
-            mock_imap_instance = MagicMock()
-            mock_imap_instance.client = None  # Connection failed
-            mock_imap.return_value.__enter__.return_value = mock_imap_instance
+        mock_db = _make_mock_db(
+            token=mock_token, actions=[mock_action], action=mock_action
+        )
+        app.dependency_overrides[_get_db] = lambda: mock_db
 
-            # Mock token
-            mock_token = Mock()
-            mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
-            mock_token.action_ids = [1]
-            mock_token.is_used = False
+        with patch("src.main.IMAPService") as mock_imap:
+            mock_imap.return_value.__enter__.side_effect = RuntimeError("Connection failed")
 
-            # Mock action
-            mock_action = Mock()
-            mock_action.id = 1
-            mock_action.status = "APPROVED"
-
-            # Setup query responses
-            def query_side_effect(*args, **kwargs):
-                mock_query = MagicMock()
-                if args[0] == ApplyToken:
-                    mock_query.filter.return_value.first.return_value = mock_token
-                elif args[0] == PendingAction:
-                    mock_query.filter.return_value.all.return_value = [mock_action]
-                return mock_query
-
-            mock_db.query.side_effect = query_side_effect
-
-            # Call apply
             response = client.post(
                 "/api/pending-actions/apply",
                 json={"apply_token": "test_token", "dry_run": False},
                 headers=auth_headers,
             )
 
-            # Should return 503
-            assert response.status_code == 503
-
-            # Token should NOT be marked as used
-            assert mock_token.is_used == False
+        assert response.status_code == 503
+        # Token should NOT be marked as used on IMAP failure
+        assert mock_token.is_used == False
 
     def test_token_consumed_on_successful_apply(self, client, auth_headers):
         """Test that token IS consumed when actions successfully apply"""
-        with patch("src.main.get_db") as mock_get_db, patch(
-            "src.main.IMAPService"
-        ) as mock_imap:
+        mock_token = Mock()
+        mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
+        mock_token.action_ids = [1]
+        mock_token.is_used = False
 
-            mock_db = MagicMock()
-            mock_get_db.return_value = mock_db
+        mock_action = Mock()
+        mock_action.id = 1
+        mock_action.status = "APPROVED"
+        mock_action.action_type = "MARK_READ"
+        mock_action.email_id = 1
+        mock_action.target_folder = None
 
-            # Mock successful IMAP
+        mock_email = Mock()
+        mock_email.id = 1
+        mock_email.uid = "12345"
+
+        mock_db = _make_mock_db(
+            token=mock_token, actions=[mock_action], action=mock_action, email=mock_email
+        )
+        app.dependency_overrides[_get_db] = lambda: mock_db
+
+        with patch("src.main.IMAPService") as mock_imap:
             mock_imap_instance = MagicMock()
             mock_imap_instance.client = True
             mock_imap_instance.mark_as_read = Mock(return_value=True)
             mock_imap.return_value.__enter__.return_value = mock_imap_instance
 
-            # Mock token
-            mock_token = Mock()
-            mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
-            mock_token.action_ids = [1]
-            mock_token.is_used = False
-
-            # Mock action
-            mock_action = Mock()
-            mock_action.id = 1
-            mock_action.status = "APPROVED"
-            mock_action.action_type = "MARK_READ"
-            mock_action.email_id = 1
-            mock_action.target_folder = None
-
-            # Mock email
-            mock_email = Mock()
-            mock_email.id = 1
-            mock_email.uid = "12345"
-
-            # Setup query responses
-            def query_side_effect(*args, **kwargs):
-                mock_query = MagicMock()
-                if args[0] == ApplyToken:
-                    mock_query.filter.return_value.first.return_value = mock_token
-                elif args[0] == PendingAction:
-                    mock_query.filter.return_value.all.return_value = [mock_action]
-                elif args[0] == ProcessedEmail:
-                    mock_query.filter.return_value.first.return_value = mock_email
-                return mock_query
-
-            mock_db.query.side_effect = query_side_effect
-
-            # Call apply
             response = client.post(
                 "/api/pending-actions/apply",
                 json={"apply_token": "test_token", "dry_run": False},
                 headers=auth_headers,
             )
 
-            # Should succeed
-            assert response.status_code == 200
-
-            # Token SHOULD be marked as used
-            assert mock_token.is_used == True
+        assert response.status_code == 200
+        # Token SHOULD be marked as used after successful apply
+        assert mock_token.is_used == True
 
 
 class TestTokenConsumptionSingleApply:
@@ -225,176 +193,113 @@ class TestTokenConsumptionSingleApply:
 
     def test_token_not_consumed_on_dry_run_single(self, client, auth_headers):
         """Test that token is NOT consumed when dry_run=true for single action"""
-        with patch("src.main.get_db") as mock_get_db:
+        mock_token = Mock()
+        mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
+        mock_token.action_ids = [1]
+        mock_token.is_used = False
 
-            mock_db = MagicMock()
-            mock_get_db.return_value = mock_db
+        mock_action = Mock()
+        mock_action.id = 1
+        mock_action.status = "APPROVED"
+        mock_action.action_type = "MARK_READ"
+        mock_action.email_id = 1
+        mock_action.target_folder = None
 
-            # Mock token
-            mock_token = Mock()
-            mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
-            mock_token.action_ids = [1]
-            mock_token.is_used = False
+        mock_email = Mock()
+        mock_email.id = 1
+        mock_email.uid = "12345"
+        mock_email.subject = "Test"
 
-            # Mock action
-            mock_action = Mock()
-            mock_action.id = 1
-            mock_action.status = "APPROVED"
-            mock_action.action_type = "MARK_READ"
-            mock_action.email_id = 1
-            mock_action.target_folder = None
+        mock_db = _make_mock_db(
+            token=mock_token, action=mock_action, email=mock_email
+        )
+        app.dependency_overrides[_get_db] = lambda: mock_db
 
-            # Mock email
-            mock_email = Mock()
-            mock_email.id = 1
-            mock_email.uid = "12345"
-            mock_email.subject = "Test"
+        response = client.post(
+            "/api/pending-actions/1/apply",
+            json={"apply_token": "test_token", "dry_run": True},
+            headers=auth_headers,
+        )
 
-            # Setup query responses
-            def query_side_effect(*args, **kwargs):
-                mock_query = MagicMock()
-                if args[0] == ApplyToken:
-                    mock_query.filter.return_value.first.return_value = mock_token
-                elif args[0] == PendingAction:
-                    mock_query.filter.return_value.first.return_value = mock_action
-                elif args[0] == ProcessedEmail:
-                    mock_query.filter.return_value.first.return_value = mock_email
-                return mock_query
-
-            mock_db.query.side_effect = query_side_effect
-
-            # Call with dry_run=true
-            response = client.post(
-                "/api/pending-actions/1/apply",
-                json={"apply_token": "test_token", "dry_run": True},
-                headers=auth_headers,
-            )
-
-            # Should succeed
-            assert response.status_code == 200
-            assert response.json()["dry_run"] == True
-
-            # Token should NOT be marked as used
-            assert mock_token.is_used == False
+        assert response.status_code == 200
+        assert response.json()["dry_run"] == True
+        # Token should NOT be marked as used
+        assert mock_token.is_used == False
 
     def test_token_not_consumed_on_imap_failure_single(self, client, auth_headers):
         """Test that token is NOT consumed when IMAP fails for single action"""
-        with patch("src.main.get_db") as mock_get_db, patch(
-            "src.main.IMAPService"
-        ) as mock_imap:
+        mock_token = Mock()
+        mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
+        mock_token.action_ids = [1]
+        mock_token.is_used = False
 
-            mock_db = MagicMock()
-            mock_get_db.return_value = mock_db
+        mock_action = Mock()
+        mock_action.id = 1
+        mock_action.status = "APPROVED"
+        mock_action.action_type = "MARK_READ"
+        mock_action.email_id = 1
 
-            # Mock IMAP failure
-            mock_imap_instance = MagicMock()
-            mock_imap_instance.client = None
-            mock_imap.return_value.__enter__.return_value = mock_imap_instance
+        mock_email = Mock()
+        mock_email.id = 1
+        mock_email.uid = "12345"
 
-            # Mock token
-            mock_token = Mock()
-            mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
-            mock_token.action_ids = [1]
-            mock_token.is_used = False
+        mock_db = _make_mock_db(
+            token=mock_token, action=mock_action, email=mock_email
+        )
+        app.dependency_overrides[_get_db] = lambda: mock_db
 
-            # Mock action
-            mock_action = Mock()
-            mock_action.id = 1
-            mock_action.status = "APPROVED"
-            mock_action.action_type = "MARK_READ"
-            mock_action.email_id = 1
+        with patch("src.main.IMAPService") as mock_imap:
+            mock_imap.return_value.__enter__.side_effect = RuntimeError("Connection failed")
 
-            # Mock email
-            mock_email = Mock()
-            mock_email.id = 1
-            mock_email.uid = "12345"
-
-            # Setup query responses
-            def query_side_effect(*args, **kwargs):
-                mock_query = MagicMock()
-                if args[0] == ApplyToken:
-                    mock_query.filter.return_value.first.return_value = mock_token
-                elif args[0] == PendingAction:
-                    mock_query.filter.return_value.first.return_value = mock_action
-                elif args[0] == ProcessedEmail:
-                    mock_query.filter.return_value.first.return_value = mock_email
-                return mock_query
-
-            mock_db.query.side_effect = query_side_effect
-
-            # Call apply
             response = client.post(
                 "/api/pending-actions/1/apply",
                 json={"apply_token": "test_token", "dry_run": False},
                 headers=auth_headers,
             )
 
-            # Should return 503
-            assert response.status_code == 503
-
-            # Token should NOT be marked as used
-            assert mock_token.is_used == False
+        assert response.status_code == 503
+        # Token should NOT be marked as used
+        assert mock_token.is_used == False
 
     def test_token_consumed_on_successful_single_apply(self, client, auth_headers):
         """Test that token IS consumed when single action successfully applies"""
-        with patch("src.main.get_db") as mock_get_db, patch(
-            "src.main.IMAPService"
-        ) as mock_imap:
+        mock_token = Mock()
+        mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
+        mock_token.action_ids = [1]
+        mock_token.is_used = False
 
-            mock_db = MagicMock()
-            mock_get_db.return_value = mock_db
+        mock_action = Mock()
+        mock_action.id = 1
+        mock_action.status = "APPROVED"
+        mock_action.action_type = "MARK_READ"
+        mock_action.email_id = 1
 
-            # Mock successful IMAP
+        mock_email = Mock()
+        mock_email.id = 1
+        mock_email.uid = "12345"
+        mock_email.message_id = "test@example.com"
+
+        mock_db = _make_mock_db(
+            token=mock_token, action=mock_action, email=mock_email
+        )
+        app.dependency_overrides[_get_db] = lambda: mock_db
+
+        with patch("src.main.IMAPService") as mock_imap:
             mock_imap_instance = MagicMock()
             mock_imap_instance.client = True
             mock_imap_instance.mark_as_read = Mock(return_value=True)
             mock_imap.return_value.__enter__.return_value = mock_imap_instance
 
-            # Mock token
-            mock_token = Mock()
-            mock_token.expires_at = datetime.utcnow() + timedelta(minutes=5)
-            mock_token.action_ids = [1]
-            mock_token.is_used = False
-
-            # Mock action
-            mock_action = Mock()
-            mock_action.id = 1
-            mock_action.status = "APPROVED"
-            mock_action.action_type = "MARK_READ"
-            mock_action.email_id = 1
-
-            # Mock email
-            mock_email = Mock()
-            mock_email.id = 1
-            mock_email.uid = "12345"
-            mock_email.message_id = "test@example.com"
-
-            # Setup query responses
-            def query_side_effect(*args, **kwargs):
-                mock_query = MagicMock()
-                if args[0] == ApplyToken:
-                    mock_query.filter.return_value.first.return_value = mock_token
-                elif args[0] == PendingAction:
-                    mock_query.filter.return_value.first.return_value = mock_action
-                elif args[0] == ProcessedEmail:
-                    mock_query.filter.return_value.first.return_value = mock_email
-                return mock_query
-
-            mock_db.query.side_effect = query_side_effect
-
-            # Call apply
             response = client.post(
                 "/api/pending-actions/1/apply",
                 json={"apply_token": "test_token", "dry_run": False},
                 headers=auth_headers,
             )
 
-            # Should succeed
-            assert response.status_code == 200
-            assert response.json()["success"] == True
-
-            # Token SHOULD be marked as used
-            assert mock_token.is_used == True
+        assert response.status_code == 200
+        assert response.json()["success"] == True
+        # Token SHOULD be marked as used
+        assert mock_token.is_used == True
 
 
 if __name__ == "__main__":

@@ -286,11 +286,12 @@ class TestInputValidation:
 
     def test_ai_output_validation(self):
         """Test that AI output is validated"""
+        import json
         from src.services.ai_service import AIService
 
         service = AIService()
 
-        # Test valid output
+        # Test valid output – must be valid JSON (not Python repr with single quotes)
         valid_output = {
             "summary": "Test summary",
             "category": "Klinik",
@@ -302,7 +303,7 @@ class TestInputValidation:
             "reasoning": "Test reasoning",
         }
 
-        validated = service._parse_ai_response(str(valid_output))
+        validated = service._parse_ai_response(json.dumps(valid_output))
         assert validated["category"] == "Klinik"
         assert validated["priority"] == "HIGH"
 

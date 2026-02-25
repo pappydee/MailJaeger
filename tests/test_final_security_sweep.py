@@ -16,8 +16,13 @@ from unittest.mock import Mock, patch, MagicMock
 from datetime import datetime, timedelta
 from fastapi.testclient import TestClient
 
-# Set API_KEY before importing app
+# Set required env vars before importing app
 os.environ["API_KEY"] = "test-secret-key-for-testing-12345"
+os.environ.setdefault("IMAP_HOST", "imap.test.com")
+os.environ.setdefault("IMAP_USERNAME", "test@test.com")
+os.environ.setdefault("IMAP_PASSWORD", "test_password")
+os.environ.setdefault("AI_ENDPOINT", "http://localhost:11434")
+os.environ.setdefault("SAFE_MODE", "false")
 
 from src.main import app
 from src.models.database import PendingAction, ProcessedEmail, ApplyToken
