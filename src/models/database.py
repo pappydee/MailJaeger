@@ -53,6 +53,11 @@ class ProcessedEmail(Base):
     suggested_folder = Column(String(200))
     reasoning = Column(Text)
 
+    # Classification override tracking
+    overridden = Column(Boolean, default=False, index=True)
+    override_rule_id = Column(Integer, nullable=True)  # FK to ClassificationOverride.id
+    original_classification = Column(JSON, nullable=True)  # snapshot before override
+
     # Processing metadata
     is_spam = Column(Boolean, default=False, index=True)
     is_processed = Column(Boolean, default=False, index=True)
@@ -276,3 +281,26 @@ class ApplyToken(Base):
         Index("idx_token_expires", "token", "expires_at"),
         Index("idx_used_expires", "is_used", "expires_at"),
     )
+
+
+class ClassificationOverride(Base):
+    """Application-level classification override rules (no LLM fine-tuning)."""
+
+    __tablename__ = "classification_overrides"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Match criteria — at least one must be set
+    sender_pattern = Column(String(200), nullable=True, index=True)  # domain or full addr
+    subject_pattern = Column(String(500), nullable=True)              # keyword substring
+
+    # Override values (any subset may be set)
+    category = Column(String(50), nullable=True)
+    priority = Column(String(20), nullable=True)
+    spam = Column(Boolean, nullable=True)
+    action_required = Column(Boolean, nullable=True)
+    suggested_folder = Column(String(200), nullable=True)
+
+    # Audit
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    created_from_email_id = Column(Integer, nullable=True)  # source email (informational)

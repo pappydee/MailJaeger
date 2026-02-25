@@ -189,7 +189,7 @@ class TestVersionEndpoint:
                 assert "version" in entry
                 assert "changes" in entry
 
-    def test_version_is_1_1_0(self):
+    def test_version_is_1_1_1(self):
         with patch.dict(os.environ, ENV):
             from src.config import reload_settings
             reload_settings()
@@ -197,7 +197,7 @@ class TestVersionEndpoint:
 
             client = TestClient(app, raise_server_exceptions=False)
             response = client.get("/api/version")
-            assert response.json()["version"] == "1.1.0"
+            assert response.json()["version"] == "1.1.1"
 
 
 class TestStatusEndpoint:

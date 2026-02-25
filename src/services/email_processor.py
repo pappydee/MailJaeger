@@ -14,6 +14,7 @@ from src.models.database import (
     ProcessingRun,
     AuditLog,
     PendingAction,
+    ClassificationOverride,
 )
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
@@ -198,14 +199,26 @@ class EmailProcessor:
             logger.info(f"Email already processed: {message_id}")
             return
 
-        # Step 2: AI Analysis with safe fallback
-        try:
-            analysis = self.ai_service.analyze_email(email_data)
-        except Exception as e:
-            sanitized_error = sanitize_error(e, debug=self.settings.debug)
-            logger.error(f"AI analysis failed for {message_id}: {sanitized_error}")
-            # Use fallback classification if AI fails
-            analysis = self.ai_service._fallback_classification(email_data)
+        # Step 2: Check for a matching classification override rule first.
+        # If a rule matches, skip the AI call entirely.
+        override_rule = self._find_matching_override(email_data)
+        applied_override = override_rule is not None
+
+        if applied_override:
+            logger.info(
+                f"Override rule {override_rule.id} matched for {message_id} "
+                f"(pattern: {override_rule.sender_pattern!r})"
+            )
+            analysis = self._build_analysis_from_override(override_rule, email_data)
+        else:
+            # Step 2b: AI Analysis with safe fallback
+            try:
+                analysis = self.ai_service.analyze_email(email_data)
+            except Exception as e:
+                sanitized_error = sanitize_error(e, debug=self.settings.debug)
+                logger.error(f"AI analysis failed for {message_id}: {sanitized_error}")
+                # Use fallback classification if AI fails
+                analysis = self.ai_service._fallback_classification(email_data)
 
         # Step 3: Spam Classification
         is_spam = self._classify_spam(email_data, analysis)
@@ -239,6 +252,8 @@ class EmailProcessor:
             is_processed=True,
             integrity_hash=email_data.get("integrity_hash"),
             processed_at=datetime.utcnow(),
+            overridden=applied_override,
+            override_rule_id=override_rule.id if override_rule else None,
         )
 
         # Add tasks
@@ -404,3 +419,73 @@ class EmailProcessor:
 
         # Check against threshold
         return spam_prob >= self.settings.spam_threshold
+
+    # ------------------------------------------------------------------
+    # Override rule helpers
+    # ------------------------------------------------------------------
+
+    def _find_matching_override(
+        self, email_data: Dict[str, Any]
+    ) -> Optional["ClassificationOverride"]:
+        """
+        Look up a ClassificationOverride rule that matches this email.
+
+        Matching priority:
+        1. sender_pattern (domain match: sender ends with the pattern)
+        2. subject_pattern (case-insensitive substring of subject)
+
+        Returns the first matching rule, or None.
+        """
+        sender = (email_data.get("sender") or "").lower()
+        subject = (email_data.get("subject") or "").lower()
+
+        rules = self.db.query(ClassificationOverride).all()
+        for rule in rules:
+            # Check sender domain match
+            if rule.sender_pattern:
+                pattern = rule.sender_pattern.lower()
+                if sender.endswith(pattern) or sender == pattern.lstrip("@"):
+                    # Optionally also check subject if subject_pattern is set
+                    if rule.subject_pattern:
+                        if rule.subject_pattern.lower() in subject:
+                            return rule
+                    else:
+                        return rule
+            # Check subject-only rule (no sender_pattern)
+            elif rule.subject_pattern:
+                if rule.subject_pattern.lower() in subject:
+                    return rule
+        return None
+
+    def _build_analysis_from_override(
+        self,
+        rule: "ClassificationOverride",
+        email_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Build an AI-style analysis dict from a ClassificationOverride rule,
+        falling back to defaults for unset fields.
+        """
+        fallback = self.ai_service._fallback_classification(email_data)
+        return {
+            "summary": fallback.get("summary", ""),
+            "category": rule.category if rule.category else fallback["category"],
+            "spam_probability": (
+                0.95
+                if rule.spam is True
+                else (0.05 if rule.spam is False else fallback["spam_probability"])
+            ),
+            "action_required": (
+                rule.action_required
+                if rule.action_required is not None
+                else fallback["action_required"]
+            ),
+            "priority": rule.priority if rule.priority else fallback["priority"],
+            "tasks": fallback.get("tasks", []),
+            "suggested_folder": (
+                rule.suggested_folder
+                if rule.suggested_folder
+                else fallback["suggested_folder"]
+            ),
+            "reasoning": "Applied override rule",
+        }

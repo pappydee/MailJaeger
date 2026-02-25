@@ -71,6 +71,31 @@ class EmailDetailResponse(EmailResponse):
     body_plain: Optional[str] = None
     body_html: Optional[str] = None
     actions_taken: Optional[dict] = None
+    # Override tracking
+    overridden: bool = False
+    override_rule_id: Optional[int] = None
+    original_classification: Optional[dict] = None
+
+
+class ClassificationOverrideRequest(BaseModel):
+    """Body for POST /api/emails/{id}/override"""
+
+    category: Optional[str] = None
+    priority: Optional[str] = None
+    spam: Optional[bool] = None
+    action_required: Optional[bool] = None
+    suggested_folder: Optional[str] = None
+
+
+class ClassificationOverrideResponse(BaseModel):
+    """Response from POST /api/emails/{id}/override"""
+
+    success: bool
+    email_id: int
+    overridden: bool
+    rule_id: Optional[int] = None
+    rule_created: bool = False
+    classification: dict
 
 
 class ProcessingRunResponse(BaseModel):

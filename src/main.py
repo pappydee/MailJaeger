@@ -35,8 +35,10 @@ from src.models.schemas import (
     PreviewActionsRequest,
     PreviewActionsResponse,
     ApplyActionsResponse,
+    ClassificationOverrideRequest,
+    ClassificationOverrideResponse,
 )
-from src.models.database import ProcessedEmail, ProcessingRun, PendingAction, ApplyToken
+from src.models.database import ProcessedEmail, ProcessingRun, PendingAction, ApplyToken, ClassificationOverride
 from src.services.scheduler import get_scheduler, get_run_status
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
@@ -714,12 +716,112 @@ async def mark_email_resolved(
     return {"success": True, "email_id": email_id, "resolved": request.resolved}
 
 
+@app.post(
+    "/api/emails/{email_id}/override",
+    response_model=ClassificationOverrideResponse,
+    dependencies=[Depends(require_authentication)],
+)
+async def override_email_classification(
+    email_id: int,
+    override: ClassificationOverrideRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Override the AI classification of an email.
+
+    If LEARNING_ENABLED=true, a ClassificationOverride rule is created from the
+    sender domain so future emails from that domain are classified automatically.
+    """
+    email = db.query(ProcessedEmail).filter(ProcessedEmail.id == email_id).first()
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    # Snapshot current classification before overriding
+    if not email.overridden:
+        email.original_classification = {
+            "category": email.category,
+            "priority": email.priority,
+            "is_spam": email.is_spam,
+            "action_required": email.action_required,
+            "suggested_folder": email.suggested_folder,
+            "reasoning": email.reasoning,
+            "spam_probability": email.spam_probability,
+        }
+
+    # Apply the requested overrides
+    if override.category is not None:
+        email.category = override.category
+    if override.priority is not None:
+        email.priority = override.priority
+    if override.spam is not None:
+        email.is_spam = override.spam
+        email.spam_probability = 0.95 if override.spam else 0.05
+    if override.action_required is not None:
+        email.action_required = override.action_required
+    if override.suggested_folder is not None:
+        email.suggested_folder = override.suggested_folder
+
+    email.overridden = True
+    email.reasoning = "Manually overridden by user"
+
+    rule_id: Optional[int] = None
+    rule_created = False
+
+    # Persist a learning rule when learning is enabled
+    if settings.learning_enabled:
+        sender = email.sender or ""
+        # Derive domain pattern (use full address for exact senders)
+        if "@" in sender:
+            domain = sender.split("@", 1)[1].strip(">").lower()
+            sender_pattern = f"@{domain}"
+        else:
+            sender_pattern = sender.lower() if sender else None
+
+        if sender_pattern:
+            rule = ClassificationOverride(
+                sender_pattern=sender_pattern,
+                category=override.category,
+                priority=override.priority,
+                spam=override.spam,
+                action_required=override.action_required,
+                suggested_folder=override.suggested_folder,
+                created_from_email_id=email_id,
+            )
+            db.add(rule)
+            db.flush()  # get the id
+            email.override_rule_id = rule.id
+            rule_id = rule.id
+            rule_created = True
+
+    db.commit()
+
+    return ClassificationOverrideResponse(
+        success=True,
+        email_id=email_id,
+        overridden=True,
+        rule_id=rule_id,
+        rule_created=rule_created,
+        classification={
+            "category": email.category,
+            "priority": email.priority,
+            "is_spam": email.is_spam,
+            "action_required": email.action_required,
+            "suggested_folder": email.suggested_folder,
+            "spam_probability": email.spam_probability,
+        },
+    )
+
+
 @app.post("/api/processing/trigger", dependencies=[Depends(require_authentication)])
 @limiter.limit("5/minute")  # Strict rate limit on manual processing trigger
-async def trigger_processing(request: Request):
+async def trigger_processing(
+    request: Request,
+    trigger_request: Optional[TriggerRunRequest] = Body(default=None),
+):
     """
     Manually trigger email processing.
 
+    Body is optional. When omitted trigger_type defaults to "MANUAL".
     Returns immediately with run_id.  Processing runs in a background thread.
     If a run is already active returns success=false with the active run_id.
     """

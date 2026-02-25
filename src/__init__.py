@@ -1,10 +1,23 @@
 """MailJaeger - Local AI email processing system"""
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __author__ = "MailJaeger Team"
 __description__ = "Fully local, privacy-first AI email processing system"
 
 CHANGELOG = [
+    {
+        "version": "1.1.1",
+        "date": "2026-02-25",
+        "changes": [
+            "Fix /api/processing/trigger: accept optional JSON body (no 422 when body omitted)",
+            "Add ClassificationOverride table for application-level learning",
+            "Add overridden/original_classification/override_rule_id fields to ProcessedEmail",
+            "New endpoint POST /api/emails/{id}/override: update classification + store rule",
+            "EmailProcessor applies override rules before AI (skip AI when rule matches)",
+            "LEARNING_ENABLED config flag controls whether override rules are persisted",
+            "EmailDetailResponse extended with overridden, original_classification, override_rule_id",
+        ],
+    },
     {
         "version": "1.1.0",
         "date": "2026-02-24",

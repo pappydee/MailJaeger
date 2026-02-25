@@ -212,12 +212,12 @@ class TestTriggerEndpoint:
 class TestVersion110:
     def test_version_is_110(self):
         from src import __version__
-        assert __version__ == "1.1.0"
+        assert __version__ == "1.1.1"
 
     def test_changelog_has_110_entry(self):
         from src import CHANGELOG
         versions = [e["version"] for e in CHANGELOG]
-        assert "1.1.0" in versions
+        assert "1.1.1" in versions
 
     def test_changelog_oldest_is_100(self):
         from src import CHANGELOG
