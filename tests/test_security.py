@@ -8,13 +8,6 @@ from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 import os
 
-# Set test environment variables before importing app
-os.environ["API_KEY"] = "test_api_key_for_testing_123456"
-os.environ["IMAP_HOST"] = "imap.test.com"
-os.environ["IMAP_USERNAME"] = "test@test.com"
-os.environ["IMAP_PASSWORD"] = "test_password"
-os.environ["AI_ENDPOINT"] = "http://localhost:11434"
-
 from src.main import app
 from src.config import get_settings, reload_settings
 
@@ -22,15 +15,13 @@ from src.config import get_settings, reload_settings
 @pytest.fixture
 def client():
     """Create test client"""
-    # Reload settings with test environment
-    reload_settings()
     return TestClient(app)
 
 
 @pytest.fixture
 def auth_headers():
     """Valid authentication headers"""
-    return {"Authorization": "Bearer test_api_key_for_testing_123456"}
+    return {"Authorization": "Bearer test_key_abc123"}
 
 
 class TestAuthentication:
@@ -257,20 +248,11 @@ class TestRateLimiting:
         # Note: This is a basic test - actual rate limiting behavior
         # depends on slowapi configuration
 
-        with patch("src.main.get_db") as mock_db, patch(
-            "src.main.get_scheduler"
-        ) as mock_scheduler:
-            mock_session = MagicMock()
-            mock_db.return_value = mock_session
-            mock_session.query.return_value.filter.return_value.first.return_value = (
-                None
-            )
+        with patch("src.main.get_scheduler") as mock_scheduler:
+            # trigger_manual_run_async returns (started: bool, run_id: Optional[int])
+            mock_scheduler.return_value.trigger_manual_run_async.return_value = (True, 1)
 
-            mock_scheduler.return_value.trigger_manual_run.return_value = True
-
-            # Make multiple rapid requests
-            # The first few should succeed, then rate limit may kick in
-            # We're just checking the endpoint is protected
+            # Make a request; it should succeed or rate limit, not fail for other reasons
             response = client.post(
                 "/api/processing/trigger",
                 json={"trigger_type": "MANUAL"},

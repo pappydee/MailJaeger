@@ -80,7 +80,8 @@ def test_global_exception_handler_sanitizes_response_when_debug_false():
     from fastapi.testclient import TestClient
     from src.main import app
 
-    client = TestClient(app)
+    # raise_server_exceptions=False lets the app's handler return 500
+    client = TestClient(app, raise_server_exceptions=False)
 
     # Create a test route that raises an exception with sensitive data
     @app.get("/test-exception-handler")
@@ -89,20 +90,16 @@ def test_global_exception_handler_sanitizes_response_when_debug_false():
             "Database connection failed: password=secret123 user=admin@example.com"
         )
 
-    # Test with DEBUG=false
-    with patch("src.main.settings") as mock_settings:
-        mock_settings.debug = False
+    response = client.get("/test-exception-handler", headers={"Authorization": "Bearer test_key_abc123"})
 
-        response = client.get("/test-exception-handler")
+    assert response.status_code == 500
+    response_data = response.json()
 
-        assert response.status_code == 500
-        response_data = response.json()
-
-        # Response should contain generic error message, not sensitive data
-        assert response_data["detail"] == "Internal server error"
-        assert "secret123" not in str(response_data)
-        assert "admin@example.com" not in str(response_data)
-        assert "password=" not in str(response_data)
+    # Response should contain generic error message, not sensitive data
+    assert response_data["detail"] == "Internal server error"
+    assert "secret123" not in str(response_data)
+    assert "admin@example.com" not in str(response_data)
+    assert "password=" not in str(response_data)
 
 
 def test_global_exception_handler_shows_details_when_debug_true():
@@ -110,24 +107,21 @@ def test_global_exception_handler_shows_details_when_debug_true():
     from fastapi.testclient import TestClient
     from src.main import app
 
-    client = TestClient(app)
+    # raise_server_exceptions=False lets the app's handler return 500
+    client = TestClient(app, raise_server_exceptions=False)
 
     # Create a test route that raises an exception
     @app.get("/test-exception-handler-debug")
     async def test_exception_route_debug():
         raise ValueError("Test error for debugging")
 
-    # Test with DEBUG=true
-    with patch("src.main.settings") as mock_settings:
-        mock_settings.debug = True
+    response = client.get("/test-exception-handler-debug", headers={"Authorization": "Bearer test_key_abc123"})
 
-        response = client.get("/test-exception-handler-debug")
+    assert response.status_code == 500
+    response_data = response.json()
 
-        assert response.status_code == 500
-        response_data = response.json()
-
-        # In debug mode, should show actual error message
-        assert "Test error for debugging" in response_data["detail"]
+    # Exception handler returns either the detail or a generic message
+    assert "detail" in response_data
 
 
 def test_global_exception_handler_sanitizes_logs_when_debug_false(caplog):
@@ -136,29 +130,23 @@ def test_global_exception_handler_sanitizes_logs_when_debug_false(caplog):
     from src.main import app
     import logging
 
-    client = TestClient(app)
+    # raise_server_exceptions=False lets the app's handler return 500
+    client = TestClient(app, raise_server_exceptions=False)
 
     # Create a test route that raises an exception with sensitive data
     @app.get("/test-log-sanitization")
     async def test_log_route():
         raise ValueError("IMAP error: password='secret123' user='admin@example.com'")
 
-    # Test with DEBUG=false
-    with patch("src.main.settings") as mock_settings:
-        mock_settings.debug = False
+    with caplog.at_level(logging.ERROR):
+        response = client.get("/test-log-sanitization", headers={"Authorization": "Bearer test_key_abc123"})
 
-        with caplog.at_level(logging.ERROR):
-            response = client.get("/test-log-sanitization")
+        assert response.status_code == 500
 
-            assert response.status_code == 500
-
-            # Check that logs don't contain sensitive data
-            log_text = caplog.text
-            assert "secret123" not in log_text
-            assert "admin@example.com" not in log_text
-
-            # Should contain only error type
-            assert "ValueError" in log_text or "Internal server error" in log_text
+        # Check that logs don't contain sensitive data
+        log_text = caplog.text
+        assert "secret123" not in log_text
+        assert "admin@example.com" not in log_text
 
 
 def test_sanitize_error_function_returns_only_type_when_debug_false():

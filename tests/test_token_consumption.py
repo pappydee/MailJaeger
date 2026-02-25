@@ -15,15 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
 import os
 
-# Set test environment variables
-os.environ["API_KEY"] = "test_api_key_for_testing_123456"
-os.environ["IMAP_HOST"] = "imap.test.com"
-os.environ["IMAP_USERNAME"] = "test@test.com"
-os.environ["IMAP_PASSWORD"] = "test_password"
-os.environ["AI_ENDPOINT"] = "http://localhost:11434"
-os.environ["SAFE_MODE"] = "false"
-os.environ["ALLOW_DESTRUCTIVE_IMAP"] = "false"
-
+# Environment is managed by conftest.py - no module-level overrides needed.
 from src.main import app
 from src.config import get_settings, reload_settings
 from src.database.connection import get_db as _get_db  # key for dependency_overrides
@@ -32,17 +24,14 @@ from src.models.database import Base, ProcessedEmail, PendingAction, ApplyToken
 
 @pytest.fixture
 def client():
-    """Create test client with fresh settings."""
-    reload_settings()
-    import src.main
-    src.main.settings = get_settings()
+    """Create test client."""
     return TestClient(app)
 
 
 @pytest.fixture
 def auth_headers():
     """Valid authentication headers"""
-    return {"Authorization": "Bearer test_api_key_for_testing_123456"}
+    return {"Authorization": "Bearer test_key_abc123"}
 
 
 @pytest.fixture

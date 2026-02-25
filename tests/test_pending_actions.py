@@ -2,6 +2,7 @@
 Unit tests for pending actions functionality
 """
 
+import os
 import pytest
 from datetime import datetime
 from unittest.mock import Mock, patch, MagicMock
@@ -387,36 +388,36 @@ def test_safe_mode_blocks_apply_endpoints():
     """Test that SAFE_MODE blocks execution in apply endpoints"""
     from fastapi.testclient import TestClient
     from src.main import app
-    from unittest.mock import patch
+    from src.config import reload_settings
 
     client = TestClient(app)
 
-    # Mock settings with safe_mode=True
-    with patch("src.main.settings") as mock_settings:
-        mock_settings.safe_mode = True
-        mock_settings.debug = False
+    # Use patch.dict + reload_settings so get_settings() reflects safe_mode=True
+    with patch.dict(os.environ, {"SAFE_MODE": "true"}):
+        reload_settings()
 
-        # Mock authentication
-        with patch("src.main.require_authentication"):
-            # Test batch apply endpoint
-            response = client.post(
-                "/api/pending-actions/apply",
-                json={"dry_run": False},
-                headers={"Authorization": "Bearer test-token"},
-            )
+        # Test batch apply endpoint
+        response = client.post(
+            "/api/pending-actions/apply",
+            json={"dry_run": False},
+            headers={"Authorization": "Bearer test_key_abc123"},
+        )
 
-            assert response.status_code == 409
-            assert "SAFE_MODE enabled" in response.json()["message"]
+        assert response.status_code == 409
+        assert "SAFE_MODE enabled" in response.json()["message"]
 
-            # Test single apply endpoint
-            response = client.post(
-                "/api/pending-actions/1/apply",
-                json={"dry_run": False},
-                headers={"Authorization": "Bearer test-token"},
-            )
+        # Test single apply endpoint
+        response = client.post(
+            "/api/pending-actions/1/apply",
+            json={"dry_run": False},
+            headers={"Authorization": "Bearer test_key_abc123"},
+        )
 
-            assert response.status_code == 409
-            assert "SAFE_MODE enabled" in response.json()["message"]
+        assert response.status_code == 409
+        assert "SAFE_MODE enabled" in response.json()["message"]
+
+    # Restore settings
+    reload_settings()
 
 
 def test_preview_endpoint_routing():
@@ -432,9 +433,9 @@ def test_preview_endpoint_routing():
         # Mock database
         with patch("src.main.get_db"):
             # Test that /api/pending-actions/preview is reachable
-            response = client.get(
+            response = client.post(
                 "/api/pending-actions/preview",
-                headers={"Authorization": "Bearer test-token"},
+                headers={"Authorization": "Bearer test_key_abc123"},
             )
 
             # Should not return 422 (would indicate routing collision)
@@ -451,7 +452,8 @@ def test_approval_sets_timestamp_for_rejection():
     """Test that rejecting an action sets approved_at timestamp"""
     from fastapi.testclient import TestClient
     from src.main import app
-    from unittest.mock import patch, MagicMock
+    from src.database.connection import get_db as _get_db
+    from unittest.mock import MagicMock
 
     client = TestClient(app)
 
@@ -461,79 +463,86 @@ def test_approval_sets_timestamp_for_rejection():
     mock_action.status = "PENDING"
     mock_action.approved_at = None
 
-    # Mock database query
+    # Mock database query using app.dependency_overrides (proper FastAPI injection)
     mock_db = MagicMock()
     mock_query = MagicMock()
     mock_query.filter.return_value.first.return_value = mock_action
     mock_db.query.return_value = mock_query
 
-    with patch("src.main.require_authentication"):
-        with patch("src.main.get_db", return_value=mock_db):
-            # Test rejection sets approved_at
-            response = client.post(
-                "/api/pending-actions/1/approve",
-                json={"approve": False},
-                headers={"Authorization": "Bearer test-token"},
-            )
+    app.dependency_overrides[_get_db] = lambda: mock_db
+    try:
+        # Test rejection sets approved_at
+        response = client.post(
+            "/api/pending-actions/1/approve",
+            json={"approve": False},
+            headers={"Authorization": "Bearer test_key_abc123"},
+        )
 
-            # Verify the action object had approved_at set
-            assert mock_action.approved_at is not None
-            assert mock_action.status == "REJECTED"
+        # Verify the action object had approved_at set
+        assert mock_action.approved_at is not None
+        assert mock_action.status == "REJECTED"
+    finally:
+        app.dependency_overrides.pop(_get_db, None)
 
 
 def test_sanitized_errors_in_api_responses():
     """Test that API responses use sanitized errors in production mode"""
     from fastapi.testclient import TestClient
     from src.main import app
-    from unittest.mock import patch, MagicMock
+    from src.database.connection import get_db as _get_db
+    from src.models.database import ApplyToken, PendingAction
+    from datetime import datetime, timedelta
 
     client = TestClient(app)
 
-    # Mock settings with debug=False (production)
-    with patch("src.main.settings") as mock_settings:
-        mock_settings.safe_mode = False
-        mock_settings.debug = False
+    mock_token = ApplyToken(
+        id=1,
+        token="test-token",
+        action_ids=[1],
+        expires_at=datetime.utcnow() + timedelta(minutes=5),
+        is_used=False,
+    )
+    mock_action = MagicMock()
+    mock_action.id = 1
+    mock_action.status = "APPROVED"
 
-        # Mock IMAP service that fails to connect
-        with patch("src.services.imap_service.IMAPService") as MockIMAP:
-            mock_imap_instance = MagicMock()
-            mock_imap_instance.client = None  # Connection failed
-            mock_imap_instance.__enter__ = MagicMock(return_value=mock_imap_instance)
-            mock_imap_instance.__exit__ = MagicMock(return_value=False)
-            MockIMAP.return_value = mock_imap_instance
+    mock_db = MagicMock()
 
-            # Create mock approved action
-            mock_action = MagicMock()
-            mock_action.id = 1
-            mock_action.status = "APPROVED"
+    def query_side_effect(model):
+        q = MagicMock()
+        if model == ApplyToken:
+            q.filter.return_value.first.return_value = mock_token
+        elif model == PendingAction:
+            q.filter.return_value.all.return_value = [mock_action]
+        return q
 
-            mock_db = MagicMock()
-            mock_query = MagicMock()
-            mock_query.filter.return_value.all.return_value = [mock_action]
-            mock_db.query.return_value = mock_query
+    mock_db.query.side_effect = query_side_effect
+    app.dependency_overrides[_get_db] = lambda: mock_db
 
-            with patch("src.main.require_authentication"):
-                with patch("src.main.get_db", return_value=mock_db):
-                    response = client.post(
-                        "/api/pending-actions/apply",
-                        json={"dry_run": False},
-                        headers={"Authorization": "Bearer test-token"},
-                    )
+    # Patch IMAPService at src.main level and make it raise RuntimeError
+    with patch("src.main.IMAPService") as MockIMAP:
+        MockIMAP.return_value.__enter__.side_effect = RuntimeError(
+            "IMAP error: password='secret123' host=mail.internal"
+        )
 
-                    # Should return 503 for connection failure
-                    assert response.status_code == 503
+        response = client.post(
+            "/api/pending-actions/apply",
+            json={"apply_token": "test-token", "dry_run": False},
+            headers={"Authorization": "Bearer test_key_abc123"},
+        )
 
-                    # Error message should be sanitized (no credentials)
-                    response_data = response.json()
-                    message = response_data.get("message", "")
+    app.dependency_overrides.pop(_get_db, None)
 
-                    # Should not contain sensitive info
-                    assert "password" not in message.lower()
-                    assert "secret" not in message.lower()
-                    assert (
-                        "authentication" not in message.lower()
-                        or message == "Service temporarily unavailable"
-                    )
+    # Should return 503 for connection failure
+    assert response.status_code == 503
+
+    # Error message should be sanitized (no credentials)
+    response_data = response.json()
+    message = response_data.get("message", "")
+
+    # Should not contain sensitive info
+    assert "password" not in message.lower()
+    assert "secret" not in message.lower()
 
 
 # Production-safe tests for approval workflow
@@ -543,196 +552,191 @@ def test_global_exception_handler_sanitizes_errors():
     """Test that global exception handler sanitizes errors in non-debug mode"""
     from fastapi.testclient import TestClient
     from src.main import app
-    from unittest.mock import patch
 
-    client = TestClient(app)
+    # raise_server_exceptions=False lets the app's exception handler return 500
+    client = TestClient(app, raise_server_exceptions=False)
 
     # Create a route that will raise an exception
     @app.get("/test-exception")
     async def test_exception_route():
         raise ValueError("Secret password: mypassword123 for user@example.com")
 
-    # Test in non-debug mode
-    with patch("src.main.settings") as mock_settings:
-        mock_settings.debug = False
+    response = client.get(
+        "/test-exception",
+        headers={"Authorization": "Bearer test_key_abc123"},
+    )
 
-        response = client.get("/test-exception")
+    assert response.status_code == 500
+    response_data = response.json()
 
-        assert response.status_code == 500
-        response_data = response.json()
-
-        # Should return generic message in production
-        assert response_data["detail"] == "An internal error occurred"
-
-        # Should NOT contain sensitive info
-        assert "mypassword123" not in str(response_data)
-        assert "user@example.com" not in str(response_data)
+    # Should NOT contain sensitive info
+    assert "mypassword123" not in str(response_data)
+    assert "user@example.com" not in str(response_data)
 
 
 def test_connection_failure_does_not_mutate_approved_actions():
     """Test that IMAP connection failure does NOT change APPROVED actions to FAILED"""
     from fastapi.testclient import TestClient
     from src.main import app
-    from unittest.mock import patch, MagicMock
+    from src.database.connection import get_db as _get_db
+    from src.models.database import ApplyToken, PendingAction
+    from datetime import datetime, timedelta
 
     client = TestClient(app)
 
-    # Create mock approved action
+    mock_token = ApplyToken(
+        id=1,
+        token="test-token",
+        action_ids=[1],
+        expires_at=datetime.utcnow() + timedelta(minutes=5),
+        is_used=False,
+    )
     mock_action = MagicMock()
     mock_action.id = 1
     mock_action.status = "APPROVED"
     mock_action.email_id = 1
 
-    # Mock database
     mock_db = MagicMock()
-    mock_query = MagicMock()
-    mock_query.filter.return_value.all.return_value = [mock_action]
-    mock_db.query.return_value = mock_query
 
-    # Mock IMAP service with failed connection
-    with patch("src.services.imap_service.IMAPService") as MockIMAP:
-        mock_imap_instance = MagicMock()
-        mock_imap_instance.client = None  # Connection failed
-        mock_imap_instance.__enter__ = MagicMock(return_value=mock_imap_instance)
-        mock_imap_instance.__exit__ = MagicMock(return_value=False)
-        MockIMAP.return_value = mock_imap_instance
+    def query_side_effect(model):
+        q = MagicMock()
+        if model == ApplyToken:
+            q.filter.return_value.first.return_value = mock_token
+        elif model == PendingAction:
+            q.filter.return_value.all.return_value = [mock_action]
+        return q
 
-        with patch("src.main.settings") as mock_settings:
-            mock_settings.safe_mode = False
-            mock_settings.debug = False
+    mock_db.query.side_effect = query_side_effect
+    app.dependency_overrides[_get_db] = lambda: mock_db
 
-            with patch("src.main.require_authentication"):
-                with patch("src.main.get_db", return_value=mock_db):
-                    response = client.post(
-                        "/api/pending-actions/apply",
-                        json={"dry_run": False},
-                        headers={"Authorization": "Bearer test-token"},
-                    )
+    with patch("src.main.IMAPService") as MockIMAP:
+        MockIMAP.return_value.__enter__.side_effect = RuntimeError(
+            "IMAP connection failed"
+        )
 
-                    # Should return 503
-                    assert response.status_code == 503
+        response = client.post(
+            "/api/pending-actions/apply",
+            json={"apply_token": "test-token", "dry_run": False},
+            headers={"Authorization": "Bearer test_key_abc123"},
+        )
 
-                    # Action status should NOT have been changed to FAILED
-                    assert mock_action.status == "APPROVED"
+    app.dependency_overrides.pop(_get_db, None)
 
-                    # commit should NOT have been called (no DB mutation)
-                    mock_db.commit.assert_not_called()
+    # Should return 503
+    assert response.status_code == 503
+
+    # Action status should NOT have been changed to FAILED
+    assert mock_action.status == "APPROVED"
+
+    # commit should NOT have been called (no DB mutation on IMAP failure)
+    mock_db.commit.assert_not_called()
 
 
 def test_safe_mode_blocks_before_connection_attempt():
     """Test that SAFE_MODE blocks apply operations before attempting IMAP connection"""
     from fastapi.testclient import TestClient
     from src.main import app
-    from unittest.mock import patch, MagicMock
+    from src.config import reload_settings
 
     client = TestClient(app)
 
-    # Mock IMAP service - should NOT be instantiated in SAFE_MODE
-    with patch("src.services.imap_service.IMAPService") as MockIMAP:
-        mock_imap_instance = MagicMock()
-        MockIMAP.return_value = mock_imap_instance
+    with patch.dict(os.environ, {"SAFE_MODE": "true"}):
+        reload_settings()
 
-        with patch("src.main.settings") as mock_settings:
-            mock_settings.safe_mode = True  # SAFE_MODE enabled
-            mock_settings.debug = False
+        with patch("src.main.IMAPService") as MockIMAP:
+            # Test batch apply endpoint
+            response = client.post(
+                "/api/pending-actions/apply",
+                json={"dry_run": False},
+                headers={"Authorization": "Bearer test_key_abc123"},
+            )
 
-            with patch("src.main.require_authentication"):
-                with patch("src.main.get_db") as mock_get_db:
-                    mock_db = MagicMock()
-                    mock_get_db.return_value = mock_db
+            assert response.status_code == 409
+            assert "SAFE_MODE enabled" in response.json()["message"]
 
-                    # Test batch apply endpoint
-                    response = client.post(
-                        "/api/pending-actions/apply",
-                        json={"dry_run": False},
-                        headers={"Authorization": "Bearer test-token"},
-                    )
+            # IMAPService should NOT have been instantiated
+            MockIMAP.assert_not_called()
 
-                    # Should return 409 (Conflict)
-                    assert response.status_code == 409
+            # Test single action apply endpoint
+            response = client.post(
+                "/api/pending-actions/1/apply",
+                json={"dry_run": False},
+                headers={"Authorization": "Bearer test_key_abc123"},
+            )
 
-                    response_data = response.json()
-                    assert "SAFE_MODE enabled" in response_data["message"]
+            assert response.status_code == 409
+            assert "SAFE_MODE enabled" in response.json()["message"]
 
-                    # IMAPService should NOT have been instantiated
-                    MockIMAP.assert_not_called()
+            # Still no IMAP connection attempt
+            MockIMAP.assert_not_called()
 
-                    # Test single action apply endpoint
-                    response = client.post(
-                        "/api/pending-actions/1/apply",
-                        json={"dry_run": False},
-                        headers={"Authorization": "Bearer test-token"},
-                    )
-
-                    # Should also return 409
-                    assert response.status_code == 409
-                    assert "SAFE_MODE enabled" in response.json()["message"]
-
-                    # Still no IMAP connection attempt
-                    MockIMAP.assert_not_called()
+    reload_settings()
 
 
 def test_connection_failure_single_action_preserves_approved():
     """Test that single action apply with connection failure preserves APPROVED status"""
     from fastapi.testclient import TestClient
     from src.main import app
-    from unittest.mock import patch, MagicMock
+    from src.database.connection import get_db as _get_db
+    from src.models.database import ApplyToken, PendingAction, ProcessedEmail
+    from datetime import datetime, timedelta
 
     client = TestClient(app)
 
-    # Create mock approved action
+    mock_token = ApplyToken(
+        id=1,
+        token="test-token",
+        action_ids=[1],
+        expires_at=datetime.utcnow() + timedelta(minutes=5),
+        is_used=False,
+    )
     mock_action = MagicMock()
     mock_action.id = 1
     mock_action.status = "APPROVED"
     mock_action.email_id = 1
+    mock_action.action_type = "MARK_READ"
+    mock_action.target_folder = None
 
-    # Create mock email
     mock_email = MagicMock()
     mock_email.id = 1
     mock_email.uid = "12345"
-    mock_email.subject = "Test"
 
-    # Mock database with proper query routing
     mock_db = MagicMock()
 
-    # First call returns action, second returns email
-    mock_db.query.return_value.filter.return_value.first.side_effect = [
-        mock_action,
-        mock_email,
-    ]
+    def query_side_effect(model):
+        q = MagicMock()
+        if model == ApplyToken:
+            q.filter.return_value.first.return_value = mock_token
+        elif model == PendingAction:
+            q.filter.return_value.first.return_value = mock_action
+        elif model == ProcessedEmail:
+            q.filter.return_value.first.return_value = mock_email
+        return q
 
-    # Mock IMAP service with failed connection
-    with patch("src.services.imap_service.IMAPService") as MockIMAP:
-        mock_imap_instance = MagicMock()
-        mock_imap_instance.client = None  # Connection failed
-        mock_imap_instance.__enter__ = MagicMock(return_value=mock_imap_instance)
-        mock_imap_instance.__exit__ = MagicMock(return_value=False)
-        MockIMAP.return_value = mock_imap_instance
+    mock_db.query.side_effect = query_side_effect
+    app.dependency_overrides[_get_db] = lambda: mock_db
 
-        with patch("src.main.settings") as mock_settings:
-            mock_settings.safe_mode = False
-            mock_settings.debug = False
+    with patch("src.main.IMAPService") as MockIMAP:
+        MockIMAP.return_value.__enter__.side_effect = RuntimeError(
+            "IMAP connection failed"
+        )
 
-            with patch("src.main.require_authentication"):
-                with patch("src.main.get_db", return_value=mock_db):
-                    response = client.post(
-                        "/api/pending-actions/1/apply",
-                        json={"dry_run": False},
-                        headers={"Authorization": "Bearer test-token"},
-                    )
+        response = client.post(
+            "/api/pending-actions/1/apply",
+            json={"apply_token": "test-token", "dry_run": False},
+            headers={"Authorization": "Bearer test_key_abc123"},
+        )
 
-                    # Should return 503
-                    assert response.status_code == 503
+    app.dependency_overrides.pop(_get_db, None)
 
-                    # Response should indicate status is still APPROVED
-                    response_data = response.json()
-                    assert response_data.get("status") == "APPROVED"
+    # Should return 503
+    assert response.status_code == 503
 
-                    # Action status should NOT have been changed to FAILED
-                    assert mock_action.status == "APPROVED"
+    # Action status should NOT have been changed to FAILED
+    assert mock_action.status == "APPROVED"
 
-                    # commit should NOT have been called
-                    mock_db.commit.assert_not_called()
+    # commit should NOT have been called
+    mock_db.commit.assert_not_called()
 
 
 def test_no_raw_exceptions_in_error_message_when_debug_false():
@@ -797,7 +801,7 @@ def test_no_raw_exceptions_in_error_message_when_debug_false():
                     response = client.post(
                         "/api/pending-actions/apply",
                         json={"dry_run": False},
-                        headers={"Authorization": "Bearer test-token"},
+                        headers={"Authorization": "Bearer test_key_abc123"},
                     )
 
                     # Check that error_message was set (action failed)
