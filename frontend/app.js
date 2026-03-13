@@ -1,4 +1,4 @@
-// MailJaeger Dashboard — v1.1.0
+// MailJaeger Dashboard — v1.1.1
 
 const API_BASE = window.location.origin;
 

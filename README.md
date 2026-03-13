@@ -44,7 +44,7 @@ MailJaeger is designed with security as a core principle:
 - ✅ **Quarantine Folder**: Suspected spam goes to quarantine, not deleted
 - ✅ **Request Size Limits**: 10MB default limit prevents large payload attacks
 - ✅ **Error Sanitization**: Internal errors never exposed to API responses
-- ✅ **Session-Only Storage**: Frontend uses sessionStorage (not localStorage) for tokens
+- ✅ **Session-Only Storage**: Frontend stores the API key as an HttpOnly session cookie (not in localStorage or sessionStorage)
 
 **Monitoring & Auditability:**
 - ✅ **Audit Logging**: All email processing actions logged with safe mode status
@@ -173,8 +173,8 @@ The application will be available at **http://localhost:8000**
 
 When you open the dashboard, you'll see a secure login screen:
 - Enter the `API_KEY` value from your `.env` file
-- The key is stored in sessionStorage (cleared when you close the tab/browser)
-- For added security, the key is never saved permanently on disk
+- The API key is exchanged for a secure session cookie (HttpOnly, SameSite=Lax, cleared on logout)
+- For added security, the raw key is never stored in the browser's localStorage or sessionStorage
 
 ## Usage
 
@@ -271,7 +271,7 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
   http://localhost:8000/api/dashboard
 ```
 
-The web dashboard will prompt for the API key on first access and store it securely in your browser's localStorage.
+The web dashboard will prompt for the API key on first access. After successful login, a secure session cookie (HttpOnly, SameSite=Lax) is set; the raw key is never stored in the browser.
 
 ### Security Features
 
@@ -521,7 +521,8 @@ MailJaeger/
 ├── src/
 │   ├── api/              # API endpoints
 │   ├── config.py         # Configuration management
-│   ├── database/         # Database connection
+│   ├── database/         # Database connection and startup checks
+│   ├── middleware/       # Auth, rate limiting, security headers, allowed hosts
 │   ├── models/           # Data models
 │   │   ├── database.py   # SQLAlchemy models
 │   │   └── schemas.py    # Pydantic schemas
@@ -532,8 +533,12 @@ MailJaeger/
 │   │   ├── learning_service.py
 │   │   ├── scheduler.py
 │   │   └── search_service.py
-│   ├── utils/            # Utilities
+│   ├── utils/            # Utilities (logging, error handling)
 │   └── main.py           # FastAPI application
+├── frontend/             # Static web dashboard (HTML/CSS/JS)
+├── docs/                 # Reverse-proxy examples, approval workflow
+├── examples/             # Example .env files for Gmail, Outlook, Raspberry Pi
+├── tests/                # Pytest test suite
 ├── requirements.txt      # Python dependencies
 ├── .env.example          # Example configuration
 └── README.md             # This file
@@ -541,10 +546,10 @@ MailJaeger/
 
 ## Roadmap
 
-Version 1.0 includes all core features as specified. Future enhancements:
-- [ ] Web UI dashboard
-- [ ] Mobile app support
+Version 1.1.1 ships with all core features, session-cookie auth, real-time progress tracking, and override learning. Future enhancements:
+- [ ] Multi-account support
 - [ ] Calendar integration
+- [ ] Mobile app support
 - [ ] Attachment analysis
 - [ ] Multi-language support beyond German
 - [ ] Export/import functionality

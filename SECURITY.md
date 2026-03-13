@@ -1,4 +1,4 @@
-# Security Summary - MailJaeger v1.0
+# Security Summary - MailJaeger v1.1.1
 
 ## Security Status: ✅ SECURE
 
@@ -320,7 +320,7 @@ python cli.py health
 
 ## Conclusion
 
-MailJaeger v1.0 has been designed and implemented with security as a core principle:
+MailJaeger v1.1.1 has been designed and implemented with security as a core principle:
 
 - ✅ **0 Known Vulnerabilities**
 - ✅ **Privacy-First Architecture**
@@ -332,6 +332,6 @@ The system is secure for production deployment on Raspberry Pi 5 and other Linux
 
 ---
 
-**Last Updated**: 2024-02-12  
+**Last Updated**: 2026-02-25  
 **Security Status**: ✅ SECURE  
 **Next Review**: Monthly dependency updates recommended

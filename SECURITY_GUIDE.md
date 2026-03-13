@@ -27,7 +27,7 @@ MailJaeger implements multiple layers of security:
 - Rate limiting prevents brute force
 - Session-only token storage prevents theft
 - CSP and escaping prevent XSS
-- Bearer tokens (not cookies) prevent CSRF
+- HttpOnly session cookie (SameSite=Lax) with CSRF protection via same-site policy
 - AI output validation prevents prompt injection
 - Log redaction prevents data leakage
 
