@@ -5,7 +5,7 @@
 ## Key Features
 
 - **🔒 100% Local & Private**: All processing occurs locally, no cloud AI services or telemetry
-- **🛡️ Secure by Default**: Token-based authentication, localhost-only binding, safe mode enabled
+- **🛡️ Secure by Default**: API key authentication, localhost-only binding, safe mode enabled
 - **🤖 AI-Powered Analysis**: Automatic email categorization, priority assessment, and task extraction
 - **🎯 Smart Filtering**: Intelligent spam detection and action-required identification  
 - **📊 Structured Organization**: Automatic archiving with learned folder suggestions
@@ -191,19 +191,7 @@ The dashboard provides:
 
 ### API Access
 
-For API access, include your API key in requests:
-
-```bash
-# Example: Trigger processing
-curl -X POST http://localhost:8000/api/processing/trigger \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{}'
-```
-
-### API Documentation
-
-Interactive API documentation:
+Authenticate programmatic requests with an `Authorization: Bearer YOUR_API_KEY` header (see [Authentication](#authentication) below for details). Interactive API documentation is available at:
 - **Swagger UI**: http://localhost:8000/api/docs
 - **ReDoc**: http://localhost:8000/api/redoc
 
@@ -263,20 +251,25 @@ environment:
 
 ### Authentication
 
-All API endpoints (except `/api/health`) require authentication:
+MailJaeger supports two authentication methods that work in parallel:
+
+**Browser / Web Dashboard**: Opening the dashboard presents a login form. Enter the `API_KEY` from your `.env` file. The server validates the key and sets an HttpOnly, SameSite=Lax session cookie. All subsequent dashboard requests are authenticated by that cookie — the raw key is never stored in the browser.
+
+**Programmatic / CLI**: Include the API key directly as a Bearer token on every request:
 
 ```bash
-# Include Bearer token in requests
-curl -H "Authorization: Bearer YOUR_API_KEY" \
-  http://localhost:8000/api/dashboard
+# Example: Trigger processing
+curl -X POST http://localhost:8000/api/processing/trigger \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json"
 ```
 
-The web dashboard will prompt for the API key on first access. After successful login, a secure session cookie (HttpOnly, SameSite=Lax) is set; the raw key is never stored in the browser.
+All API endpoints require authentication except `/api/health` (monitoring) and `/api/version` (public version info). The `/api/auth/login` and `/api/auth/logout` endpoints are also public (they are the mechanism for establishing a session).
 
 ### Security Features
 
 **Built-in Protection:**
-- ✅ Token-based authentication on all endpoints
+- ✅ API key authentication (Bearer token for CLI; session cookie for browser)
 - ✅ Localhost binding by default (127.0.0.1)
 - ✅ Restrictive CORS (no wildcard origins)
 - ✅ Credential filtering in all logs

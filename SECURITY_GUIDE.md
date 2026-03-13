@@ -23,15 +23,22 @@ MailJaeger implements multiple layers of security:
 - Attacker may attempt: brute force, token theft, XSS/CSRF, SSRF, prompt injection, data exfiltration
 
 **Mitigations:**
-- All endpoints require authentication
+- All protected endpoints require authentication (Bearer token or session cookie)
 - Rate limiting prevents brute force
-- Session-only token storage prevents theft
+- HttpOnly session cookie (SameSite=Lax) prevents credential theft via JavaScript; same-site policy limits CSRF
 - CSP and escaping prevent XSS
-- HttpOnly session cookie (SameSite=Lax) with CSRF protection via same-site policy
 - AI output validation prevents prompt injection
 - Log redaction prevents data leakage
 
 ## Authentication & Authorization
+
+MailJaeger supports two authentication methods that work in parallel:
+
+- **Browser / Web Dashboard**: The login form accepts the `API_KEY`. On success the server sets an HttpOnly, SameSite=Lax session cookie. All subsequent dashboard requests are authenticated via that cookie; the raw key is never stored in the browser.
+- **Programmatic / CLI**: Supply the API key as a Bearer token on every request:
+  ```bash
+  curl -H "Authorization: Bearer YOUR_API_KEY" http://localhost:8000/api/dashboard
+  ```
 
 ### API Key Management
 
@@ -92,8 +99,10 @@ second_active_key_here
 ### Protected Routes
 
 All routes require authentication except:
-- `/api/health` - Health check for monitoring
-- Static assets (CSS, JS) - But frontend requires auth to load
+- `/api/health` - Health check for monitoring systems
+- `/api/version` - Public version and changelog info
+- `/api/auth/login`, `/api/auth/logout`, `/api/auth/verify` - Session management
+- Static assets (`/static/`) - Required for loading the login page
 
 Protected routes include:
 - `/` - Frontend dashboard
@@ -525,6 +534,23 @@ Use this before production deployment:
 3. Backup production database
 4. Deploy during low-traffic period
 5. Monitor logs after deployment
+
+## Compliance
+
+### Privacy Regulations
+
+- ✅ **GDPR Compliant**: All data stays local, no third-party sharing
+- ✅ **No Data Collection**: Zero telemetry or analytics
+- ✅ **User Control**: Complete data ownership
+- ✅ **Right to Erasure**: Users can delete the database at any time
+- ✅ **Data Portability**: SQLite database is portable and exportable
+
+### Security Standards
+
+- ✅ **Principle of Least Privilege**: Minimal permissions
+- ✅ **Defense in Depth**: Multiple independent security layers
+- ✅ **Secure by Default**: Safe defaults prevent accidental exposure
+- ✅ **Fail Secure**: Access denied when configuration is incomplete
 
 ## Contact
 
