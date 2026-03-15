@@ -277,7 +277,11 @@ class AnalysisPipeline:
         for rule in rules:
             if rule.sender_pattern:
                 pattern = rule.sender_pattern.lower()
-                if sender.endswith(pattern) or sender == pattern.lstrip("@"):
+                # Ensure accurate domain matching: pattern like "@example.com" must not
+                # match "notexample.com". Normalize to ensure leading "@" for domain checks.
+                if not pattern.startswith("@"):
+                    pattern = "@" + pattern.lstrip("@")
+                if sender.endswith(pattern):
                     if rule.subject_pattern:
                         if rule.subject_pattern.lower() in subject:
                             matched_rule = rule
@@ -398,13 +402,21 @@ class AnalysisPipeline:
         """Record a decision event for learning/audit purposes."""
         try:
             analysis = result.get("analysis", {})
+            stage = result.get("stage", 0)
+            # Use a stage-appropriate confidence: stage 1/2 use fixed values, stage 3 uses spam_probability
+            if stage == 1:
+                confidence = 0.8
+            elif stage == 2:
+                confidence = 0.9
+            else:
+                confidence = analysis.get("spam_probability", 0.5)
             event = DecisionEvent(
                 email_id=email.id,
                 thread_id=email.thread_id,
                 event_type=event_type,
-                source=result.get("source", f"pipeline_stage{result.get('stage', 0)}"),
+                source=result.get("source", f"pipeline_stage{stage}"),
                 new_value=analysis.get("category"),
-                confidence=result.get("confidence", analysis.get("spam_probability")),
+                confidence=confidence,
                 model_version=PIPELINE_VERSION,
                 created_at=datetime.utcnow(),
             )

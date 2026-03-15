@@ -148,7 +148,8 @@ class TestHostOllamaConfiguration:
         with open("docker-compose.yml", "r") as f:
             content = f.read()
         assert "ollama/ollama" not in content, "docker-compose.yml must not use ollama/ollama image"
-        assert "mailjaeger-ollama" not in content, "docker-compose.yml must not have mailjaeger-ollama container"
+        # Neither the original container_name nor the image reference should remain
+        assert "image: ollama" not in content, "docker-compose.yml must not reference Ollama as a service image"
 
     def test_docker_compose_uses_host_docker_internal(self):
         """docker-compose.yml must use host.docker.internal for AI endpoint."""

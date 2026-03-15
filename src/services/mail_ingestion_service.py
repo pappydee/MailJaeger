@@ -313,7 +313,11 @@ class MailIngestionService:
             return ""
         try:
             from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, "lxml")
+            # Prefer lxml for performance; fall back to html.parser if lxml is unavailable
+            try:
+                soup = BeautifulSoup(html, "lxml")
+            except Exception:
+                soup = BeautifulSoup(html, "html.parser")
             for tag in soup(["script", "style", "img", "link"]):
                 tag.decompose()
             return soup.get_text(separator=" ")
