@@ -52,7 +52,9 @@ function openLoginModal() {
     const m = document.getElementById('loginModal');
     m.classList.add('active');
     document.getElementById('apiKeyInput').focus();
-    // Guard against duplicate event listeners when re-opening after session expiry
+    // Guard against duplicate event listeners when re-opening after session expiry.
+    // removeEventListener is reliable here because handleLogin is a stable
+    // module-scope named function (not an inline lambda).
     const form = document.getElementById('loginForm');
     form.removeEventListener('submit', handleLogin);
     form.addEventListener('submit', handleLogin);
