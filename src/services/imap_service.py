@@ -3,6 +3,7 @@ IMAP email retrieval service
 """
 
 import logging
+import ssl
 from typing import List, Dict, Any, Optional
 from email import message_from_bytes
 from email.header import decode_header
@@ -36,10 +37,22 @@ class IMAPService:
         """
         temp_client = None
         try:
+            # Build SSL context with configurable certificate verification
+            ssl_context = None
+            if self.settings.imap_use_ssl:
+                ssl_context = ssl.create_default_context()
+                if not self.settings.imap_ssl_verify:
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                    logger.warning(
+                        "IMAP SSL certificate verification is DISABLED (IMAP_SSL_VERIFY=false)"
+                    )
+
             temp_client = IMAPClient(
                 self.settings.imap_host,
                 port=self.settings.imap_port,
                 ssl=self.settings.imap_use_ssl,
+                ssl_context=ssl_context,
             )
             # Get password from settings (handles file-based secrets)
             password = self.settings.get_imap_password()
@@ -121,10 +134,10 @@ class IMAPService:
 
             logger.info(f"Found {len(messages)} unread emails")
 
-            # Fetch email data
+            # Fetch email data using BODY.PEEK to avoid marking emails as read in safe mode
             emails = []
             for uid, message_data in self.client.fetch(
-                messages, ["RFC822", "FLAGS"]
+                messages, [b"BODY.PEEK[]", b"FLAGS"]
             ).items():
                 try:
                     email_data = self._parse_email(uid, message_data)
@@ -145,7 +158,7 @@ class IMAPService:
     def _parse_email(self, uid: int, message_data: Dict) -> Optional[Dict[str, Any]]:
         """Parse email message"""
         try:
-            raw_email = message_data[b"RFC822"]
+            raw_email = message_data.get(b"BODY[]") or message_data.get(b"RFC822")
             msg = message_from_bytes(raw_email)
 
             # Extract headers
@@ -154,6 +167,8 @@ class IMAPService:
             recipients = self._decode_header(msg.get("To", ""))
             date_str = msg.get("Date")
             message_id = msg.get("Message-ID", f"<generated-{uid}@mailjaeger>")
+            in_reply_to = msg.get("In-Reply-To", "")
+            references = msg.get("References", "")
 
             # Parse date
             email_date = None
@@ -220,6 +235,8 @@ class IMAPService:
             return {
                 "uid": str(uid),
                 "message_id": message_id,
+                "in_reply_to": in_reply_to,
+                "references": references,
                 "subject": subject,
                 "sender": sender,
                 "recipients": recipients,

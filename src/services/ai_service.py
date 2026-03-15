@@ -266,9 +266,9 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
         # Convert to string and truncate if needed
         str_value = str(value)[:max_length]
 
-        # Basic sanitization - remove control characters except newlines/tabs
-        # Using regex for better performance on large strings
-        sanitized = re.sub(r"[^\x20-\x7E\n\t]", "", str_value)
+        # Strip control characters but preserve Unicode (including German umlauts: ä ö ü ß)
+        # Allow printable ASCII, Unicode letters/digits/punctuation, newlines and tabs
+        sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str_value)
 
         return sanitized.strip()
 
@@ -423,7 +423,7 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
         try:
             url = f"{self.settings.ai_endpoint}/api/tags"
 
-            with httpx.Client(timeout=5) as client:
+            with httpx.Client(timeout=self.settings.ai_timeout) as client:
                 response = client.get(url)
                 response.raise_for_status()
 
