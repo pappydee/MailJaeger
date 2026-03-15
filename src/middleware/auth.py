@@ -66,6 +66,13 @@ async def require_authentication(request: Request) -> None:
     or from the global auth middleware (session cookie).  The credentials are NOT
     accepted as a body parameter to avoid FastAPI embedding the request body.
     """
+    # Fast-path: global_auth_middleware already verified this request (Bearer or
+    # session cookie) and stamped request.state.authenticated = True.  Trust it
+    # to avoid duplicating session-store lookups and to support cookie-based auth
+    # for browser clients.
+    if hasattr(request.state, "authenticated") and request.state.authenticated:
+        return
+
     settings = get_settings()
     api_keys = settings.get_api_keys()
 

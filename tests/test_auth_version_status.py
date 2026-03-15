@@ -260,6 +260,51 @@ class TestStatusEndpoint:
                 f"Missing fields: {required_fields - data.keys()}"
             )
 
+    def test_status_with_session_cookie_returns_200(self):
+        """Session-cookie login must allow access to protected routes (regression: cookie auth loop)."""
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            reload_settings()
+            from src.main import app
+
+            client = TestClient(app, raise_server_exceptions=False)
+            # Step 1: log in with API key to obtain a session cookie
+            login = client.post(
+                "/api/auth/login",
+                json={"api_key": "test_secret_key_12345"},
+            )
+            assert login.status_code == 200, "Login must succeed before testing cookie auth"
+            assert "mailjaeger_session" in login.cookies
+
+            # Step 2: two different protected endpoints must be reachable with
+            # only the session cookie and no Authorization header, confirming
+            # this is not route-specific.
+            status_resp = client.get("/api/status")
+            assert status_resp.status_code == 200, (
+                "Session-cookie auth must be accepted by Depends(require_authentication). "
+                "If this fails, the browser will enter an infinite re-auth loop."
+            )
+            assert "status" in status_resp.json()
+
+            # /api/auth/verify also uses the cookie — confirm consistent behaviour
+            verify_resp = client.get("/api/auth/verify")
+            assert verify_resp.status_code == 200
+            assert verify_resp.json().get("authenticated") is True
+
+    def test_cookie_auth_invalidated_after_logout(self):
+        """Protected routes must return 401 after the session is logged out."""
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            reload_settings()
+            from src.main import app
+
+            client = TestClient(app, raise_server_exceptions=False)
+            login = client.post("/api/auth/login", json={"api_key": "test_secret_key_12345"})
+            assert login.status_code == 200, "Login must succeed before testing logout"
+            assert client.get("/api/status").status_code == 200
+            client.post("/api/auth/logout")
+            assert client.get("/api/status").status_code == 401
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

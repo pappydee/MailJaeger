@@ -143,6 +143,7 @@ async def global_auth_middleware(request: Request, call_next):
             token = auth_header.split(" ", 1)[1]
             if any(secrets.compare_digest(token, key) for key in api_keys):
                 logger.debug(f"Bearer-authenticated request to {path}")
+                request.state.authenticated = True
                 return await call_next(request)
         except IndexError:
             pass
@@ -161,6 +162,7 @@ async def global_auth_middleware(request: Request, call_next):
         expiry = _sessions.get(session_token)
         if expiry and expiry > datetime.utcnow():
             logger.debug(f"Cookie-authenticated request to {path}")
+            request.state.authenticated = True
             return await call_next(request)
         # Expired or invalid session
         if session_token in _sessions:
