@@ -45,7 +45,14 @@ from src.services.ai_service import AIService
 from src.services.search_service import SearchService
 from src.services.learning_service import LearningService
 from src.services.email_processor import EmailProcessor
-from src.middleware.auth import require_authentication, AuthenticationError
+from src.middleware.auth import (
+    require_authentication,
+    AuthenticationError,
+    validate_request_auth,
+    _sessions,
+    SESSION_COOKIE,
+    SESSION_EXPIRY_HOURS,
+)
 from src.middleware.security_headers import SecurityHeadersMiddleware
 from src.middleware.allowed_hosts import AllowedHostsMiddleware
 from src.middleware.rate_limiting import limiter, rate_limit_exceeded_handler
@@ -57,11 +64,8 @@ from src import __version__, CHANGELOG
 setup_logging()
 logger = get_logger(__name__)
 
-# In-memory session store: token -> expiry datetime
-# Sessions are lost on restart (acceptable for a local tool).
-_sessions: Dict[str, datetime] = {}
-SESSION_COOKIE = "mailjaeger_session"
-SESSION_EXPIRY_HOURS = 24
+# Session store and related constants are defined in src.middleware.auth and
+# imported above.  src.main uses them directly (login/logout/verify endpoints).
 
 # Settings with validation
 try:
@@ -105,9 +109,9 @@ async def global_auth_middleware(request: Request, call_next):
     Global authentication middleware that enforces auth for all routes
     except those in the explicit allowlist. This is fail-closed by default.
 
-    Accepts either:
-    - Authorization: Bearer <API_KEY>  (CLI/curl compatibility)
-    - Session cookie set by POST /api/auth/login  (browser usage)
+    Delegates to validate_request_auth() from src.middleware.auth — the same
+    function used by Depends(require_authentication) — so there is exactly one
+    authentication code-path for both Bearer tokens and session cookies.
     """
     # Explicit allowlist of unauthenticated routes.
     # "/" is allowed so the browser can load the login page.
@@ -123,53 +127,15 @@ async def global_auth_middleware(request: Request, call_next):
     ):
         return await call_next(request)
 
-    # Check authentication for all other routes
-    settings = get_settings()
-    api_keys = settings.get_api_keys()
-
-    # Fail-closed: If no API keys configured, deny all access except allowlist
-    if not api_keys:
-        logger.error(f"No API keys configured - denying access to {path}")
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Unauthorized"},
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    # --- Option 1: Bearer token (CLI / curl) ---
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        try:
-            token = auth_header.split(" ", 1)[1]
-            if any(secrets.compare_digest(token, key) for key in api_keys):
-                logger.debug(f"Bearer-authenticated request to {path}")
-                request.state.authenticated = True
-                return await call_next(request)
-        except IndexError:
-            pass
-        logger.warning(
-            f"Failed Bearer auth for {path} from {request.client.host if request.client else 'unknown'}"
-        )
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Unauthorized"},
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    # --- Option 2: Session cookie (browser) ---
-    session_token = request.cookies.get(SESSION_COOKIE)
-    if session_token:
-        expiry = _sessions.get(session_token)
-        if expiry and expiry > datetime.utcnow():
-            logger.debug(f"Cookie-authenticated request to {path}")
-            request.state.authenticated = True
-            return await call_next(request)
-        # Expired or invalid session
-        if session_token in _sessions:
-            del _sessions[session_token]
+    # Delegate to the shared validator (Bearer token OR session cookie)
+    if validate_request_auth(request):
+        logger.debug("Authenticated request to %s", path)
+        return await call_next(request)
 
     logger.warning(
-        f"Unauthenticated request to {path} from {request.client.host if request.client else 'unknown'}"
+        "Unauthenticated request to %s from %s",
+        path,
+        request.client.host if request.client else "unknown",
     )
     return JSONResponse(
         status_code=401,
@@ -448,27 +414,11 @@ async def auth_verify(request: Request):
     Check whether the current request is authenticated.
     Returns 200 if authenticated (Bearer or session cookie), 401 otherwise.
     This is called by the frontend to decide whether to show the login screen.
+    Uses the same validate_request_auth() function as the global middleware and
+    the require_authentication dependency.
     """
-    settings = get_settings()
-    api_keys = settings.get_api_keys()
-
-    if not api_keys:
-        return JSONResponse(status_code=401, content={"authenticated": False})
-
-    # Check Bearer
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header.split(" ", 1)[1]
-        if any(secrets.compare_digest(token, key) for key in api_keys):
-            return {"authenticated": True}
-
-    # Check session cookie
-    session_token = request.cookies.get(SESSION_COOKIE)
-    if session_token:
-        expiry = _sessions.get(session_token)
-        if expiry and expiry > datetime.utcnow():
-            return {"authenticated": True}
-
+    if validate_request_auth(request):
+        return {"authenticated": True}
     return JSONResponse(status_code=401, content={"authenticated": False})
 
 

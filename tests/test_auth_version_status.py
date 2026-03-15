@@ -305,6 +305,96 @@ class TestStatusEndpoint:
             client.post("/api/auth/logout")
             assert client.get("/api/status").status_code == 401
 
+    def test_invalid_bearer_returns_401(self):
+        """An invalid Bearer token must be rejected (not fall through to cookie check)."""
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            reload_settings()
+            from src.main import app
+
+            client = TestClient(app, raise_server_exceptions=False)
+            response = client.get(
+                "/api/status",
+                headers={"Authorization": "Bearer wrong-token-value"},
+            )
+            assert response.status_code == 401, "Invalid Bearer token must return 401"
+
+    def test_invalid_cookie_returns_401(self):
+        """A cookie that does not match any session must be rejected."""
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            reload_settings()
+            from src.main import app
+
+            client = TestClient(
+                app,
+                raise_server_exceptions=False,
+                cookies={"mailjaeger_session": "totally-fake-session-token"},
+            )
+            response = client.get("/api/status")
+            assert response.status_code == 401, "Unknown session cookie must return 401"
+
+    def test_validate_request_auth_is_shared(self):
+        """validate_request_auth() must be the same function used by both
+        global_auth_middleware and require_authentication – there must be a
+        single auth code-path, not independent duplicates."""
+        import inspect
+        from src.middleware import auth as auth_module
+        from src import main as main_module
+
+        # The function must exist in the auth module
+        assert hasattr(auth_module, "validate_request_auth"), (
+            "validate_request_auth must live in src.middleware.auth"
+        )
+        # main.py must import and use the same object (not define its own copy)
+        assert hasattr(main_module, "validate_request_auth"), (
+            "src.main must import validate_request_auth from src.middleware.auth"
+        )
+        assert main_module.validate_request_auth is auth_module.validate_request_auth, (
+            "src.main.validate_request_auth must be the same object as "
+            "src.middleware.auth.validate_request_auth"
+        )
+
+    def test_middleware_calls_validate_request_auth(self):
+        """global_auth_middleware must call validate_request_auth() at runtime."""
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            reload_settings()
+            from src.main import app
+
+            client = TestClient(app, raise_server_exceptions=False)
+            with patch(
+                "src.main.validate_request_auth", return_value=True
+            ) as mock_validate:
+                client.get(
+                    "/api/status",
+                    headers={"Authorization": "Bearer test_secret_key_12345"},
+                )
+            assert mock_validate.called, (
+                "global_auth_middleware must call validate_request_auth()"
+            )
+
+    def test_dependency_calls_validate_request_auth(self):
+        """require_authentication() must call validate_request_auth() at runtime."""
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            reload_settings()
+            from src.main import app
+
+            client = TestClient(app, raise_server_exceptions=False)
+            # Patch validate_request_auth inside the auth module so that
+            # require_authentication (which imports from there) sees the mock.
+            with patch(
+                "src.middleware.auth.validate_request_auth", return_value=True
+            ) as mock_validate:
+                client.get(
+                    "/api/status",
+                    headers={"Authorization": "Bearer test_secret_key_12345"},
+                )
+            assert mock_validate.called, (
+                "require_authentication dependency must call validate_request_auth()"
+            )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
