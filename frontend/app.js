@@ -52,7 +52,27 @@ function openLoginModal() {
     const m = document.getElementById('loginModal');
     m.classList.add('active');
     document.getElementById('apiKeyInput').focus();
-    document.getElementById('loginForm').addEventListener('submit', handleLogin);
+    // Guard against duplicate event listeners when re-opening after session expiry
+    const form = document.getElementById('loginForm');
+    form.removeEventListener('submit', handleLogin);
+    form.addEventListener('submit', handleLogin);
+}
+
+function closeLoginModal() {
+    const m = document.getElementById('loginModal');
+    if (m) m.classList.remove('active');
+}
+
+/**
+ * Called whenever an API response returns 401 after the user was already
+ * logged in.  Stops all background activity and presents the login modal so
+ * the user can re-authenticate without a full page reload.
+ */
+function handleSessionExpired() {
+    stopStatusPolling();
+    if (_dashboardTimer) { clearInterval(_dashboardTimer); _dashboardTimer = null; }
+    showToast('Sitzung abgelaufen – bitte neu anmelden', 'error');
+    openLoginModal();
 }
 
 async function handleLogin(e) {
@@ -71,7 +91,14 @@ async function handleLogin(e) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ api_key: key }),
         });
-        if (r.ok) { location.reload(); return; }
+        if (r.ok) {
+            // Close the modal and (re-)boot the dashboard without a full page
+            // reload so that a re-login after session expiry is seamless.
+            closeLoginModal();
+            document.getElementById('apiKeyInput').value = '';
+            await boot();
+            return;
+        }
         const d = await r.json().catch(() => ({}));
         err.textContent = d.detail || 'Ungültiger API-Schlüssel.';
         err.style.display = 'block';
@@ -131,7 +158,7 @@ function stopStatusPolling() {
 async function pollStatus() {
     try {
         const r = await fetch(`${API_BASE}/api/status`);
-        if (r.status === 401) { stopStatusPolling(); return; }
+        if (r.status === 401) { handleSessionExpired(); return; }
         if (!r.ok) return;
         const d = await r.json();
         renderStatus(d);
@@ -201,7 +228,7 @@ function renderStatus(d) {
 async function loadDashboard() {
     try {
         const r = await fetch(`${API_BASE}/api/dashboard`);
-        if (r.status === 401) { showToast('Sitzung abgelaufen – bitte neu anmelden', 'error'); setTimeout(() => location.reload(), 2000); return; }
+        if (r.status === 401) { handleSessionExpired(); return; }
         if (!r.ok) { showToast(`Dashboard-Fehler: ${r.status}`, 'error'); return; }
         const d = await r.json();
 
@@ -255,7 +282,7 @@ async function loadEmails() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
         });
-        if (r.status === 401) { list.innerHTML = '<div class="loading">Nicht autorisiert</div>'; return; }
+        if (r.status === 401) { handleSessionExpired(); return; }
         if (!r.ok) { list.innerHTML = '<div class="loading">Fehler beim Laden</div>'; showToast(`Email-Liste: HTTP ${r.status}`, 'error'); return; }
         const emails = await r.json();
         renderEmails(Array.isArray(emails) ? emails : []);
