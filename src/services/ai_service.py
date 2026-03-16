@@ -522,7 +522,7 @@ Antworte NUR mit dem JSON-Array, keine zusätzlichen Erklärungen."""
             raise ValueError("Batch AI response is not a JSON array")
 
         # Warn about duplicate email_ids returned by the model
-        seen_ids: set = set()
+        seen_ids = set()
         for item in raw_list:
             if isinstance(item, dict) and "email_id" in item:
                 eid = item["email_id"]

@@ -1838,7 +1838,7 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
         # Suggested actions for safe-mode morning report
         # ----------------------------------------------------------------
         safe_mode_active = settings.safe_mode
-        suggested_actions: list[ReportSuggestedAction] = []
+        suggested_actions: List[ReportSuggestedAction] = []
 
         for e in recent_emails:
             if not e.id:

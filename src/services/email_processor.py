@@ -39,6 +39,16 @@ logger = get_logger(__name__)
 class EmailProcessor:
     """Main email processing orchestrator"""
 
+    # Keywords that indicate bulk / newsletter / promotional mail.
+    # Used by compute_importance_score to penalise low-value mail so that
+    # important messages are processed before newsletters regardless of recency.
+    _BULK_INDICATORS: tuple = (
+        "newsletter", "unsubscribe", "abmelden", "no-reply", "noreply",
+        "do-not-reply", "donotreply", "list-unsubscribe",
+        "bulk", "promo", "marketing", "digest", "weekly", "monthly",
+        "angebot", "rabatt", "sale", "offer", "deal",
+    )
+
     def __init__(self, db_session: Session, status: Optional["RunStatus"] = None):
         self.settings = get_settings()
         self.db = db_session
@@ -533,14 +543,8 @@ class EmailProcessor:
         # Newsletter / bulk mail penalty applied early to avoid recency bias
         # If the email looks like bulk/newsletter it is de-prioritised regardless
         # of how recent it is.
-        bulk_indicators = [
-            "newsletter", "unsubscribe", "abmelden", "no-reply", "noreply",
-            "do-not-reply", "donotreply", "list-unsubscribe",
-            "bulk", "promo", "marketing", "digest", "weekly", "monthly",
-            "angebot", "rabatt", "sale", "offer", "deal",
-        ]
-        if any(ind in sender for ind in bulk_indicators) or any(
-            ind in subject for ind in bulk_indicators
+        if any(ind in sender for ind in self._BULK_INDICATORS) or any(
+            ind in subject for ind in self._BULK_INDICATORS
         ):
             score -= 20
 
