@@ -40,7 +40,7 @@ class IMAPService:
             # Build SSL context with configurable certificate verification
             ssl_context = None
             if self.settings.imap_use_ssl:
-                ssl_context = ssl.create_default_context()
+                ssl_context = ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
                 if not self.settings.imap_ssl_verify:
                     ssl_context.check_hostname = False
                     ssl_context.verify_mode = ssl.CERT_NONE
