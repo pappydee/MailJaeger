@@ -27,10 +27,14 @@ class RunStatus:
 
     Valid ``status`` values (all lowercase):
       idle | running | cancelling | cancelled | success | failed
+
+    Valid ``phase`` values:
+      None (idle/finished) | ingestion | analysis
     """
 
     run_id: Optional[int] = None
     status: str = "idle"  # idle | running | cancelling | cancelled | success | failed
+    phase: Optional[str] = None  # None | ingestion | analysis
     current_step: Optional[str] = None
     progress_percent: int = 0
     processed: int = 0
@@ -47,6 +51,7 @@ class RunStatus:
     def reset(self) -> None:
         self.run_id = None
         self.status = "idle"
+        self.phase = None
         self.current_step = None
         self.progress_percent = 0
         self.processed = 0
@@ -78,6 +83,7 @@ class RunStatus:
         return {
             "run_id": self.run_id,
             "status": self.status,
+            "phase": self.phase,
             "current_step": self.current_step,
             "progress_percent": self.progress_percent,
             "processed": self.processed,
@@ -259,9 +265,9 @@ class SchedulerService:
             return int(hour), int(minute)
         except (ValueError, AttributeError) as e:
             logger.warning(
-                f"Invalid schedule time: {self.settings.schedule_time}, using default 08:00"
+                f"Invalid schedule time: {self.settings.schedule_time}, using default 02:00"
             )
-            return 8, 0
+            return 2, 0
 
     def _job_executed(self, event):
         """Callback for successful job execution"""

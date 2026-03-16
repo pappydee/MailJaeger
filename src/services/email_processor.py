@@ -13,6 +13,7 @@ is only used for backward-compatible helpers such as _process_single_email.
 import logging
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from datetime import datetime
+from sqlalchemy import nullslast, desc as sa_desc
 from sqlalchemy.orm import Session
 
 from src.config import get_settings
@@ -62,6 +63,10 @@ class EmailProcessor:
             except Exception:
                 pass  # never let status updates break the processor
 
+    def _should_cancel(self) -> bool:
+        """Return True when a cancellation has been requested for this run."""
+        return self._status is not None and self._status.cancel_requested
+
     # ------------------------------------------------------------------
     # Primary processing workflow (two-phase index-based)
     # ------------------------------------------------------------------
@@ -102,6 +107,7 @@ class EmailProcessor:
             # Phase 1: Ingest — import all emails from IMAP into local index
             # ----------------------------------------------------------------
             self._update_status(
+                phase="ingestion",
                 current_step="Phase 1: Ingesting emails from IMAP…",
                 progress_percent=5,
             )
@@ -116,13 +122,22 @@ class EmailProcessor:
             # Phase 2: Analyse — process pending emails from local index
             # ----------------------------------------------------------------
             self._update_status(
+                phase="analysis",
                 current_step="Phase 2: Querying local index for pending emails…",
                 progress_percent=20,
             )
+
+            # Compute importance scores for any pending emails that lack one,
+            # then retrieve pending emails sorted by importance (high → low)
+            # so the most critical messages are processed first.
+            self._compute_pending_importance_scores()
+
             pending_emails = (
                 self.db.query(ProcessedEmail)
                 .filter(ProcessedEmail.analysis_state == "pending")
-                .order_by(ProcessedEmail.received_at.asc())
+                .order_by(
+                    nullslast(sa_desc(ProcessedEmail.importance_score)),
+                )
                 .limit(self.settings.max_emails_per_run)
                 .all()
             )
@@ -130,6 +145,7 @@ class EmailProcessor:
             if not pending_emails:
                 logger.info("No pending emails to analyse in local index")
                 self._update_status(
+                    phase=None,
                     current_step=None,
                     progress_percent=100,
                     total=0,
@@ -182,12 +198,23 @@ class EmailProcessor:
                 )
 
             try:
-                for idx, email_record in enumerate(pending_emails, start=1):
-                    # --- cancellation checkpoint ---
-                    if self._status is not None and self._status.cancel_requested:
+                # ---- Batch-aware analysis loop --------------------------------
+                # We process emails in groups of ai_batch_size.  Within each
+                # group, Stage-1/2 emails are handled individually (fast, no LLM),
+                # and Stage-3 emails (those that need LLM) are sent in a single
+                # batch AI request to reduce round-trips.
+                batch_size = max(1, self.settings.ai_batch_size)
+                idx = 0  # global email index across all batches
+
+                for batch_start in range(0, total, batch_size):
+                    batch = pending_emails[batch_start: batch_start + batch_size]
+
+                    # --- cancellation checkpoint (per batch) ---
+                    if self._should_cancel():
                         logger.info(
-                            f"Cancellation requested — stopping before email "
-                            f"{idx}/{total} ({idx - 1} completed so far)"
+                            f"Cancellation requested — stopping before batch "
+                            f"starting at {batch_start}/{total} "
+                            f"({idx} completed so far)"
                         )
                         self._update_status(
                             status="cancelling",
@@ -195,34 +222,45 @@ class EmailProcessor:
                         )
                         break
 
-                    pct = 25 + int((idx / total) * 65)  # 25 → 90 %
-                    self._update_status(
-                        current_step=f"Analysing {idx}/{total}…",
-                        progress_percent=pct,
-                        processed=self.stats["processed"],
-                        spam=self.stats["spam"],
-                        action_required=self.stats["action_required"],
-                        failed=self.stats["failed"],
-                    )
-                    try:
-                        self._process_indexed_email(email_record, imap_for_actions)
-                    except Exception as e:
-                        sanitized_error = sanitize_error(
-                            e, debug=self.settings.debug
+                    # Run Stage 1 & 2 for every email in the batch
+                    needs_llm: List = []  # (email_record,) tuples for Stage-3
+                    for email_record in batch:
+                        idx += 1
+                        pct = 25 + int((idx / total) * 65)  # 25 → 90 %
+                        self._update_status(
+                            current_step=f"Analysing {idx}/{total}…",
+                            progress_percent=pct,
+                            processed=self.stats["processed"],
+                            spam=self.stats["spam"],
+                            action_required=self.stats["action_required"],
+                            failed=self.stats["failed"],
                         )
-                        logger.error(
-                            f"Failed to process indexed email "
-                            f"{email_record.message_id}: {sanitized_error}"
-                        )
-                        self.stats["failed"] += 1
-                        # Mark the record so we don't retry endlessly
                         try:
-                            email_record.analysis_state = "failed"
-                            self.db.add(email_record)
-                            self.db.commit()
-                        except Exception:
-                            pass
-                        continue
+                            went_to_llm = self._process_indexed_email_stages12(
+                                email_record, imap_for_actions
+                            )
+                            if went_to_llm:
+                                needs_llm.append(email_record)
+                        except Exception as e:
+                            sanitized_error = sanitize_error(
+                                e, debug=self.settings.debug
+                            )
+                            logger.error(
+                                f"Failed to pre-classify indexed email "
+                                f"{email_record.message_id}: {sanitized_error}"
+                            )
+                            self.stats["failed"] += 1
+                            try:
+                                email_record.analysis_state = "failed"
+                                self.db.add(email_record)
+                                self.db.commit()
+                            except Exception:
+                                pass
+
+                    # Stage 3: batch LLM analysis for emails that need it
+                    if needs_llm:
+                        self._process_batch_llm(needs_llm, imap_for_actions)
+
             finally:
                 if imap_for_actions:
                     try:
@@ -231,12 +269,10 @@ class EmailProcessor:
                         pass
 
             # Determine whether the run was cancelled mid-flight
-            was_cancelled = (
-                self._status is not None and self._status.cancel_requested
-            )
+            was_cancelled = self._should_cancel()
 
             # Save run statistics
-            self._update_status(current_step="Saving results…", progress_percent=95)
+            self._update_status(phase=None, current_step="Saving results…", progress_percent=95)
             run.emails_processed = self.stats["processed"]
             run.emails_spam = self.stats["spam"]
             run.emails_archived = self.stats["archived"]
@@ -471,6 +507,337 @@ class EmailProcessor:
             f"Indexed email processed: spam={is_spam}, "
             f"action={action_required}, priority={priority}"
         )
+
+    # ------------------------------------------------------------------
+    # New helpers: importance scoring, batch processing
+    # ------------------------------------------------------------------
+
+    def compute_importance_score(self, email_record: ProcessedEmail) -> float:
+        """
+        Compute an importance score in the range 0–100 for a single email.
+
+        Inputs:
+        - sender history (previous action_required emails from same domain)
+        - action-required keyword heuristics in subject
+        - thread participation (has In-Reply-To / References?)
+        - email recency
+
+        Higher score → higher priority → processed first.
+        """
+        score = 30.0  # neutral baseline
+
+        subject = (email_record.subject or "").lower()
+        sender = (email_record.sender or "").lower()
+
+        # Recency bonus: emails received in the last 48 h score higher
+        try:
+            if email_record.received_at or email_record.date:
+                ts = email_record.received_at or email_record.date
+                age_hours = (datetime.utcnow() - ts).total_seconds() / 3600
+                if age_hours <= 24:
+                    score += 20
+                elif age_hours <= 48:
+                    score += 10
+        except Exception:
+            pass
+
+        # Thread participation: email is a reply → likely involves the user
+        if email_record.thread_id:
+            score += 10
+
+        # Subject keyword heuristics (German + English)
+        urgent_keywords = [
+            "dringend", "urgent", "sofort", "immediately",
+            "frist", "deadline", "termin",
+            "notfall", "emergency",
+            "bitte antworten", "please reply",
+            "antwort erforderlich", "response required",
+        ]
+        if any(kw in subject for kw in urgent_keywords):
+            score += 20
+
+        # Sender domain reputation: check historical action_required rate
+        try:
+            domain = sender.split("@")[-1] if "@" in sender else ""
+            if domain:
+                total_from_domain = (
+                    self.db.query(ProcessedEmail)
+                    .filter(
+                        ProcessedEmail.sender.ilike(f"%@{domain}"),
+                        ProcessedEmail.is_processed == True,
+                    )
+                    .count()
+                )
+                if total_from_domain > 0:
+                    action_from_domain = (
+                        self.db.query(ProcessedEmail)
+                        .filter(
+                            ProcessedEmail.sender.ilike(f"%@{domain}"),
+                            ProcessedEmail.action_required == True,
+                            ProcessedEmail.is_processed == True,
+                        )
+                        .count()
+                    )
+                    action_rate = action_from_domain / total_from_domain
+                    score += action_rate * 20  # up to +20 for 100% action-required domain
+        except Exception:
+            pass
+
+        # Cap to 0–100
+        return max(0.0, min(100.0, score))
+
+    def _compute_pending_importance_scores(self) -> None:
+        """Compute and persist importance_score for all 'pending' emails that lack one."""
+        try:
+            unscored = (
+                self.db.query(ProcessedEmail)
+                .filter(
+                    ProcessedEmail.analysis_state == "pending",
+                    ProcessedEmail.importance_score == None,  # noqa: E711
+                )
+                .all()
+            )
+            if not unscored:
+                return
+            logger.info(f"Computing importance scores for {len(unscored)} emails")
+            for email_record in unscored:
+                email_record.importance_score = self.compute_importance_score(email_record)
+                self.db.add(email_record)
+            self.db.commit()
+        except Exception as e:
+            sanitized = sanitize_error(e, debug=self.settings.debug)
+            logger.warning(f"Failed to compute importance scores: {sanitized}")
+
+    def _process_indexed_email_stages12(
+        self,
+        email_record: ProcessedEmail,
+        imap: Optional[IMAPService],
+    ) -> bool:
+        """
+        Run Stage 1 and Stage 2 of the analysis pipeline on a single indexed email.
+
+        If Stages 1 and 2 produce a confident classification the email is
+        fully handled here and ``False`` is returned.
+        If Stage 3 (LLM) is required, the email is left in its current
+        analysis_state and ``True`` is returned so the caller can batch it.
+        """
+        from src.services.analysis_pipeline import AnalysisPipeline
+
+        pipeline = AnalysisPipeline(self.db)
+
+        # Stage 1
+        stage1 = pipeline._stage1_pre_classify(email_record)
+        if stage1["confident"]:
+            pipeline._record_decision(email_record, "stage1_pre_classified", stage1)
+            pipeline._update_analysis_state(email_record, "pre_classified")
+            self._apply_analysis_and_act(email_record, stage1["analysis"], imap)
+            return False
+
+        # Stage 2
+        stage2 = pipeline._stage2_rule_classify(email_record)
+        if stage2["confident"]:
+            pipeline._record_decision(email_record, "stage2_classified", stage2)
+            pipeline._update_analysis_state(email_record, "classified")
+            self._apply_analysis_and_act(email_record, stage2["analysis"], imap)
+            return False
+
+        # Neither stage produced a confident result — needs LLM
+        return True
+
+    def _process_batch_llm(
+        self,
+        email_records: List[ProcessedEmail],
+        imap: Optional[IMAPService],
+    ) -> None:
+        """
+        Send a batch of emails to the AI service in one LLM call
+        (Stage 3 — batch path).  Applies results and IMAP actions.
+        """
+        from src.services.analysis_pipeline import AnalysisPipeline, PIPELINE_VERSION
+
+        pipeline = AnalysisPipeline(self.db)
+
+        # Build the lightweight dicts the AI service expects
+        email_data_list = []
+        for rec in email_records:
+            email_data_list.append({
+                "id": rec.id,
+                "subject": rec.subject or "",
+                "sender": rec.sender or "",
+                "body_plain": rec.body_plain or "",
+                "body_html": rec.body_html or "",
+            })
+
+        try:
+            results = self.ai_service.analyze_emails_batch(email_data_list)
+        except Exception as e:
+            sanitized = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Batch LLM analysis failed: {sanitized}")
+            results = [
+                self.ai_service._fallback_classification(ed) for ed in email_data_list
+            ]
+
+        for email_record, analysis in zip(email_records, results):
+            try:
+                pipeline._update_analysis_state(email_record, "deep_analyzed")
+                pipeline._record_decision(
+                    email_record,
+                    "stage3_deep_analyzed",
+                    {"stage": 3, "source": "llm_batch", "analysis": analysis},
+                )
+                self._apply_analysis_and_act(email_record, analysis, imap)
+                email_record.analysis_version = PIPELINE_VERSION
+                self.db.add(email_record)
+            except Exception as e:
+                sanitized = sanitize_error(e, debug=self.settings.debug)
+                logger.error(
+                    f"Failed to apply batch LLM result for "
+                    f"{email_record.message_id}: {sanitized}"
+                )
+                self.stats["failed"] += 1
+                try:
+                    email_record.analysis_state = "failed"
+                    self.db.add(email_record)
+                except Exception:
+                    pass
+
+        self.db.commit()
+
+    def _apply_analysis_and_act(
+        self,
+        email_record: ProcessedEmail,
+        analysis: Dict[str, Any],
+        imap: Optional[IMAPService],
+    ) -> None:
+        """
+        Apply analysis results to the email record and execute IMAP actions.
+
+        This is a refactored version of the logic that was previously inlined
+        in ``_process_indexed_email``.  Both the Stage-1/2 path and the Stage-3
+        batch path call this helper.
+        """
+        from src.models.database import AuditLog, PendingAction
+
+        message_id = email_record.message_id
+
+        email_data = {
+            "message_id": message_id,
+            "uid": email_record.imap_uid or email_record.uid,
+            "subject": email_record.subject or "",
+            "sender": email_record.sender or "",
+            "body_plain": email_record.body_plain or "",
+        }
+
+        # Apply classification
+        email_record.summary = analysis.get("summary")
+        email_record.category = analysis.get("category")
+        email_record.spam_probability = analysis.get("spam_probability")
+        email_record.action_required = analysis.get("action_required")
+        email_record.priority = analysis.get("priority")
+        email_record.suggested_folder = analysis.get("suggested_folder")
+        email_record.reasoning = analysis.get("reasoning")
+        email_record.is_processed = True
+        email_record.processed_at = datetime.utcnow()
+
+        is_spam = self._classify_spam(email_data, analysis)
+        email_record.is_spam = is_spam
+        action_required = bool(analysis.get("action_required", False))
+        priority = analysis.get("priority", "LOW")
+
+        actions_taken = []
+        uid_str = email_record.imap_uid or email_record.uid
+        uid_int: Optional[int] = None
+        try:
+            uid_int = int(uid_str) if uid_str else None
+        except (ValueError, TypeError):
+            uid_int = None
+
+        if self.settings.safe_mode:
+            actions_taken.append("safe_mode_skip")
+
+        elif self.settings.require_approval:
+            actions_taken.append("queued_pending_actions")
+            self.db.add(email_record)
+            self.db.flush()
+            if is_spam:
+                self.db.add(PendingAction(
+                    email_id=email_record.id,
+                    action_type="MOVE_FOLDER",
+                    target_folder=self.settings.quarantine_folder,
+                    status="PENDING",
+                ))
+                self.stats["spam"] += 1
+            else:
+                if self.settings.mark_as_read:
+                    self.db.add(PendingAction(
+                        email_id=email_record.id,
+                        action_type="MARK_READ",
+                        status="PENDING",
+                    ))
+                self.db.add(PendingAction(
+                    email_id=email_record.id,
+                    action_type="MOVE_FOLDER",
+                    target_folder=self.settings.archive_folder,
+                    status="PENDING",
+                ))
+                self.stats["archived"] += 1
+                if action_required:
+                    self.db.add(PendingAction(
+                        email_id=email_record.id,
+                        action_type="ADD_FLAG",
+                        status="PENDING",
+                    ))
+                    self.stats["action_required"] += 1
+
+        elif imap and uid_int:
+            if is_spam:
+                target = (
+                    self.settings.spam_folder
+                    if self.settings.delete_spam
+                    else self.settings.quarantine_folder
+                )
+                if imap.move_to_folder(uid_int, target):
+                    actions_taken.append(
+                        "moved_to_spam" if self.settings.delete_spam else "moved_to_quarantine"
+                    )
+                    email_record.is_archived = True
+                    self.stats["spam"] += 1
+            else:
+                if self.settings.mark_as_read:
+                    if imap.mark_as_read(uid_int):
+                        actions_taken.append("marked_as_read")
+                if imap.move_to_folder(uid_int, self.settings.archive_folder):
+                    actions_taken.append("moved_to_archive")
+                    email_record.is_archived = True
+                    self.stats["archived"] += 1
+                if action_required:
+                    if imap.add_flag(uid_int):
+                        actions_taken.append("flagged")
+                        email_record.is_flagged = True
+                    self.stats["action_required"] += 1
+
+        email_record.actions_taken = {"actions": actions_taken}
+
+        self.db.add(email_record)
+        self.db.add(AuditLog(
+            event_type="EMAIL_PROCESSED",
+            email_message_id=message_id,
+            description=(
+                f"Email processed (indexed): spam={is_spam}, "
+                f"action_required={action_required}, "
+                f"safe_mode={self.settings.safe_mode}, "
+                f"require_approval={self.settings.require_approval}"
+            ),
+            data={
+                "category": analysis.get("category"),
+                "priority": priority,
+                "actions": actions_taken,
+                "safe_mode": self.settings.safe_mode,
+                "require_approval": self.settings.require_approval,
+            },
+        ))
+        self.db.commit()
+        self.stats["processed"] += 1
 
     # ------------------------------------------------------------------
     # Legacy method — kept for backward compatibility with tests and

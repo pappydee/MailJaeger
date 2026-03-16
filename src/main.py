@@ -22,6 +22,7 @@ from src.models.schemas import (
     EmailResponse,
     EmailDetailResponse,
     DashboardResponse,
+    DailyReportResponse,
     ProcessingRunResponse,
     EmailListRequest,
     SearchRequest,
@@ -100,6 +101,20 @@ app = FastAPI(
 def _service_is_unhealthy(health: dict) -> bool:
     """Return True when a service health-check dict indicates a non-healthy state."""
     return isinstance(health, dict) and health.get("status") not in ("healthy", "ok")
+
+
+def _daily_report_available(db: Session) -> bool:
+    """Return True when at least one email was processed in the last 24 hours."""
+    try:
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+        count = (
+            db.query(ProcessedEmail)
+            .filter(ProcessedEmail.processed_at >= cutoff)
+            .count()
+        )
+        return count > 0
+    except Exception:
+        return False
 
 
 # Global authentication middleware (fail-closed)
@@ -562,6 +577,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
             unresolved_count=unresolved_count,
             health_status=health_status,
             run_status=get_run_status().to_dict(),
+            daily_report_available=_daily_report_available(db),
         )
 
     except Exception as e:
@@ -1737,6 +1753,114 @@ async def health_check():
             "scheduler": get_scheduler().get_status(),
         },
     }
+
+
+@app.get(
+    "/api/reports/daily",
+    response_model=DailyReportResponse,
+    dependencies=[Depends(require_authentication)],
+)
+@limiter.limit("10/minute")
+async def get_daily_report(request: Request, db: Session = Depends(get_db)):
+    """
+    Generate and return a daily AI-powered email summary report.
+
+    Analyses emails processed in the last 24 hours and asks the local
+    Ollama AI model to produce a structured German-language summary covering:
+    - important emails
+    - emails requiring action
+    - spam filtered
+    - unresolved threads
+    - suggested actions
+    """
+    try:
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+
+        recent_emails = (
+            db.query(ProcessedEmail)
+            .filter(ProcessedEmail.processed_at >= cutoff)
+            .order_by(ProcessedEmail.processed_at.desc())
+            .limit(100)  # cap to keep the prompt manageable
+            .all()
+        )
+
+        total_processed = len(recent_emails)
+        action_required_count = sum(
+            1 for e in recent_emails if e.action_required
+        )
+        spam_count = sum(1 for e in recent_emails if e.is_spam)
+        unresolved_count = sum(
+            1 for e in recent_emails if e.action_required and not e.is_resolved
+        )
+
+        # Build a structured prompt for the AI
+        email_summaries = []
+        for e in recent_emails[:30]:  # include top 30 in prompt to stay concise
+            parts = [f"- {e.sender or '?'}: {e.subject or '(kein Betreff)'}"]
+            if e.action_required:
+                parts.append("[Aktion erforderlich]")
+            if e.is_spam:
+                parts.append("[Spam]")
+            if e.summary:
+                parts.append(f"({e.summary[:120]})")
+            email_summaries.append(" ".join(parts))
+
+        email_list_str = "\n".join(email_summaries) if email_summaries else "(keine)"
+
+        prompt = f"""Erstelle einen täglichen E-Mail-Bericht auf Deutsch basierend auf den folgenden verarbeiteten E-Mails der letzten 24 Stunden.
+
+Statistiken:
+- Verarbeitete E-Mails: {total_processed}
+- Aktion erforderlich: {action_required_count}
+- Spam erkannt: {spam_count}
+- Ungelöst: {unresolved_count}
+
+E-Mails:
+{email_list_str}
+
+Erstelle einen strukturierten Bericht mit den folgenden Abschnitten:
+1. Zusammenfassung (2-3 Sätze)
+2. Wichtige E-Mails (maximal 5)
+3. Aktionen erforderlich (mit konkreten Vorschlägen)
+4. Spam-Filter-Ergebnis
+5. Empfohlene nächste Schritte
+
+Halte den Bericht präzise und handlungsorientiert."""
+
+        ai_service = AIService()
+        raw_response = ai_service.generate_report(prompt)
+
+        if raw_response and raw_response.strip():
+            report_text = raw_response.strip()
+        else:
+            # Fallback: generate a plain-text summary without AI
+            lines = [
+                f"Täglicher E-Mail-Bericht ({datetime.utcnow().strftime('%d.%m.%Y')})",
+                "",
+                "Zusammenfassung",
+                f"• {total_processed} E-Mails verarbeitet",
+                f"• {action_required_count} erfordern eine Aktion",
+                f"• {spam_count} Spam erkannt",
+                f"• {unresolved_count} ungelöst",
+                "",
+                "(KI-Zusammenfassung nicht verfügbar — Ollama nicht erreichbar)",
+            ]
+            report_text = "\n".join(lines)
+
+        return DailyReportResponse(
+            generated_at=datetime.utcnow().isoformat(),
+            period_hours=24,
+            total_processed=total_processed,
+            action_required=action_required_count,
+            spam_detected=spam_count,
+            unresolved=unresolved_count,
+            report_text=report_text,
+        )
+
+    except Exception as e:
+        sanitized_error = sanitize_error(e, debug=settings.debug)
+        logger.error(f"Daily report generation failed: {sanitized_error}")
+        raise HTTPException(status_code=500, detail="Report generation failed")
 
 
 if __name__ == "__main__":

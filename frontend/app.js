@@ -155,12 +155,16 @@ function renderStatus(d) {
         _isProcessing = true;
         section.style.display = 'block';
 
+        // Phase badge: show ingestion vs analysis phase label
+        const phaseLabel = d.phase === 'ingestion' ? '📥 Einlesen' : d.phase === 'analysis' ? '🔍 Analyse' : '';
+
         if (d.status === 'cancelling') {
             label.textContent = 'Wird abgebrochen…';
             bar.style.background = 'var(--warning)';
         } else {
-            label.textContent = d.current_step || 'Verarbeitung läuft…';
-            bar.style.background = '';
+            const stepText = d.current_step || 'Verarbeitung läuft…';
+            label.textContent = phaseLabel ? `${phaseLabel} · ${stepText}` : stepText;
+            bar.style.background = d.phase === 'ingestion' ? 'var(--secondary)' : '';
         }
 
         pctEl.textContent = `${d.progress_percent || 0} %`;
@@ -307,6 +311,10 @@ async function loadDashboard() {
         // Safe mode badge
         const smb = document.getElementById('safeModeBadge');
         if (smb) smb.style.display = d.safe_mode ? 'inline-block' : 'none';
+
+        // Daily report button
+        const reportBtn = document.getElementById('viewDailyReport');
+        if (reportBtn) reportBtn.style.display = d.daily_report_available ? 'inline-flex' : 'none';
 
     } catch (ex) {
         showToast('Dashboard konnte nicht geladen werden', 'error');
@@ -483,6 +491,34 @@ async function triggerProcessing() {
     }
 }
 
+// ── Daily report ───────────────────────────────────────────────────────
+async function openDailyReport() {
+    const modal = document.getElementById('reportModal');
+    const body  = document.getElementById('reportModalBody');
+    if (!modal || !body) return;
+    modal.classList.add('active');
+    body.innerHTML = '<div class="loading">Bericht wird erstellt…</div>';
+    try {
+        const r = await fetch(`${API_BASE}/api/reports/daily`);
+        if (!r.ok) { body.innerHTML = '<div class="loading">Fehler beim Laden des Berichts</div>'; return; }
+        const d = await r.json();
+        body.innerHTML = `
+            <div class="report-meta">
+                <span>Erstellt: ${fmtDt(d.generated_at)}</span>
+                <span>Zeitraum: letzte ${d.period_hours}h</span>
+            </div>
+            <div class="report-stats">
+                <span>📧 ${d.total_processed} verarbeitet</span>
+                <span>⚡ ${d.action_required} Aktion erforderlich</span>
+                <span>🚫 ${d.spam_detected} Spam</span>
+                <span>⏳ ${d.unresolved} ungelöst</span>
+            </div>
+            <pre class="report-text">${escHtml(d.report_text)}</pre>`;
+    } catch {
+        body.innerHTML = '<div class="loading">Fehler beim Laden des Berichts</div>';
+    }
+}
+
 // ── Filters ────────────────────────────────────────────────────────────
 function applyFilters() {
     const cat = document.getElementById('filterCategory').value;
@@ -500,6 +536,8 @@ function applyFilters() {
 function wireListeners() {
     document.getElementById('triggerProcessing')?.addEventListener('click', triggerProcessing);
     document.getElementById('cancelRunBtn')?.addEventListener('click', cancelProcessing);
+    document.getElementById('viewDailyReport')?.addEventListener('click', openDailyReport);
+    document.getElementById('closeReportModal')?.addEventListener('click', () => document.getElementById('reportModal').classList.remove('active'));
     document.getElementById('applyFilters')?.addEventListener('click', applyFilters);
     document.getElementById('logoutBtn')?.addEventListener('click', handleLogout);
     document.getElementById('versionBadge')?.addEventListener('click', openVersionModal);
@@ -507,7 +545,7 @@ function wireListeners() {
     document.getElementById('closeModal')?.addEventListener('click', () => document.getElementById('emailModal').classList.remove('active'));
 
     // Close modals on backdrop click
-    ['versionModal', 'emailModal'].forEach(id => {
+    ['versionModal', 'emailModal', 'reportModal'].forEach(id => {
         document.getElementById(id)?.addEventListener('click', e => {
             if (e.target.id === id) document.getElementById(id).classList.remove('active');
         });

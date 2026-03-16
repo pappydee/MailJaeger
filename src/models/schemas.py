@@ -135,6 +135,18 @@ class DashboardResponse(BaseModel):
     # Live in-progress run state (same source as /api/status).
     # When no run is active this mirrors the last completed run_status.
     run_status: Optional[dict] = None
+    # True when a daily report has been generated and is ready to view.
+    daily_report_available: bool = False
+
+
+class DailyReportResponse(BaseModel):
+    generated_at: str
+    period_hours: int = 24
+    total_processed: int = 0
+    action_required: int = 0
+    spam_detected: int = 0
+    unresolved: int = 0
+    report_text: str  # AI-generated markdown/plain-text summary
 
 
 class EmailListRequest(BaseModel):

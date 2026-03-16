@@ -120,6 +120,14 @@ class Settings(BaseSettings):
         default="30m", description="How long Ollama keeps model in memory"
     )
 
+    # AI Batch Processing
+    ai_batch_size: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="Number of emails to send in a single AI batch analysis request (AI_BATCH_SIZE)",
+    )
+
     # Processing Configuration
     spam_threshold: float = Field(
         default=0.7, ge=0.0, le=1.0, description="Spam probability threshold"
@@ -144,7 +152,7 @@ class Settings(BaseSettings):
 
     # Scheduling
     schedule_time: str = Field(
-        default="08:00", description="Daily schedule time (HH:MM)"
+        default="02:00", description="Daily schedule time (HH:MM)"
     )
     schedule_timezone: str = Field(
         default="Europe/Berlin", description="Timezone for scheduling"
