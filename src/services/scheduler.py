@@ -23,10 +23,18 @@ logger = get_logger(__name__)
 
 @dataclass
 class RunStatus:
-    """Shared mutable state describing the current or most-recent processing run."""
+    """Shared mutable state describing the current or most-recent processing run.
+
+    Valid ``status`` values (all lowercase):
+      idle | running | cancelling | cancelled | success | failed
+
+    Valid ``phase`` values:
+      None (idle/finished) | ingestion | analysis
+    """
 
     run_id: Optional[int] = None
-    status: str = "idle"  # idle | running | success | failed
+    status: str = "idle"  # idle | running | cancelling | cancelled | success | failed
+    phase: Optional[str] = None  # None | ingestion | analysis
     current_step: Optional[str] = None
     progress_percent: int = 0
     processed: int = 0
@@ -37,10 +45,13 @@ class RunStatus:
     started_at: Optional[str] = None
     last_update: Optional[str] = None
     message: str = ""
+    # Set to True to ask the running job to stop at the next safe checkpoint.
+    cancel_requested: bool = False
 
     def reset(self) -> None:
         self.run_id = None
         self.status = "idle"
+        self.phase = None
         self.current_step = None
         self.progress_percent = 0
         self.processed = 0
@@ -51,6 +62,16 @@ class RunStatus:
         self.started_at = None
         self.last_update = None
         self.message = ""
+        self.cancel_requested = False
+
+    def request_cancel(self) -> bool:
+        """Signal a running job to stop.  Returns True if the signal was set."""
+        if self.status not in ("running", "cancelling"):
+            return False
+        self.cancel_requested = True
+        self.status = "cancelling"
+        self.last_update = datetime.utcnow().isoformat()
+        return True
 
     def update(self, **kwargs) -> None:
         for k, v in kwargs.items():
@@ -62,6 +83,7 @@ class RunStatus:
         return {
             "run_id": self.run_id,
             "status": self.status,
+            "phase": self.phase,
             "current_step": self.current_step,
             "progress_percent": self.progress_percent,
             "processed": self.processed,
@@ -72,6 +94,7 @@ class RunStatus:
             "started_at": self.started_at,
             "last_update": self.last_update,
             "message": self.message,
+            "cancel_requested": self.cancel_requested,
         }
 
 
@@ -203,13 +226,21 @@ class SchedulerService:
                     "SUCCESS": "success",
                     "FAILURE": "failed",
                     "PARTIAL": "success",
+                    "CANCELLED": "cancelled",
                 }
                 final_status = status_map.get(run.status, "idle")
+                # Show 100 % for any completed run; for CANCELLED keep the
+                # partial progress so the user can see how far the run got.
+                final_pct = (
+                    _run_status.progress_percent
+                    if run.status == "CANCELLED"
+                    else 100
+                )
                 _run_status.update(
                     run_id=run.id,
                     status=final_status,
                     current_step=None,
-                    progress_percent=100,
+                    progress_percent=final_pct,
                     message=f"Completed: {run.status}",
                 )
         except Exception as e:
@@ -234,9 +265,9 @@ class SchedulerService:
             return int(hour), int(minute)
         except (ValueError, AttributeError) as e:
             logger.warning(
-                f"Invalid schedule time: {self.settings.schedule_time}, using default 08:00"
+                f"Invalid schedule time: {self.settings.schedule_time}, using default 02:00"
             )
-            return 8, 0
+            return 2, 0
 
     def _job_executed(self, event):
         """Callback for successful job execution"""

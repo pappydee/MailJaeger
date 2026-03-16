@@ -20,9 +20,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies.
+# ca-certificates is required for the optional custom-cert import mechanism
+# (see scripts/entrypoint.sh and docker-compose.yml certs volume comment).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies directly in runtime
@@ -36,6 +39,10 @@ RUN python -c "import uvicorn; print(uvicorn.__version__)"
 COPY src/ ./src/
 COPY frontend/ ./frontend/
 COPY cli.py .
+
+# Copy entrypoint script (handles optional custom CA cert import at startup)
+COPY scripts/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 # Create necessary directories with restrictive permissions
 RUN mkdir -p /app/data /app/data/logs /app/data/search_index /app/data/attachments && \
@@ -54,6 +61,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:8000/api/health || exit 1
 
-# Run application using Python module syntax with configurable host/port
-# Default to localhost (127.0.0.1) if SERVER_HOST is not set for safety
-CMD python -m uvicorn src.main:app --host ${SERVER_HOST:-127.0.0.1} --port ${SERVER_PORT}
+# Use entrypoint script so optional custom CA certs can be imported at startup.
+# The entrypoint defaults to binding on ${SERVER_HOST:-127.0.0.1} (localhost-only)
+# unless SERVER_HOST is explicitly set to 0.0.0.0 in docker-compose or .env.
+CMD ["/entrypoint.sh"]

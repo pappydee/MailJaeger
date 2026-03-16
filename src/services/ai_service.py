@@ -266,9 +266,9 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
         # Convert to string and truncate if needed
         str_value = str(value)[:max_length]
 
-        # Basic sanitization - remove control characters except newlines/tabs
-        # Using regex for better performance on large strings
-        sanitized = re.sub(r"[^\x20-\x7E\n\t]", "", str_value)
+        # Strip control characters but preserve Unicode (including German umlauts: ä ö ü ß)
+        # Allow printable ASCII, Unicode letters/digits/punctuation, newlines and tabs
+        sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str_value)
 
         return sanitized.strip()
 
@@ -418,12 +418,143 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
         content = f"{subject} {body}"
         return any(indicator in content for indicator in action_indicators)
 
+    def analyze_emails_batch(
+        self, emails: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Analyse a batch of emails in a single LLM request.
+
+        Each item in ``emails`` must have: id, subject, sender,
+        body_plain (optional), body_html (optional).
+
+        Returns a list of analysis dicts in the same order as ``emails``.
+        On any failure the corresponding entry falls back to
+        ``_fallback_classification``.
+        """
+        if not emails:
+            return []
+
+        # Build a combined prompt that asks the model to return a JSON array
+        entries = []
+        for i, email_data in enumerate(emails):
+            content = self._prepare_content(email_data)
+            entries.append(f"### Email {i + 1} (id={email_data.get('id', i)})\n{content}")
+
+        combined = "\n\n".join(entries)
+
+        prompt = f"""Analysiere die folgenden {len(emails)} E-Mails und gib eine strukturierte Antwort als JSON-Array zurück.
+
+{combined}
+
+Antworte mit einem JSON-Array mit {len(emails)} Objekten in der gleichen Reihenfolge:
+[
+  {{
+    "email_id": <id aus dem Header>,
+    "summary": "Kurze Zusammenfassung auf Deutsch",
+    "category": "Klinik|Forschung|Privat|Verwaltung|Unklar",
+    "spam_probability": 0.0-1.0,
+    "action_required": true/false,
+    "priority": "LOW|MEDIUM|HIGH",
+    "tasks": [],
+    "suggested_folder": "Archive|Klinik|Forschung|Privat|Verwaltung|Important|Later",
+    "reasoning": "Kurze Begründung"
+  }},
+  ...
+]
+
+Antworte NUR mit dem JSON-Array, keine zusätzlichen Erklärungen."""
+
+        try:
+            raw = self._call_ai_service(prompt)
+            if not raw:
+                raise ValueError("Empty AI response")
+
+            batch_results = self._parse_batch_response(raw, emails)
+            return batch_results
+
+        except Exception as e:
+            sanitized = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Batch AI analysis failed ({len(emails)} emails): {sanitized}")
+            return [self._fallback_classification(e) for e in emails]
+
+    def _parse_batch_response(
+        self, response: str, emails: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse a JSON-array response for batch analysis.
+
+        Falls back to individual fallback classification for any entry that
+        cannot be parsed or validated.
+        """
+        # Extract the JSON array from the response text
+        stripped = response.strip()
+
+        # Try code fence first
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", stripped)
+        if fence_match:
+            candidate = fence_match.group(1).strip()
+            if candidate.startswith("["):
+                stripped = candidate
+
+        # Find first [ ... last ]
+        arr_start = stripped.find("[")
+        arr_end = stripped.rfind("]") + 1
+        if arr_start == -1 or arr_end <= arr_start:
+            raise ValueError("No JSON array found in batch AI response")
+
+        json_str = stripped[arr_start:arr_end]
+        raw_list = json.loads(json_str)
+
+        if not isinstance(raw_list, list):
+            raise ValueError("Batch AI response is not a JSON array")
+
+        # Build a lookup by email_id if the model returned ids
+        id_to_result: Dict[Any, Dict] = {}
+        for item in raw_list:
+            if isinstance(item, dict) and "email_id" in item:
+                id_to_result[item["email_id"]] = item
+
+        results = []
+        for i, email_data in enumerate(emails):
+            email_id = email_data.get("id", i)
+            raw_item = id_to_result.get(email_id) or (raw_list[i] if i < len(raw_list) else None)
+            if raw_item:
+                try:
+                    analysis = self._parse_ai_response(json.dumps(raw_item))
+                    results.append(analysis)
+                except Exception as e:
+                    sanitized = sanitize_error(e, debug=self.settings.debug)
+                    logger.warning(
+                        f"Failed to parse batch result for email {email_id}: {sanitized}"
+                    )
+                    results.append(self._fallback_classification(email_data))
+            else:
+                results.append(self._fallback_classification(email_data))
+
+        return results
+
+    def generate_report(self, prompt: str) -> Optional[str]:
+        """
+        Generate a free-form text report using the configured AI model.
+
+        Unlike ``analyze_email`` / ``analyze_emails_batch`` this method
+        returns the raw AI response string rather than parsing it into a
+        structured dict.  Callers are responsible for handling a ``None``
+        response (AI unavailable) gracefully.
+        """
+        try:
+            return self._call_ai_service(prompt)
+        except Exception as e:
+            sanitized = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Report generation failed: {sanitized}")
+            return None
+
     def check_health(self) -> Dict[str, Any]:
         """Check AI service health"""
         try:
             url = f"{self.settings.ai_endpoint}/api/tags"
 
-            with httpx.Client(timeout=5) as client:
+            with httpx.Client(timeout=self.settings.ai_timeout) as client:
                 response = client.get(url)
                 response.raise_for_status()
 

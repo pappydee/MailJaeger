@@ -22,6 +22,7 @@ from src.models.schemas import (
     EmailResponse,
     EmailDetailResponse,
     DashboardResponse,
+    DailyReportResponse,
     ProcessingRunResponse,
     EmailListRequest,
     SearchRequest,
@@ -46,6 +47,7 @@ from src.services.search_service import SearchService
 from src.services.learning_service import LearningService
 from src.services.email_processor import EmailProcessor
 from src.middleware.auth import require_authentication, AuthenticationError
+from src.middleware.session_store import _sessions, SESSION_COOKIE, SESSION_EXPIRY_HOURS
 from src.middleware.security_headers import SecurityHeadersMiddleware
 from src.middleware.allowed_hosts import AllowedHostsMiddleware
 from src.middleware.rate_limiting import limiter, rate_limit_exceeded_handler
@@ -57,11 +59,10 @@ from src import __version__, CHANGELOG
 setup_logging()
 logger = get_logger(__name__)
 
-# In-memory session store: token -> expiry datetime
-# Sessions are lost on restart (acceptable for a local tool).
-_sessions: Dict[str, datetime] = {}
-SESSION_COOKIE = "mailjaeger_session"
-SESSION_EXPIRY_HOURS = 24
+# In-memory session store: imported from session_store so that
+# require_authentication() in auth.py can validate cookies without a
+# circular import.  _sessions is the same dict object in both modules.
+# (SESSION_COOKIE and SESSION_EXPIRY_HOURS are also imported above.)
 
 # Settings with validation
 try:
@@ -95,6 +96,25 @@ app = FastAPI(
     docs_url="/api/docs",
     redoc_url="/api/redoc",
 )
+
+
+def _service_is_unhealthy(health: dict) -> bool:
+    """Return True when a service health-check dict indicates a non-healthy state."""
+    return isinstance(health, dict) and health.get("status") not in ("healthy", "ok")
+
+
+def _daily_report_available(db: Session) -> bool:
+    """Return True when at least one email was processed in the last 24 hours."""
+    try:
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+        count = (
+            db.query(ProcessedEmail)
+            .filter(ProcessedEmail.processed_at >= cutoff)
+            .count()
+        )
+        return count > 0
+    except Exception:
+        return False
 
 
 # Global authentication middleware (fail-closed)
@@ -531,9 +551,20 @@ async def get_dashboard(db: Session = Depends(get_db)):
         imap_service = IMAPService()
         ai_service = AIService()
 
+        imap_health = imap_service.check_health()
+        ai_health = ai_service.check_health()
+
+        # Derive an overall system status:
+        #   OK       — all critical services healthy
+        #   DEGRADED — at least one service is unhealthy but the app is running
+        #   ERROR    — critical failure (reserved for future use)
+        degraded = _service_is_unhealthy(imap_health) or _service_is_unhealthy(ai_health)
+        overall_status = "DEGRADED" if degraded else "OK"
+
         health_status = {
-            "mail_server": imap_service.check_health(),
-            "ai_service": ai_service.check_health(),
+            "overall_status": overall_status,
+            "mail_server": imap_health,
+            "ai_service": ai_health,
             "database": {"status": "healthy", "message": "Database operational"},
             "scheduler": scheduler.get_status(),
         }
@@ -545,6 +576,8 @@ async def get_dashboard(db: Session = Depends(get_db)):
             action_required_count=action_required_count,
             unresolved_count=unresolved_count,
             health_status=health_status,
+            run_status=get_run_status().to_dict(),
+            daily_report_available=_daily_report_available(db),
         )
 
     except Exception as e:
@@ -852,6 +885,30 @@ async def trigger_processing(
                 else sanitized_error
             ),
         )
+
+
+@app.post("/api/processing/cancel", dependencies=[Depends(require_authentication)])
+@limiter.limit("10/minute")
+async def cancel_processing(request: Request):
+    """
+    Request cancellation of the currently running processing job.
+
+    If a run is active its status transitions to "cancelling"; the processing
+    loop checks this flag before each email and exits cleanly, persisting
+    partial progress.  The final run status in the DB is set to CANCELLED.
+
+    Returns:
+      success=True  when the cancel signal was accepted (run was active)
+      success=False when there is no active run to cancel
+    """
+    run_status = get_run_status()
+    accepted = run_status.request_cancel()
+    return {
+        "success": accepted,
+        "message": "Cancellation requested" if accepted else "No active run to cancel",
+        "run_id": run_status.run_id,
+        "status": run_status.status,
+    }
 
 
 @app.get(
@@ -1696,6 +1753,114 @@ async def health_check():
             "scheduler": get_scheduler().get_status(),
         },
     }
+
+
+@app.get(
+    "/api/reports/daily",
+    response_model=DailyReportResponse,
+    dependencies=[Depends(require_authentication)],
+)
+@limiter.limit("10/minute")
+async def get_daily_report(request: Request, db: Session = Depends(get_db)):
+    """
+    Generate and return a daily AI-powered email summary report.
+
+    Analyses emails processed in the last 24 hours and asks the local
+    Ollama AI model to produce a structured German-language summary covering:
+    - important emails
+    - emails requiring action
+    - spam filtered
+    - unresolved threads
+    - suggested actions
+    """
+    try:
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+
+        recent_emails = (
+            db.query(ProcessedEmail)
+            .filter(ProcessedEmail.processed_at >= cutoff)
+            .order_by(ProcessedEmail.processed_at.desc())
+            .limit(100)  # cap to keep the prompt manageable
+            .all()
+        )
+
+        total_processed = len(recent_emails)
+        action_required_count = sum(
+            1 for e in recent_emails if e.action_required
+        )
+        spam_count = sum(1 for e in recent_emails if e.is_spam)
+        unresolved_count = sum(
+            1 for e in recent_emails if e.action_required and not e.is_resolved
+        )
+
+        # Build a structured prompt for the AI
+        email_summaries = []
+        for e in recent_emails[:30]:  # include top 30 in prompt to stay concise
+            parts = [f"- {e.sender or '?'}: {e.subject or '(kein Betreff)'}"]
+            if e.action_required:
+                parts.append("[Aktion erforderlich]")
+            if e.is_spam:
+                parts.append("[Spam]")
+            if e.summary:
+                parts.append(f"({e.summary[:120]})")
+            email_summaries.append(" ".join(parts))
+
+        email_list_str = "\n".join(email_summaries) if email_summaries else "(keine)"
+
+        prompt = f"""Erstelle einen täglichen E-Mail-Bericht auf Deutsch basierend auf den folgenden verarbeiteten E-Mails der letzten 24 Stunden.
+
+Statistiken:
+- Verarbeitete E-Mails: {total_processed}
+- Aktion erforderlich: {action_required_count}
+- Spam erkannt: {spam_count}
+- Ungelöst: {unresolved_count}
+
+E-Mails:
+{email_list_str}
+
+Erstelle einen strukturierten Bericht mit den folgenden Abschnitten:
+1. Zusammenfassung (2-3 Sätze)
+2. Wichtige E-Mails (maximal 5)
+3. Aktionen erforderlich (mit konkreten Vorschlägen)
+4. Spam-Filter-Ergebnis
+5. Empfohlene nächste Schritte
+
+Halte den Bericht präzise und handlungsorientiert."""
+
+        ai_service = AIService()
+        raw_response = ai_service.generate_report(prompt)
+
+        if raw_response and raw_response.strip():
+            report_text = raw_response.strip()
+        else:
+            # Fallback: generate a plain-text summary without AI
+            lines = [
+                f"Täglicher E-Mail-Bericht ({datetime.utcnow().strftime('%d.%m.%Y')})",
+                "",
+                "Zusammenfassung",
+                f"• {total_processed} E-Mails verarbeitet",
+                f"• {action_required_count} erfordern eine Aktion",
+                f"• {spam_count} Spam erkannt",
+                f"• {unresolved_count} ungelöst",
+                "",
+                "(KI-Zusammenfassung nicht verfügbar — Ollama nicht erreichbar)",
+            ]
+            report_text = "\n".join(lines)
+
+        return DailyReportResponse(
+            generated_at=datetime.utcnow().isoformat(),
+            period_hours=24,
+            total_processed=total_processed,
+            action_required=action_required_count,
+            spam_detected=spam_count,
+            unresolved=unresolved_count,
+            report_text=report_text,
+        )
+
+    except Exception as e:
+        sanitized_error = sanitize_error(e, debug=settings.debug)
+        logger.error(f"Daily report generation failed: {sanitized_error}")
+        raise HTTPException(status_code=500, detail="Report generation failed")
 
 
 if __name__ == "__main__":

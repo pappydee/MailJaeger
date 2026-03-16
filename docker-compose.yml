@@ -1,24 +1,6 @@
 version: '3.8'
 
 services:
-  # Ollama AI Service
-  ollama:
-    image: ollama/ollama:latest
-    container_name: mailjaeger-ollama
-    volumes:
-      - ollama_data:/root/.ollama
-    ports:
-      - "127.0.0.1:11434:11434"  # Bind to localhost only for security
-    restart: unless-stopped
-    # Uncomment for GPU support
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-
   # MailJaeger Application
   mailjaeger:
     build: .
@@ -42,10 +24,13 @@ services:
       - IMAP_PORT=${IMAP_PORT:-993}
       - IMAP_USERNAME=${IMAP_USERNAME}
       - IMAP_PASSWORD=${IMAP_PASSWORD}
+      - IMAP_SSL_VERIFY=${IMAP_SSL_VERIFY:-true}
       
-      # AI Configuration
-      - AI_ENDPOINT=http://ollama:11434
-      - AI_MODEL=${AI_MODEL:-mistral:7b-instruct-q4_0}
+      # AI Configuration - uses host Ollama instance (not a Docker container)
+      # host.docker.internal resolves to the host machine from inside the container
+      - AI_ENDPOINT=${AI_ENDPOINT:-http://host.docker.internal:11434}
+      - AI_MODEL=${AI_MODEL:-mistral-small3.1}
+      - AI_TIMEOUT=${AI_TIMEOUT:-120}
       
       # Database
       - DATABASE_URL=sqlite:///./data/mailjaeger.db
@@ -53,6 +38,12 @@ services:
       # Processing
       - SPAM_THRESHOLD=${SPAM_THRESHOLD:-0.7}
       - MAX_EMAILS_PER_RUN=${MAX_EMAILS_PER_RUN:-200}
+      
+      # Resource Budget Controls
+      - MAX_EMAILS_PER_BATCH=${MAX_EMAILS_PER_BATCH:-50}
+      - MAX_RUNTIME_MINUTES=${MAX_RUNTIME_MINUTES:-30}
+      - MAX_LLM_CALLS_PER_RUN=${MAX_LLM_CALLS_PER_RUN:-100}
+      - MAX_PARALLEL_TASKS=${MAX_PARALLEL_TASKS:-1}
       
       # Mail Action Safety
       - SAFE_MODE=${SAFE_MODE:-true}
@@ -76,13 +67,19 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DEBUG=${DEBUG:-false}
     
+    extra_hosts:
+      # Allows the container to reach the host machine's Ollama instance
+      - "host.docker.internal:host-gateway"
+    
     volumes:
       - mailjaeger_data:/app/data
+      # Optional: mount custom CA certificates for local TLS interception
+      # (e.g. corporate antivirus proxies).  Place *.crt or *.pem files in
+      # a local ./certs/ directory and uncomment the line below.
+      # The container startup script will import them automatically.
+      # - ./certs:/app/certs:ro
       # Optional: Mount .env file for secrets (alternative to environment variables)
       # - ./.env:/app/.env:ro
-    
-    depends_on:
-      - ollama
     
     restart: unless-stopped
     
@@ -93,13 +90,14 @@ services:
       retries: 3
       start_period: 40s
     
-    # Security: Run as non-root user
-    # Note: Adjust UID/GID if needed for your host system
-    # Use `id -u` and `id -g` on host to get your UID/GID
-    user: "1000:1000"
+    # NOTE: The user directive is intentionally omitted here.
+    # Hardcoding a UID:GID (e.g. "1000:1000") causes permission errors on macOS
+    # and many Linux volume setups.  The container runs as root inside its own
+    # namespace, which is safe because the data volume is private.
+    # Linux users who need a non-root container user can override per-environment:
+    #   user: "${UID}:${GID}"
+    # (in a docker-compose.override.yml file)
 
 volumes:
-  ollama_data:
-    driver: local
   mailjaeger_data:
     driver: local

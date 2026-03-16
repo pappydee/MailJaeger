@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     imap_host: str = Field(description="IMAP server hostname")
     imap_port: int = Field(default=993, description="IMAP server port")
     imap_use_ssl: bool = Field(default=True, description="Use SSL for IMAP")
+    imap_ssl_verify: bool = Field(
+        default=True,
+        description="Verify SSL certificate for IMAP (set false to accept antivirus-injected certs)",
+    )
     imap_username: str = Field(description="IMAP username")
     imap_password: str = Field(default="", description="IMAP password")
     imap_password_file: Optional[str] = Field(
@@ -92,11 +96,12 @@ class Settings(BaseSettings):
 
     # AI Configuration
     ai_endpoint: str = Field(
-        default="http://localhost:11434", description="Local AI endpoint (Ollama)"
+        default="http://host.docker.internal:11434",
+        description="Local AI endpoint (Ollama on host machine)",
     )
     ai_model: str = Field(
-        default="mistral:7b-instruct-q4_0",
-        description="AI model to use (recommended: mistral:7b-instruct-q4_0, phi3:mini, or llama3.2:3b for Raspberry Pi 5)",
+        default="mistral-small3.1",
+        description="AI model to use (e.g. mistral-small3.1, mistral:7b-instruct-q4_0, phi3:mini)",
     )
     ai_timeout: int = Field(default=30, description="AI request timeout in seconds")
 
@@ -115,6 +120,14 @@ class Settings(BaseSettings):
         default="30m", description="How long Ollama keeps model in memory"
     )
 
+    # AI Batch Processing
+    ai_batch_size: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="Number of emails to send in a single AI batch analysis request (AI_BATCH_SIZE)",
+    )
+
     # Processing Configuration
     spam_threshold: float = Field(
         default=0.7, ge=0.0, le=1.0, description="Spam probability threshold"
@@ -123,9 +136,23 @@ class Settings(BaseSettings):
         default=200, description="Maximum emails to process per run"
     )
 
+    # Resource Budget Controls (Priority 8)
+    max_emails_per_batch: int = Field(
+        default=50, description="Maximum emails per batch (controls memory usage)"
+    )
+    max_runtime_minutes: int = Field(
+        default=30, description="Maximum processing run time in minutes"
+    )
+    max_llm_calls_per_run: int = Field(
+        default=100, description="Maximum LLM calls per processing run"
+    )
+    max_parallel_tasks: int = Field(
+        default=1, description="Maximum parallel processing tasks"
+    )
+
     # Scheduling
     schedule_time: str = Field(
-        default="08:00", description="Daily schedule time (HH:MM)"
+        default="02:00", description="Daily schedule time (HH:MM)"
     )
     schedule_timezone: str = Field(
         default="Europe/Berlin", description="Timezone for scheduling"

@@ -261,5 +261,44 @@ class TestStatusEndpoint:
             )
 
 
+    def test_status_with_session_cookie_returns_200(self):
+        """
+        Regression test for the browser login-loop bug.
+
+        Symptoms before fix:
+          - /api/auth/verify returned 200 (cookie was valid)
+          - /api/status (and other protected routes) returned 401
+          - frontend reloaded endlessly
+
+        Root cause: require_authentication() only accepted Bearer tokens and
+        ignored valid session cookies set by POST /api/auth/login.
+
+        This test verifies the complete browser authentication flow:
+          login → cookie → protected route → 200.
+        """
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            reload_settings()
+            from src.main import app
+
+            client = TestClient(app, raise_server_exceptions=False)
+
+            # Step 1: log in — obtain a session cookie
+            login = client.post(
+                "/api/auth/login",
+                json={"api_key": "test_secret_key_12345"},
+            )
+            assert login.status_code == 200, "Login must succeed"
+            assert "mailjaeger_session" in login.cookies, "Login must set session cookie"
+
+            # Step 2: access a protected route using the session cookie only
+            # TestClient carries cookies automatically across requests.
+            response = client.get("/api/status")
+            assert response.status_code == 200, (
+                "Protected route must return 200 when authenticated via session cookie "
+                "(was 401 before the fix — browser login loop bug)"
+            )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

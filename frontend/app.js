@@ -139,23 +139,38 @@ async function pollStatus() {
 }
 
 function renderStatus(d) {
-    const section = document.getElementById('progressSection');
-    const label   = document.getElementById('progressLabel');
-    const pctEl   = document.getElementById('progressPercent');
-    const bar     = document.getElementById('progressBar');
-    const counts  = document.getElementById('progressCounts');
-    const trigBtn = document.getElementById('triggerProcessing');
-    const trigLbl = document.getElementById('triggerLabel');
-    const trigIco = document.getElementById('triggerIcon');
+    const section   = document.getElementById('progressSection');
+    const label     = document.getElementById('progressLabel');
+    const pctEl     = document.getElementById('progressPercent');
+    const bar       = document.getElementById('progressBar');
+    const counts    = document.getElementById('progressCounts');
+    const trigBtn   = document.getElementById('triggerProcessing');
+    const trigLbl   = document.getElementById('triggerLabel');
+    const trigIco   = document.getElementById('triggerIcon');
+    const cancelBtn = document.getElementById('cancelRunBtn');
 
-    if (d.status === 'running') {
+    const isActive = isActiveRun(d.status);
+
+    if (isActive) {
         _isProcessing = true;
         section.style.display = 'block';
-        label.textContent  = d.current_step || 'Verarbeitung läuft…';
-        pctEl.textContent  = `${d.progress_percent || 0} %`;
-        bar.style.width    = `${d.progress_percent || 0}%`;
 
-        // Count detail
+        // Phase badge: show ingestion vs analysis phase label
+        const phaseLabel = d.phase === 'ingestion' ? '📥 Einlesen' : d.phase === 'analysis' ? '🔍 Analyse' : '';
+
+        if (d.status === 'cancelling') {
+            label.textContent = 'Wird abgebrochen…';
+            bar.style.background = 'var(--warning)';
+        } else {
+            const stepText = d.current_step || 'Verarbeitung läuft…';
+            label.textContent = phaseLabel ? `${phaseLabel} · ${stepText}` : stepText;
+            bar.style.background = d.phase === 'ingestion' ? 'var(--secondary)' : '';
+        }
+
+        pctEl.textContent = `${d.progress_percent || 0} %`;
+        bar.style.width   = `${d.progress_percent || 0}%`;
+
+        // Count detail — all from same run_status object
         const parts = [];
         if (d.total > 0) parts.push(`${d.processed}/${d.total} verarbeitet`);
         if (d.spam > 0)  parts.push(`${d.spam} Spam`);
@@ -163,26 +178,32 @@ function renderStatus(d) {
         if (d.failed > 0) parts.push(`${d.failed} Fehler`);
         counts.innerHTML = parts.map(p => `<span>${escHtml(p)}</span>`).join('');
 
-        // Button spinner
+        // Cancel button: visible during active run, disabled while already cancelling
+        if (cancelBtn) {
+            cancelBtn.style.display = 'inline-flex';
+            cancelBtn.disabled = d.status === 'cancelling';
+            cancelBtn.textContent = d.status === 'cancelling' ? 'Wird abgebrochen…' : 'Abbrechen';
+        }
+
+        // Trigger button: disabled while running
         if (trigBtn) {
             trigBtn.disabled = true;
             if (trigIco) trigIco.outerHTML = '<span class="spinner" id="triggerIcon"></span>';
             if (trigLbl) trigLbl.textContent = 'Läuft…';
         }
+
+        // "Letzte Verarbeitung" section: show LIVE data from run_status (not stale DB)
+        renderLastRunFromStatus(d);
+
     } else {
-        // Completed or idle
-        if (_isProcessing && (d.status === 'success' || d.status === 'failed')) {
-            // Run just finished — refresh list once
-            loadDashboard();
-            loadEmails();
-            if (d.status === 'success') showToast('Verarbeitung abgeschlossen ✓', 'success');
-            else showToast('Verarbeitung mit Fehler beendet', 'error');
-        }
-        _isProcessing = (d.status === 'running');
+        // Not active: idle / success / failed / cancelled
+        const wasActive = _isProcessing;
+        _isProcessing = false;
 
-        if (!_isProcessing) section.style.display = 'none';
+        section.style.display = 'none';
+        if (cancelBtn) cancelBtn.style.display = 'none';
 
-        // Restore button
+        // Restore trigger button
         if (trigBtn) {
             trigBtn.disabled = false;
             const ico = document.getElementById('triggerIcon');
@@ -194,6 +215,37 @@ function renderStatus(d) {
             }
             if (trigLbl) trigLbl.textContent = 'Jetzt verarbeiten';
         }
+
+        // If just finished: reload dashboard/list and show toast
+        if (wasActive) {
+            loadDashboard();
+            loadEmails();
+            if (d.status === 'success')   showToast('Verarbeitung abgeschlossen ✓', 'success');
+            else if (d.status === 'failed')    showToast('Verarbeitung mit Fehler beendet', 'error');
+            else if (d.status === 'cancelled') showToast('Verarbeitung abgebrochen', 'info');
+        }
+    }
+}
+
+/**
+ * Update the "Letzte Verarbeitung" info section with LIVE data from run_status.
+ * Called every 2 s while a run is active so the section never shows stale DB values.
+ */
+function renderLastRunFromStatus(d) {
+    const time      = document.getElementById('lastRunTime');
+    const processed = document.getElementById('lastRunProcessed');
+    const badge     = document.getElementById('lastRunStatus');
+
+    if (time && d.started_at) time.textContent = fmtDt(d.started_at);
+    if (processed) {
+        const p = d.processed || 0;
+        const t = d.total || 0;
+        const f = d.failed || 0;
+        processed.textContent = t > 0 ? `${p}/${t} (${f} Fehler)` : `${p} (${f} Fehler)`;
+    }
+    if (badge) {
+        badge.textContent = statusLabel(d.status);
+        badge.className   = 'info-badge ' + statusCls(d.status);
     }
 }
 
@@ -210,29 +262,59 @@ async function loadDashboard() {
         document.getElementById('unresolvedCount').textContent= d.unresolved_count ?? '–';
         document.getElementById('spamFiltered').textContent   = d.last_run?.emails_spam ?? '–';
 
-        const lr = d.last_run;
-        if (lr) {
-            document.getElementById('lastRunTime').textContent      = fmtDt(lr.started_at);
-            document.getElementById('lastRunProcessed').textContent = `${lr.emails_processed} (${lr.emails_failed} Fehler)`;
-            const badge = document.getElementById('lastRunStatus');
-            badge.textContent = lr.status;
-            badge.className   = 'info-badge ' + statusCls(lr.status);
-        } else {
-            document.getElementById('lastRunTime').textContent = 'Noch keine Verarbeitung';
+        // ── "Letzte Verarbeitung" ────────────────────────────────────────
+        // Rule: if a run is currently active (running / cancelling), the
+        // renderStatus() loop updates this section every 2 s from run_status.
+        // We only update it here (from the DB last_run record) when the
+        // backend is idle / completed, so we never overwrite live counters
+        // with stale DB data.
+        const liveStatus = d.run_status?.status;
+        const isLiveActive = isActiveRun(liveStatus);
+
+        if (!isLiveActive) {
+            const lr = d.last_run;
+            if (lr) {
+                document.getElementById('lastRunTime').textContent      = fmtDt(lr.started_at);
+                document.getElementById('lastRunProcessed').textContent = `${lr.emails_processed} (${lr.emails_failed} Fehler)`;
+                const badge = document.getElementById('lastRunStatus');
+                badge.textContent = statusLabel(lr.status);
+                badge.className   = 'info-badge ' + statusCls(lr.status);
+            } else {
+                document.getElementById('lastRunTime').textContent = 'Noch keine Verarbeitung';
+            }
         }
         document.getElementById('nextRunTime').textContent = d.next_scheduled_run ? fmtDt(d.next_scheduled_run) : 'Nicht geplant';
 
-        // Health
-        const hs = d.health_status;
-        const ok = hs?.mail_server?.status === 'healthy' && hs?.ai_service?.status === 'healthy';
-        const dot  = document.getElementById('healthDot');
-        const txt  = document.getElementById('healthText');
-        if (dot) dot.className = 'status-dot ' + (ok ? 'healthy' : 'unhealthy');
-        if (txt) txt.textContent = ok ? 'System OK' : 'Problem';
+        // ── Health badge ─────────────────────────────────────────────────
+        // Prefer the backend-computed overall_status; fall back to per-service
+        // check for backward compatibility with older backend versions.
+        const hs  = d.health_status;
+        const dot = document.getElementById('healthDot');
+        const txt = document.getElementById('healthText');
+        const overall = hs?.overall_status;
+        if (overall === 'OK') {
+            if (dot) dot.className = 'status-dot healthy';
+            if (txt) txt.textContent = 'System OK';
+        } else if (overall === 'DEGRADED') {
+            if (dot) dot.className = 'status-dot degraded';
+            if (txt) txt.textContent = 'Eingeschränkt';
+        } else if (overall === 'ERROR') {
+            if (dot) dot.className = 'status-dot unhealthy';
+            if (txt) txt.textContent = 'Fehler';
+        } else {
+            // Fallback: check individual services
+            const ok = hs?.mail_server?.status === 'healthy' && hs?.ai_service?.status === 'healthy';
+            if (dot) dot.className = 'status-dot ' + (ok ? 'healthy' : 'unhealthy');
+            if (txt) txt.textContent = ok ? 'System OK' : 'Problem';
+        }
 
         // Safe mode badge
         const smb = document.getElementById('safeModeBadge');
         if (smb) smb.style.display = d.safe_mode ? 'inline-block' : 'none';
+
+        // Daily report button
+        const reportBtn = document.getElementById('viewDailyReport');
+        if (reportBtn) reportBtn.style.display = d.daily_report_available ? 'inline-flex' : 'none';
 
     } catch (ex) {
         showToast('Dashboard konnte nicht geladen werden', 'error');
@@ -343,6 +425,23 @@ async function markResolved(id) {
     } catch { showToast('Fehler beim Markieren', 'error'); }
 }
 
+// ── Cancel processing ──────────────────────────────────────────────────
+async function cancelProcessing() {
+    const btn = document.getElementById('cancelRunBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Wird abgebrochen…'; }
+    try {
+        const r = await fetch(`${API_BASE}/api/processing/cancel`, { method: 'POST' });
+        if (!r.ok) {
+            showToast('Abbruch fehlgeschlagen', 'error');
+            // Re-enable button so user can retry
+            if (btn) { btn.disabled = false; btn.textContent = 'Abbrechen'; }
+        }
+    } catch {
+        showToast('Verbindungsfehler beim Abbrechen', 'error');
+        if (btn) { btn.disabled = false; btn.textContent = 'Abbrechen'; }
+    }
+}
+
 // ── Trigger processing ─────────────────────────────────────────────────
 async function triggerProcessing() {
     if (_isProcessing) return;
@@ -392,6 +491,34 @@ async function triggerProcessing() {
     }
 }
 
+// ── Daily report ───────────────────────────────────────────────────────
+async function openDailyReport() {
+    const modal = document.getElementById('reportModal');
+    const body  = document.getElementById('reportModalBody');
+    if (!modal || !body) return;
+    modal.classList.add('active');
+    body.innerHTML = '<div class="loading">Bericht wird erstellt…</div>';
+    try {
+        const r = await fetch(`${API_BASE}/api/reports/daily`);
+        if (!r.ok) { body.innerHTML = '<div class="loading">Fehler beim Laden des Berichts</div>'; return; }
+        const d = await r.json();
+        body.innerHTML = `
+            <div class="report-meta">
+                <span>Erstellt: ${fmtDt(d.generated_at)}</span>
+                <span>Zeitraum: letzte ${d.period_hours}h</span>
+            </div>
+            <div class="report-stats">
+                <span>📧 ${d.total_processed} verarbeitet</span>
+                <span>⚡ ${d.action_required} Aktion erforderlich</span>
+                <span>🚫 ${d.spam_detected} Spam</span>
+                <span>⏳ ${d.unresolved} ungelöst</span>
+            </div>
+            <pre class="report-text">${escHtml(d.report_text)}</pre>`;
+    } catch {
+        body.innerHTML = '<div class="loading">Fehler beim Laden des Berichts</div>';
+    }
+}
+
 // ── Filters ────────────────────────────────────────────────────────────
 function applyFilters() {
     const cat = document.getElementById('filterCategory').value;
@@ -408,6 +535,9 @@ function applyFilters() {
 // ── Event wiring ────────────────────────────────────────────────────────
 function wireListeners() {
     document.getElementById('triggerProcessing')?.addEventListener('click', triggerProcessing);
+    document.getElementById('cancelRunBtn')?.addEventListener('click', cancelProcessing);
+    document.getElementById('viewDailyReport')?.addEventListener('click', openDailyReport);
+    document.getElementById('closeReportModal')?.addEventListener('click', () => document.getElementById('reportModal').classList.remove('active'));
     document.getElementById('applyFilters')?.addEventListener('click', applyFilters);
     document.getElementById('logoutBtn')?.addEventListener('click', handleLogout);
     document.getElementById('versionBadge')?.addEventListener('click', openVersionModal);
@@ -415,7 +545,7 @@ function wireListeners() {
     document.getElementById('closeModal')?.addEventListener('click', () => document.getElementById('emailModal').classList.remove('active'));
 
     // Close modals on backdrop click
-    ['versionModal', 'emailModal'].forEach(id => {
+    ['versionModal', 'emailModal', 'reportModal'].forEach(id => {
         document.getElementById(id)?.addEventListener('click', e => {
             if (e.target.id === id) document.getElementById(id).classList.remove('active');
         });
@@ -430,6 +560,11 @@ function escHtml(s) {
     return d.innerHTML;
 }
 
+/** True when a processing run is currently in-flight (progress bar visible). */
+function isActiveRun(status) {
+    return status === 'running' || status === 'cancelling';
+}
+
 function fmtDate(s) {
     if (!s) return '–';
     return new Date(s).toLocaleDateString('de-DE', { year:'numeric', month:'2-digit', day:'2-digit' });
@@ -441,5 +576,24 @@ function fmtDt(s) {
 }
 
 function statusCls(s) {
-    return ({ SUCCESS: 'success', FAILURE: 'failure', PARTIAL: 'partial' })[s] || '';
+    return ({
+        // DB / backend uppercase
+        SUCCESS: 'success', FAILURE: 'failure', PARTIAL: 'partial',
+        CANCELLED: 'cancelled', IN_PROGRESS: 'running',
+        // run_status lowercase
+        success: 'success', failed: 'failure',
+        running: 'running', cancelling: 'cancelling', cancelled: 'cancelled',
+        idle: '',
+    })[s] || '';
+}
+
+function statusLabel(s) {
+    return ({
+        // DB / backend uppercase
+        SUCCESS: 'Erfolgreich', FAILURE: 'Fehler', PARTIAL: 'Teilweise',
+        CANCELLED: 'Abgebrochen', IN_PROGRESS: 'Läuft',
+        // run_status lowercase
+        idle: 'Bereit', running: 'Läuft', cancelling: 'Wird abgebrochen…',
+        cancelled: 'Abgebrochen', success: 'Erfolgreich', failed: 'Fehler',
+    })[s] || s || '–';
 }

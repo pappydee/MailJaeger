@@ -19,8 +19,8 @@ def test_default_settings():
     assert settings.imap_use_ssl is True
     assert settings.spam_threshold == 0.7
     assert settings.max_emails_per_run == 200
-    assert settings.schedule_time == "08:00"
-    assert settings.ai_model == "mistral:7b-instruct-q4_0"
+    assert settings.schedule_time == "02:00"
+    assert settings.ai_model == "mistral-small3.1"
 
 
 def test_custom_settings():

@@ -3,11 +3,13 @@ Authentication middleware for MailJaeger
 """
 
 import secrets
+from datetime import datetime
 from fastapi import Request, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
 
 from src.config import get_settings
+from src.middleware.session_store import _sessions, SESSION_COOKIE
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -83,6 +85,23 @@ async def require_authentication(request: Request) -> None:
         logger.error(f"No API keys configured - denying access to {request.url.path}")
         raise AuthenticationError("Unauthorized")
 
+    # --- Option 1: Session cookie (browser) ---
+    # `global_auth_middleware` in main.py also validates cookies at the HTTP
+    # middleware level, but that layer cannot short-circuit a Depends().
+    # require_authentication() is invoked *by FastAPI* after the middleware
+    # chain completes, so we must repeat the cookie check here to prevent
+    # browser-authenticated users from receiving 401 on every protected route
+    # (the login-loop bug).  Both layers share the same `_sessions` dict via
+    # src/middleware/session_store.py, so there is no duplication of state.
+    session_token = request.cookies.get(SESSION_COOKIE)
+    if session_token:
+        expiry = _sessions.get(session_token)
+        if expiry and expiry > datetime.utcnow():
+            logger.debug(f"Cookie-authenticated request to {request.url.path}")
+            return
+        # Expired or unknown session – fall through to Bearer check below
+
+    # --- Option 2: Bearer token (CLI / curl) ---
     # Get credentials from header
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):

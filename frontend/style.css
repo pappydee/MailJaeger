@@ -137,6 +137,7 @@ body {
 }
 .status-dot.healthy   { background: var(--success); }
 .status-dot.unhealthy { background: var(--danger); }
+.status-dot.degraded  { background: var(--warning); }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
 .status-text { font-size: 13px; font-weight: 500; color: var(--text); }
 
@@ -159,6 +160,8 @@ body {
 .btn-primary:hover:not(:disabled)  { background: var(--primary-dark); }
 .btn-secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
 .btn-secondary:hover:not(:disabled) { background: #F3F4F6; }
+.btn-danger   { background: var(--danger); color: white; }
+.btn-danger:hover:not(:disabled)   { background: #DC2626; }
 
 /* Spinner for loading state */
 .spinner {
@@ -221,6 +224,11 @@ body {
     color: var(--text-light);
 }
 .progress-counts span { white-space: nowrap; }
+.progress-actions {
+    margin-top: 12px;
+    display: flex;
+    justify-content: flex-end;
+}
 
 /* ── Dashboard Stats ────────────────────────────────────────────────── */
 .dashboard-stats {
@@ -279,9 +287,12 @@ body {
     background: #F3F4F6;
     color: var(--text);
 }
-.info-badge.success { background: #D1FAE5; color: #065F46; }
-.info-badge.failure { background: #FEE2E2; color: #991B1B; }
-.info-badge.partial { background: #FEF3C7; color: #92400E; }
+.info-badge.success    { background: #D1FAE5; color: #065F46; }
+.info-badge.failure    { background: #FEE2E2; color: #991B1B; }
+.info-badge.partial    { background: #FEF3C7; color: #92400E; }
+.info-badge.running    { background: #DBEAFE; color: #1E40AF; }
+.info-badge.cancelling { background: #FEF3C7; color: #92400E; }
+.info-badge.cancelled  { background: #F3F4F6; color: #374151; }
 
 /* ── Filters ─────────────────────────────────────────────────────────── */
 .filters {
@@ -456,4 +467,38 @@ body {
 @media (max-width: 390px) {
     .dashboard-stats { grid-template-columns: 1fr; }
     .email-header { flex-direction: column; }
+}
+
+/* ── Daily Report Modal ─────────────────────────────────────────────── */
+.report-meta {
+    display: flex;
+    gap: 16px;
+    font-size: 12px;
+    color: var(--text-light);
+    margin-bottom: 12px;
+}
+.report-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 13px;
+    font-weight: 500;
+    margin-bottom: 16px;
+    padding: 12px;
+    background: var(--background);
+    border-radius: 8px;
+}
+.report-text {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+    line-height: 1.7;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    max-height: 420px;
+    overflow-y: auto;
 }
