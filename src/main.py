@@ -46,6 +46,7 @@ from src.services.search_service import SearchService
 from src.services.learning_service import LearningService
 from src.services.email_processor import EmailProcessor
 from src.middleware.auth import require_authentication, AuthenticationError
+from src.middleware.session_store import _sessions, SESSION_COOKIE, SESSION_EXPIRY_HOURS
 from src.middleware.security_headers import SecurityHeadersMiddleware
 from src.middleware.allowed_hosts import AllowedHostsMiddleware
 from src.middleware.rate_limiting import limiter, rate_limit_exceeded_handler
@@ -57,11 +58,10 @@ from src import __version__, CHANGELOG
 setup_logging()
 logger = get_logger(__name__)
 
-# In-memory session store: token -> expiry datetime
-# Sessions are lost on restart (acceptable for a local tool).
-_sessions: Dict[str, datetime] = {}
-SESSION_COOKIE = "mailjaeger_session"
-SESSION_EXPIRY_HOURS = 24
+# In-memory session store: imported from session_store so that
+# require_authentication() in auth.py can validate cookies without a
+# circular import.  _sessions is the same dict object in both modules.
+# (SESSION_COOKIE and SESSION_EXPIRY_HOURS are also imported above.)
 
 # Settings with validation
 try:
