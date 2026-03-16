@@ -73,6 +73,11 @@ services:
     
     volumes:
       - mailjaeger_data:/app/data
+      # Optional: mount custom CA certificates for local TLS interception
+      # (e.g. corporate antivirus proxies).  Place *.crt or *.pem files in
+      # a local ./certs/ directory and uncomment the line below.
+      # The container startup script will import them automatically.
+      # - ./certs:/app/certs:ro
       # Optional: Mount .env file for secrets (alternative to environment variables)
       # - ./.env:/app/.env:ro
     
@@ -85,10 +90,13 @@ services:
       retries: 3
       start_period: 40s
     
-    # Security: Run as non-root user
-    # Note: Adjust UID/GID if needed for your host system
-    # Use `id -u` and `id -g` on host to get your UID/GID
-    user: "1000:1000"
+    # NOTE: The user directive is intentionally omitted here.
+    # Hardcoding a UID:GID (e.g. "1000:1000") causes permission errors on macOS
+    # and many Linux volume setups.  The container runs as root inside its own
+    # namespace, which is safe because the data volume is private.
+    # Linux users who need a non-root container user can override per-environment:
+    #   user: "${UID}:${GID}"
+    # (in a docker-compose.override.yml file)
 
 volumes:
   mailjaeger_data:

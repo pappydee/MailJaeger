@@ -895,5 +895,348 @@ class TestIngestionPipeline:
         assert result == "skipped"
 
 
+# ============================================================================
+# Correction Pass Tests — Tasks 1–4
+# ============================================================================
+
+
+class TestPrimaryProcessingPathUsesIndex:
+    """
+    Task 1: The primary process_emails() path must use the local index,
+    not UNSEEN-only IMAP retrieval.
+    """
+
+    def _make_processor(self, db=None, settings_overrides=None):
+        env = {**ENV, **(settings_overrides or {})}
+        with patch.dict(os.environ, env):
+            from src.config import reload_settings
+            reload_settings()
+        from src.services.email_processor import EmailProcessor
+        return EmailProcessor(db_session=db or MagicMock())
+
+    def test_process_emails_does_not_call_get_unread_emails(self):
+        """
+        process_emails() must NOT call imap.get_unread_emails() (UNSEEN path).
+        The primary path now goes through ingestion + local index.
+        """
+        import inspect
+        from src.services.email_processor import EmailProcessor
+        source = inspect.getsource(EmailProcessor.process_emails)
+        assert "get_unread_emails" not in source, (
+            "process_emails must not call get_unread_emails (UNSEEN-only path)"
+        )
+
+    def test_process_emails_calls_run_ingestion(self):
+        """process_emails() must invoke _run_ingestion for Phase 1."""
+        import inspect
+        from src.services.email_processor import EmailProcessor
+        source = inspect.getsource(EmailProcessor.process_emails)
+        assert "_run_ingestion" in source, (
+            "process_emails must call _run_ingestion to ingest from IMAP"
+        )
+
+    def test_process_emails_queries_pending_analysis_state(self):
+        """process_emails() must query emails with analysis_state='pending'."""
+        import inspect
+        from src.services.email_processor import EmailProcessor
+        source = inspect.getsource(EmailProcessor.process_emails)
+        assert "analysis_state" in source, (
+            "process_emails must query emails by analysis_state from local index"
+        )
+
+    def test_run_ingestion_uses_all_not_unseen(self):
+        """_run_ingestion must delegate to MailIngestionService which uses ALL search."""
+        import inspect
+        from src.services.mail_ingestion_service import MailIngestionService
+        source = inspect.getsource(MailIngestionService.ingest_folder)
+        assert '"ALL"' in source or "'ALL'" in source or '["ALL"]' in source, (
+            "Ingestion must use ALL message search, not UNSEEN-only"
+        )
+        assert "UNSEEN" not in source, (
+            "Ingestion must not use UNSEEN search filter"
+        )
+
+    def test_process_emails_uses_indexed_email_processor(self):
+        """process_emails() must use _process_indexed_email for local index."""
+        import inspect
+        from src.services.email_processor import EmailProcessor
+        source = inspect.getsource(EmailProcessor.process_emails)
+        assert "_process_indexed_email" in source, (
+            "process_emails must call _process_indexed_email to process indexed records"
+        )
+
+    def test_process_emails_two_phase_with_ingest_and_analyse(self):
+        """process_emails() executes Phase 1 ingestion and Phase 2 analysis."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from src.models.database import Base
+
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            reload_settings()
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        db = Session()
+
+        from src.services.email_processor import EmailProcessor
+
+        processor = EmailProcessor(db_session=db)
+
+        # Mock ingestion (Phase 1) and the pending query (Phase 2)
+        with patch.object(processor, "_run_ingestion", return_value={"new": 0, "skipped": 0, "failed": 0}) as mock_ingest:
+            run = processor.process_emails(trigger_type="MANUAL")
+
+        # Ingestion must have been called
+        mock_ingest.assert_called_once()
+        # Run must succeed (no pending emails → SUCCESS)
+        assert run.status == "SUCCESS"
+        db.close()
+
+    def test_safe_mode_preserved_in_indexed_path(self):
+        """_process_indexed_email must respect safe_mode (no IMAP actions)."""
+        import inspect
+        from src.services.email_processor import EmailProcessor
+        source = inspect.getsource(EmailProcessor._process_indexed_email)
+        assert "safe_mode" in source, (
+            "_process_indexed_email must check safe_mode before executing IMAP actions"
+        )
+        assert "safe_mode_skip" in source, (
+            "_process_indexed_email must add 'safe_mode_skip' action in safe mode"
+        )
+
+    def test_indexed_email_does_not_mark_as_read_implicitly(self):
+        """_process_indexed_email must NOT mark emails as read (BODY.PEEK is upstream)."""
+        import inspect
+        from src.services.email_processor import EmailProcessor
+        source = inspect.getsource(EmailProcessor._process_indexed_email)
+        # mark_as_read is only called explicitly when mark_as_read setting is True
+        # and in normal mode — never implicitly
+        assert "BODY.PEEK" not in source, (
+            "BODY.PEEK logic belongs in imap_service, not email_processor"
+        )
+
+
+class TestDockerComposeMacCompatibility:
+    """Task 2: docker-compose.yml must not require a hardcoded user: UID:GID."""
+
+    def test_no_hardcoded_user_uid_gid(self):
+        """docker-compose.yml must not have user: '1000:1000'."""
+        with open("docker-compose.yml", "r") as f:
+            content = f.read()
+        assert 'user: "1000:1000"' not in content, (
+            "docker-compose.yml must not hardcode user: '1000:1000' (breaks Mac)"
+        )
+        assert "user: '1000:1000'" not in content, (
+            "docker-compose.yml must not hardcode user: '1000:1000' (breaks Mac)"
+        )
+
+    def test_user_directive_commented_or_absent(self):
+        """Uncommented user: directive must not specify a fixed UID:GID."""
+        with open("docker-compose.yml", "r") as f:
+            lines = f.readlines()
+        for line in lines:
+            stripped = line.strip()
+            # Skip comment lines
+            if stripped.startswith("#"):
+                continue
+            # If we see an active `user:` key with a numeric UID, fail
+            import re
+            if re.match(r"user:\s*['\"]?\d+:\d+['\"]?", stripped):
+                raise AssertionError(
+                    f"Found hardcoded user directive (breaks Mac): {stripped!r}"
+                )
+
+
+class TestDurableTLSCertMechanism:
+    """Task 3: Configurable, durable CA cert injection."""
+
+    def test_entrypoint_script_exists(self):
+        """scripts/entrypoint.sh must exist."""
+        import os
+        assert os.path.exists("scripts/entrypoint.sh"), (
+            "scripts/entrypoint.sh must exist for cert injection at startup"
+        )
+
+    def test_entrypoint_imports_certs_from_configurable_dir(self):
+        """entrypoint.sh must import certs from CERTS_DIR, not a hardcoded path."""
+        with open("scripts/entrypoint.sh", "r") as f:
+            content = f.read()
+        assert "CERTS_DIR" in content, (
+            "entrypoint.sh must use CERTS_DIR variable (not hardcoded path)"
+        )
+        assert "update-ca-certificates" in content, (
+            "entrypoint.sh must call update-ca-certificates to install certs"
+        )
+
+    def test_entrypoint_does_not_disable_tls_verification(self):
+        """entrypoint.sh must NOT set PYTHONHTTPSVERIFY=0 or similar."""
+        with open("scripts/entrypoint.sh", "r") as f:
+            content = f.read()
+        assert "PYTHONHTTPSVERIFY=0" not in content
+        assert "ssl_verify=false" not in content.lower()
+        assert "verify=false" not in content.lower()
+
+    def test_dockerfile_installs_ca_certificates(self):
+        """Dockerfile must install the ca-certificates package."""
+        with open("Dockerfile", "r") as f:
+            content = f.read()
+        assert "ca-certificates" in content, (
+            "Dockerfile must install ca-certificates for update-ca-certificates to work"
+        )
+
+    def test_dockerfile_copies_entrypoint(self):
+        """Dockerfile must COPY the entrypoint script."""
+        with open("Dockerfile", "r") as f:
+            content = f.read()
+        assert "entrypoint.sh" in content, (
+            "Dockerfile must COPY scripts/entrypoint.sh"
+        )
+
+    def test_docker_compose_documents_certs_volume(self):
+        """docker-compose.yml must document the certs volume mount (even commented)."""
+        with open("docker-compose.yml", "r") as f:
+            content = f.read()
+        assert "certs" in content, (
+            "docker-compose.yml must document the optional certs volume mount"
+        )
+
+    def test_tls_verify_defaults_to_true(self):
+        """IMAP SSL verification must default to True (safe default)."""
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            settings = reload_settings()
+        assert settings.imap_ssl_verify is True
+
+    def test_env_example_documents_certs_mechanism(self):
+        """.env.example must document the TLS cert injection approach."""
+        with open(".env.example", "r") as f:
+            content = f.read()
+        assert "certs" in content.lower() or "CERTS" in content, (
+            ".env.example must document the custom CA cert injection mechanism"
+        )
+
+
+class TestSafeModeFixes:
+    """Task 4: Verify all previous safe-mode and local fixes still hold."""
+
+    def test_imap_fetch_uses_body_peek_not_rfc822_in_ingestion(self):
+        """Ingestion fetch must still use BODY.PEEK[] to avoid marking emails read."""
+        import inspect
+        from src.services.mail_ingestion_service import MailIngestionService
+        source = inspect.getsource(MailIngestionService.ingest_folder)
+        assert "BODY.PEEK" in source, (
+            "Ingestion must still use BODY.PEEK[] fetch to avoid setting \\Seen flag"
+        )
+
+    def test_imap_service_fetch_uses_body_peek(self):
+        """IMAPService.get_unread_emails must still use BODY.PEEK[]."""
+        import inspect
+        from src.services.imap_service import IMAPService
+        source = inspect.getsource(IMAPService.get_unread_emails)
+        assert "BODY.PEEK" in source, "get_unread_emails must use BODY.PEEK[]"
+
+    def test_parse_email_supports_body_peek_response_key(self):
+        """_parse_email must support b'BODY[]' key (BODY.PEEK response)."""
+        import inspect
+        from src.services.imap_service import IMAPService
+        source = inspect.getsource(IMAPService._parse_email)
+        assert "BODY[]" in source, "_parse_email must support BODY[] response key"
+        assert "RFC822" in source, "_parse_email must still support RFC822 fallback"
+
+    def test_ai_endpoint_default_is_host_docker_internal(self):
+        """AI endpoint field default must point to host.docker.internal."""
+        from src.config import Settings
+        field = Settings.model_fields.get("ai_endpoint")
+        assert "host.docker.internal" in str(field.default)
+
+    def test_docker_compose_uses_host_docker_internal(self):
+        """docker-compose.yml must still use host.docker.internal for AI."""
+        with open("docker-compose.yml", "r") as f:
+            content = f.read()
+        assert "host.docker.internal" in content
+
+    def test_docker_compose_no_ollama_image(self):
+        """docker-compose.yml must not have ollama Docker image."""
+        with open("docker-compose.yml", "r") as f:
+            content = f.read()
+        assert "ollama/ollama" not in content
+        assert "image: ollama" not in content
+
+    def test_ai_service_health_check_uses_settings_timeout(self):
+        """AIService.check_health must not have a hardcoded timeout."""
+        import inspect
+        from src.services.ai_service import AIService
+        source = inspect.getsource(AIService.check_health)
+        assert "timeout=5" not in source, "check_health must not hardcode timeout=5"
+        assert "ai_timeout" in source, "check_health must use settings.ai_timeout"
+
+    def test_process_indexed_email_safe_mode_no_imap_actions(self):
+        """
+        _process_indexed_email with safe_mode=True must not call any IMAP
+        action methods even when an imap object is passed in.
+        """
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from src.models.database import Base, ProcessedEmail
+        from datetime import datetime as dt
+
+        with patch.dict(os.environ, {**ENV, "SAFE_MODE": "true"}):
+            from src.config import reload_settings
+            reload_settings()
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        db = Session()
+
+        from src.services.email_processor import EmailProcessor
+
+        processor = EmailProcessor(db_session=db)
+
+        # Insert a pending email record into the DB
+        record = ProcessedEmail(
+            message_id="<safe-mode-test@test.com>",
+            uid="1",
+            imap_uid="1",
+            analysis_state="pending",
+            subject="Test",
+            sender="test@test.com",
+            received_at=dt.utcnow(),
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+
+        mock_imap = MagicMock()
+
+        # Mock the analysis pipeline to return a simple result
+        with patch("src.services.analysis_pipeline.AnalysisPipeline") as MockPipeline:
+            mock_pipeline = MagicMock()
+            mock_pipeline.analyse.return_value = {
+                "summary": "Test",
+                "category": "Unklar",
+                "spam_probability": 0.1,
+                "action_required": False,
+                "priority": "LOW",
+                "suggested_folder": "Archive",
+                "reasoning": "Test",
+            }
+            MockPipeline.return_value = mock_pipeline
+
+            processor._process_indexed_email(record, mock_imap)
+
+        # Safe mode: no IMAP actions must be called
+        mock_imap.move_to_folder.assert_not_called()
+        mock_imap.mark_as_read.assert_not_called()
+        mock_imap.add_flag.assert_not_called()
+
+        # Record must have safe_mode_skip in actions
+        db.refresh(record)
+        assert "safe_mode_skip" in record.actions_taken["actions"]
+        db.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

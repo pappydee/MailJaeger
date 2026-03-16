@@ -277,10 +277,10 @@ class AnalysisPipeline:
         for rule in rules:
             if rule.sender_pattern:
                 pattern = rule.sender_pattern.lower()
-                # Ensure accurate domain matching: pattern like "@example.com" must not
-                # match "notexample.com". Normalize to ensure leading "@" for domain checks.
+                # Ensure accurate domain matching: normalize to "@domain" form
+                # so "@example.com" does not match "notexample.com"
                 if not pattern.startswith("@"):
-                    pattern = "@" + pattern.lstrip("@")
+                    pattern = "@" + pattern
                 if sender.endswith(pattern):
                     if rule.subject_pattern:
                         if rule.subject_pattern.lower() in subject:
