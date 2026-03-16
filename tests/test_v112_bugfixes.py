@@ -24,7 +24,7 @@ ENV = {
     "AI_ENDPOINT": "http://localhost:11434",
 }
 
-AUTH = {"Authorization": "Bearer test_key_abc123"}
+AUTH = {"Authorization": f"Bearer {ENV['API_KEY']}"}
 
 
 def _reset_rate_limiter():
@@ -637,3 +637,178 @@ class TestSafeModePreserved:
             processor = EmailProcessor(mock_db)
             # safe_mode must be True for this processor instance
             assert processor.settings.safe_mode is True
+
+
+# ---------------------------------------------------------------------------
+# Dashboard UI consistency — state selection (backend response-shape tests)
+# ---------------------------------------------------------------------------
+
+
+def _make_dashboard_client(run_status_override=None, last_run=None):
+    """Helper: build a TestClient whose dashboard endpoint returns controlled data."""
+    with patch.dict(os.environ, ENV):
+        from src.config import reload_settings
+        reload_settings()
+        from src.main import app
+        from src.database.connection import get_db
+        from src.services.scheduler import get_run_status
+
+        if run_status_override:
+            rs = get_run_status()
+            rs.reset()
+            for k, v in run_status_override.items():
+                if hasattr(rs, k):
+                    setattr(rs, k, v)
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.order_by.return_value.first.return_value = last_run
+        mock_db.query.return_value.count.return_value = 0
+        mock_db.query.return_value.filter.return_value.count.return_value = 0
+
+        def _override():
+            yield mock_db
+
+        app.dependency_overrides[get_db] = _override
+        return app, _override
+
+
+class TestDashboardStateSelection:
+    """
+    Backend response-shape tests that verify the dashboard payload lets the UI
+    apply the correct "state selection" rule:
+
+    - run_status.status == 'running'/'cancelling'  →  UI should use run_status
+    - run_status.status == 'idle'                  →  UI should use last_run
+    """
+
+    def _patched_client(self, run_status_dict, last_run_obj=None):
+        _reset_rate_limiter()
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            reload_settings()
+            from src.main import app
+            from src.database.connection import get_db
+            from src.services.scheduler import get_run_status
+
+            rs = get_run_status()
+            rs.reset()
+            for k, v in run_status_dict.items():
+                if hasattr(rs, k):
+                    setattr(rs, k, v)
+
+            mock_db = MagicMock()
+            mock_db.query.return_value.order_by.return_value.first.return_value = last_run_obj
+            mock_db.query.return_value.count.return_value = 0
+            mock_db.query.return_value.filter.return_value.count.return_value = 0
+
+            def _override():
+                yield mock_db
+
+            app.dependency_overrides[get_db] = _override
+            try:
+                with patch("src.main.IMAPService") as mock_imap, \
+                     patch("src.main.AIService") as mock_ai, \
+                     patch("src.main.get_scheduler") as mock_sched:
+                    mock_imap.return_value.check_health.return_value = {"status": "healthy"}
+                    mock_ai.return_value.check_health.return_value = {"status": "healthy"}
+                    mock_sched.return_value.get_next_run_time.return_value = None
+                    mock_sched.return_value.get_status.return_value = {}
+
+                    client = TestClient(app, raise_server_exceptions=False)
+                    resp = client.get("/api/dashboard", headers=AUTH)
+                    return resp.json()
+            finally:
+                app.dependency_overrides.clear()
+                get_run_status().reset()
+
+    def test_dashboard_run_status_idle_exposes_status_idle(self):
+        """When no run is active, run_status.status must be 'idle'."""
+        data = self._patched_client({"status": "idle"})
+        assert data["run_status"]["status"] == "idle"
+
+    def test_dashboard_run_status_running_exposes_live_counters(self):
+        """When a run is active, run_status carries live processed/total."""
+        data = self._patched_client({"status": "running", "processed": 7, "total": 20})
+        rs = data["run_status"]
+        assert rs["status"] == "running"
+        assert rs["processed"] == 7
+        assert rs["total"] == 20
+
+    def test_dashboard_run_status_cancelling_exposed(self):
+        """cancelling state must be propagated through the dashboard."""
+        data = self._patched_client({
+            "status": "cancelling", "cancel_requested": True,
+            "processed": 3, "total": 10,
+        })
+        rs = data["run_status"]
+        assert rs["status"] == "cancelling"
+        assert rs["cancel_requested"] is True
+
+    def test_dashboard_run_status_cancelled_after_run(self):
+        """Cancelled state must survive in run_status until reset."""
+        data = self._patched_client({"status": "cancelled", "processed": 5, "total": 10})
+        rs = data["run_status"]
+        assert rs["status"] == "cancelled"
+        assert rs["processed"] == 5
+
+    def test_dashboard_has_no_last_run_when_db_empty(self):
+        """When no DB runs exist and status is idle, last_run must be null."""
+        data = self._patched_client({"status": "idle"}, last_run_obj=None)
+        assert data["last_run"] is None
+
+    def test_api_status_and_dashboard_run_status_consistent_during_run(self):
+        """
+        /api/status and dashboard.run_status must report the same counters
+        during an active run — this is what prevents the 'Letzte Verarbeitung'
+        from showing stale IN_PROGRESS/0 while the progress bar shows real counts.
+        """
+        _reset_rate_limiter()
+        with patch.dict(os.environ, ENV):
+            from src.config import reload_settings
+            reload_settings()
+            from src.main import app
+            from src.database.connection import get_db
+            from src.services.scheduler import get_run_status
+
+            rs = get_run_status()
+            rs.reset()
+            rs.status = "running"
+            rs.processed = 12
+            rs.total = 50
+            rs.progress_percent = 35
+
+            mock_db = MagicMock()
+            mock_db.query.return_value.order_by.return_value.first.return_value = None
+            mock_db.query.return_value.count.return_value = 0
+            mock_db.query.return_value.filter.return_value.count.return_value = 0
+
+            def _override():
+                yield mock_db
+
+            app.dependency_overrides[get_db] = _override
+            try:
+                with patch("src.main.IMAPService") as mock_imap, \
+                     patch("src.main.AIService") as mock_ai, \
+                     patch("src.main.get_scheduler") as mock_sched:
+                    mock_imap.return_value.check_health.return_value = {"status": "healthy"}
+                    mock_ai.return_value.check_health.return_value = {"status": "healthy"}
+                    mock_sched.return_value.get_next_run_time.return_value = None
+                    mock_sched.return_value.get_status.return_value = {}
+
+                    client = TestClient(app, raise_server_exceptions=False)
+                    status_resp = client.get("/api/status", headers=AUTH)
+                    dashboard_resp = client.get("/api/dashboard", headers=AUTH)
+
+                    assert status_resp.status_code == 200
+                    assert dashboard_resp.status_code == 200
+
+                    s = status_resp.json()
+                    d = dashboard_resp.json()["run_status"]
+
+                    assert s["processed"] == d["processed"] == 12
+                    assert s["total"] == d["total"] == 50
+                    assert s["progress_percent"] == d["progress_percent"] == 35
+                    assert s["status"] == d["status"] == "running"
+            finally:
+                app.dependency_overrides.clear()
+                get_run_status().reset()

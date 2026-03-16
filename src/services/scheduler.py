@@ -223,11 +223,18 @@ class SchedulerService:
                     "CANCELLED": "cancelled",
                 }
                 final_status = status_map.get(run.status, "idle")
+                # Show 100 % for any completed run; for CANCELLED keep the
+                # partial progress so the user can see how far the run got.
+                final_pct = (
+                    _run_status.progress_percent
+                    if run.status == "CANCELLED"
+                    else 100
+                )
                 _run_status.update(
                     run_id=run.id,
                     status=final_status,
                     current_step=None,
-                    progress_percent=_run_status.progress_percent,
+                    progress_percent=final_pct,
                     message=f"Completed: {run.status}",
                 )
         except Exception as e:
