@@ -183,6 +183,18 @@ class EmailProcessor:
 
             try:
                 for idx, email_record in enumerate(pending_emails, start=1):
+                    # --- cancellation checkpoint ---
+                    if self._status is not None and self._status.cancel_requested:
+                        logger.info(
+                            f"Cancellation requested — stopping before email "
+                            f"{idx}/{total} ({idx - 1} completed so far)"
+                        )
+                        self._update_status(
+                            status="cancelling",
+                            current_step="Cancelling…",
+                        )
+                        break
+
                     pct = 25 + int((idx / total) * 65)  # 25 → 90 %
                     self._update_status(
                         current_step=f"Analysing {idx}/{total}…",
@@ -218,6 +230,11 @@ class EmailProcessor:
                     except Exception:
                         pass
 
+            # Determine whether the run was cancelled mid-flight
+            was_cancelled = (
+                self._status is not None and self._status.cancel_requested
+            )
+
             # Save run statistics
             self._update_status(current_step="Saving results…", progress_percent=95)
             run.emails_processed = self.stats["processed"]
@@ -225,12 +242,19 @@ class EmailProcessor:
             run.emails_archived = self.stats["archived"]
             run.emails_action_required = self.stats["action_required"]
             run.emails_failed = self.stats["failed"]
-            run.status = "SUCCESS" if self.stats["failed"] == 0 else "PARTIAL"
             run.completed_at = datetime.utcnow()
+
+            if was_cancelled:
+                run.status = "CANCELLED"
+            elif self.stats["failed"] == 0:
+                run.status = "SUCCESS"
+            else:
+                run.status = "PARTIAL"
             self.db.commit()
 
             logger.info(
-                f"Processing run completed: {self.stats['processed']} processed, "
+                f"Processing run {'CANCELLED' if was_cancelled else 'completed'}: "
+                f"{self.stats['processed']} processed, "
                 f"{self.stats['spam']} spam, {self.stats['archived']} archived, "
                 f"{self.stats['action_required']} action required, "
                 f"{self.stats['failed']} failed"

@@ -2,7 +2,7 @@
 Pydantic models for API requests and responses
 """
 
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, field_validator
 from typing import Optional, List
 from datetime import datetime
 from enum import Enum
@@ -51,17 +51,27 @@ class EmailResponse(BaseModel):
     summary: Optional[str] = None
     category: Optional[str] = None
     spam_probability: Optional[float] = None
-    action_required: bool
+    action_required: bool = False
     priority: Optional[str] = None
     suggested_folder: Optional[str] = None
     reasoning: Optional[str] = None
-    is_spam: bool
-    is_archived: bool
-    is_flagged: bool
-    is_resolved: bool
+    is_spam: bool = False
+    is_archived: bool = False
+    is_flagged: bool = False
+    is_resolved: bool = False
     tasks: List[TaskResponse] = []
     created_at: datetime
     processed_at: Optional[datetime] = None
+
+    # Coerce NULL DB values (emails not yet analysed) to False so that
+    # Pydantic v2 strict bool validation never raises a ValidationError.
+    @field_validator(
+        "action_required", "is_spam", "is_archived", "is_flagged", "is_resolved",
+        mode="before",
+    )
+    @classmethod
+    def coerce_none_to_false(cls, v: object) -> object:
+        return False if v is None else v
 
     class Config:
         from_attributes = True
@@ -122,6 +132,9 @@ class DashboardResponse(BaseModel):
     action_required_count: int
     unresolved_count: int
     health_status: dict
+    # Live in-progress run state (same source as /api/status).
+    # When no run is active this mirrors the last completed run_status.
+    run_status: Optional[dict] = None
 
 
 class EmailListRequest(BaseModel):

@@ -97,6 +97,11 @@ app = FastAPI(
 )
 
 
+def _service_is_unhealthy(health: dict) -> bool:
+    """Return True when a service health-check dict indicates a non-healthy state."""
+    return isinstance(health, dict) and health.get("status") not in ("healthy", "ok")
+
+
 # Global authentication middleware (fail-closed)
 # This enforces authentication for ALL routes except explicit allowlist
 @app.middleware("http")
@@ -531,9 +536,20 @@ async def get_dashboard(db: Session = Depends(get_db)):
         imap_service = IMAPService()
         ai_service = AIService()
 
+        imap_health = imap_service.check_health()
+        ai_health = ai_service.check_health()
+
+        # Derive an overall system status:
+        #   OK       — all critical services healthy
+        #   DEGRADED — at least one service is unhealthy but the app is running
+        #   ERROR    — critical failure (reserved for future use)
+        degraded = _service_is_unhealthy(imap_health) or _service_is_unhealthy(ai_health)
+        overall_status = "DEGRADED" if degraded else "OK"
+
         health_status = {
-            "mail_server": imap_service.check_health(),
-            "ai_service": ai_service.check_health(),
+            "overall_status": overall_status,
+            "mail_server": imap_health,
+            "ai_service": ai_health,
             "database": {"status": "healthy", "message": "Database operational"},
             "scheduler": scheduler.get_status(),
         }
@@ -545,6 +561,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
             action_required_count=action_required_count,
             unresolved_count=unresolved_count,
             health_status=health_status,
+            run_status=get_run_status().to_dict(),
         )
 
     except Exception as e:
@@ -852,6 +869,30 @@ async def trigger_processing(
                 else sanitized_error
             ),
         )
+
+
+@app.post("/api/processing/cancel", dependencies=[Depends(require_authentication)])
+@limiter.limit("10/minute")
+async def cancel_processing(request: Request):
+    """
+    Request cancellation of the currently running processing job.
+
+    If a run is active its status transitions to "cancelling"; the processing
+    loop checks this flag before each email and exits cleanly, persisting
+    partial progress.  The final run status in the DB is set to CANCELLED.
+
+    Returns:
+      success=True  when the cancel signal was accepted (run was active)
+      success=False when there is no active run to cancel
+    """
+    run_status = get_run_status()
+    accepted = run_status.request_cancel()
+    return {
+        "success": accepted,
+        "message": "Cancellation requested" if accepted else "No active run to cancel",
+        "run_id": run_status.run_id,
+        "status": run_status.status,
+    }
 
 
 @app.get(
