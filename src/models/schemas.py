@@ -139,14 +139,49 @@ class DashboardResponse(BaseModel):
     daily_report_available: bool = False
 
 
+class ReportEmailItem(BaseModel):
+    """A single email entry inside the structured daily report."""
+
+    email_id: int
+    subject: Optional[str] = None
+    sender: Optional[str] = None
+    summary: Optional[str] = None
+    priority: Optional[str] = None
+    category: Optional[str] = None
+
+
+class ReportSuggestedAction(BaseModel):
+    """
+    A suggested IMAP action tied to a specific email.
+
+    In SAFE MODE these are *not* executed automatically.  The frontend
+    renders them as clickable buttons that submit the action to the
+    approval/action-queue flow.
+    """
+
+    email_id: int
+    action_type: str  # MOVE_FOLDER | MARK_READ | ADD_FLAG | MARK_SPAM | MARK_RESOLVED | REPLY_DRAFT
+    target_folder: Optional[str] = None
+    description: str  # human-readable label shown in the UI
+    safe_mode: bool = True  # True → action goes to queue, False → applied immediately
+
+
 class DailyReportResponse(BaseModel):
     generated_at: str
     period_hours: int = 24
+    # Flat counters (backward-compatible)
     total_processed: int = 0
     action_required: int = 0
     spam_detected: int = 0
     unresolved: int = 0
-    report_text: str  # AI-generated markdown/plain-text summary
+    # Structured item lists for frontend rendering
+    important_items: List[ReportEmailItem] = []
+    action_items: List[ReportEmailItem] = []
+    unresolved_items: List[ReportEmailItem] = []
+    spam_items: List[ReportEmailItem] = []
+    # Clickable suggested actions (safe-mode-aware)
+    suggested_actions: List[ReportSuggestedAction] = []
+    report_text: str  # AI-generated or fallback plain-text summary
 
 
 class EmailListRequest(BaseModel):

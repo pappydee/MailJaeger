@@ -23,6 +23,8 @@ from src.models.schemas import (
     EmailDetailResponse,
     DashboardResponse,
     DailyReportResponse,
+    ReportEmailItem,
+    ReportSuggestedAction,
     ProcessingRunResponse,
     EmailListRequest,
     SearchRequest,
@@ -1755,6 +1757,7 @@ async def health_check():
     }
 
 
+
 @app.get(
     "/api/reports/daily",
     response_model=DailyReportResponse,
@@ -1772,6 +1775,9 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
     - spam filtered
     - unresolved threads
     - suggested actions
+
+    In SAFE MODE the response also includes clickable ``suggested_actions`` so
+    the user can trigger individual IMAP actions via the approval queue.
     """
     try:
         cutoff = datetime.utcnow() - timedelta(hours=24)
@@ -1785,15 +1791,102 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
         )
 
         total_processed = len(recent_emails)
-        action_required_count = sum(
-            1 for e in recent_emails if e.action_required
-        )
+        action_required_count = sum(1 for e in recent_emails if e.action_required)
         spam_count = sum(1 for e in recent_emails if e.is_spam)
         unresolved_count = sum(
             1 for e in recent_emails if e.action_required and not e.is_resolved
         )
 
-        # Build a structured prompt for the AI
+        # ----------------------------------------------------------------
+        # Build structured item lists
+        # ----------------------------------------------------------------
+        def _to_item(e: ProcessedEmail) -> ReportEmailItem:
+            return ReportEmailItem(
+                email_id=e.id,
+                subject=e.subject,
+                sender=e.sender,
+                summary=e.summary,
+                priority=e.priority,
+                category=e.category,
+            )
+
+        # Important: HIGH priority or flagged
+        important_items = [
+            _to_item(e)
+            for e in recent_emails
+            if (e.priority == "HIGH" or e.is_flagged) and not e.is_spam
+        ][:10]
+
+        # Action items: action_required and not yet resolved
+        action_items = [
+            _to_item(e)
+            for e in recent_emails
+            if e.action_required and not e.is_resolved and not e.is_spam
+        ][:10]
+
+        # Unresolved: action_required but not resolved (same set, capped differently)
+        unresolved_items = [
+            _to_item(e)
+            for e in recent_emails
+            if e.action_required and not e.is_resolved
+        ][:10]
+
+        # Spam
+        spam_items = [_to_item(e) for e in recent_emails if e.is_spam][:10]
+
+        # ----------------------------------------------------------------
+        # Suggested actions for safe-mode morning report
+        # ----------------------------------------------------------------
+        safe_mode_active = settings.safe_mode
+        suggested_actions: list[ReportSuggestedAction] = []
+
+        for e in recent_emails:
+            if not e.id:
+                continue
+            if e.is_spam and not e.is_archived:
+                suggested_actions.append(
+                    ReportSuggestedAction(
+                        email_id=e.id,
+                        action_type="MOVE_FOLDER",
+                        target_folder=settings.quarantine_folder,
+                        description=f"Spam verschieben: {e.subject or '(kein Betreff)'}",
+                        safe_mode=safe_mode_active,
+                    )
+                )
+            elif e.action_required and not e.is_resolved:
+                suggested_actions.append(
+                    ReportSuggestedAction(
+                        email_id=e.id,
+                        action_type="MARK_RESOLVED",
+                        description=f"Als erledigt markieren: {e.subject or '(kein Betreff)'}",
+                        safe_mode=safe_mode_active,
+                    )
+                )
+                suggested_actions.append(
+                    ReportSuggestedAction(
+                        email_id=e.id,
+                        action_type="REPLY_DRAFT",
+                        description=f"Antwort-Entwurf erstellen: {e.subject or '(kein Betreff)'}",
+                        safe_mode=safe_mode_active,
+                    )
+                )
+            elif not e.is_archived and not e.is_spam:
+                suggested_actions.append(
+                    ReportSuggestedAction(
+                        email_id=e.id,
+                        action_type="MOVE_FOLDER",
+                        target_folder=settings.archive_folder,
+                        description=f"Archivieren: {e.subject or '(kein Betreff)'}",
+                        safe_mode=safe_mode_active,
+                    )
+                )
+            # Cap total suggestions to keep the response manageable
+            if len(suggested_actions) >= 20:
+                break
+
+        # ----------------------------------------------------------------
+        # Build AI prompt
+        # ----------------------------------------------------------------
         email_summaries = []
         for e in recent_emails[:30]:  # include top 30 in prompt to stay concise
             parts = [f"- {e.sender or '?'}: {e.subject or '(kein Betreff)'}"]
@@ -1845,6 +1938,12 @@ Halte den Bericht präzise und handlungsorientiert."""
                 "",
                 "(KI-Zusammenfassung nicht verfügbar — Ollama nicht erreichbar)",
             ]
+            if action_items:
+                lines += ["", "Offene Aktionen:"]
+                for item in action_items[:5]:
+                    lines.append(
+                        f"  • [{item.priority or 'LOW'}] {item.sender or '?'}: {item.subject or '(kein Betreff)'}"
+                    )
             report_text = "\n".join(lines)
 
         return DailyReportResponse(
@@ -1854,6 +1953,11 @@ Halte den Bericht präzise und handlungsorientiert."""
             action_required=action_required_count,
             spam_detected=spam_count,
             unresolved=unresolved_count,
+            important_items=important_items,
+            action_items=action_items,
+            unresolved_items=unresolved_items,
+            spam_items=spam_items,
+            suggested_actions=suggested_actions,
             report_text=report_text,
         )
 

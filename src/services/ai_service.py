@@ -434,6 +434,12 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
         if not emails:
             return []
 
+        email_ids = [e.get("id") for e in emails]
+        logger.info(
+            f"[batch] Starting batch LLM analysis: {len(emails)} email(s), "
+            f"ids={email_ids}"
+        )
+
         # Build a combined prompt that asks the model to return a JSON array
         entries = []
         for i, email_data in enumerate(emails):
@@ -470,6 +476,10 @@ Antworte NUR mit dem JSON-Array, keine zusätzlichen Erklärungen."""
                 raise ValueError("Empty AI response")
 
             batch_results = self._parse_batch_response(raw, emails)
+            logger.info(
+                f"[batch] Completed batch LLM analysis: {len(batch_results)} results "
+                f"for {len(emails)} email(s)"
+            )
             return batch_results
 
         except Exception as e:
@@ -483,8 +493,11 @@ Antworte NUR mit dem JSON-Array, keine zusätzlichen Erklärungen."""
         """
         Parse a JSON-array response for batch analysis.
 
-        Falls back to individual fallback classification for any entry that
-        cannot be parsed or validated.
+        Safeguards:
+        - Detects and warns about duplicate email_ids in the AI response.
+        - Falls back per-item when a single entry is malformed/invalid.
+        - Handles truncated arrays by falling back on the missing tail.
+        - Validates category and folder values per-item.
         """
         # Extract the JSON array from the response text
         stripped = response.strip()
@@ -508,11 +521,26 @@ Antworte NUR mit dem JSON-Array, keine zusätzlichen Erklärungen."""
         if not isinstance(raw_list, list):
             raise ValueError("Batch AI response is not a JSON array")
 
-        # Build a lookup by email_id if the model returned ids
+        # Warn about duplicate email_ids returned by the model
+        seen_ids: set = set()
+        for item in raw_list:
+            if isinstance(item, dict) and "email_id" in item:
+                eid = item["email_id"]
+                if eid in seen_ids:
+                    logger.warning(
+                        f"[batch] Duplicate email_id={eid} in AI batch response — "
+                        f"only the first occurrence will be used"
+                    )
+                else:
+                    seen_ids.add(eid)
+
+        # Build a lookup by email_id (first occurrence wins)
         id_to_result: Dict[Any, Dict] = {}
         for item in raw_list:
             if isinstance(item, dict) and "email_id" in item:
-                id_to_result[item["email_id"]] = item
+                eid = item["email_id"]
+                if eid not in id_to_result:
+                    id_to_result[eid] = item
 
         results = []
         for i, email_data in enumerate(emails):
@@ -525,10 +553,14 @@ Antworte NUR mit dem JSON-Array, keine zusätzlichen Erklärungen."""
                 except Exception as e:
                     sanitized = sanitize_error(e, debug=self.settings.debug)
                     logger.warning(
-                        f"Failed to parse batch result for email {email_id}: {sanitized}"
+                        f"[batch] Failed to parse batch result for email {email_id}: "
+                        f"{sanitized} — using fallback"
                     )
                     results.append(self._fallback_classification(email_data))
             else:
+                logger.warning(
+                    f"[batch] No AI result for email {email_id} (index {i}) — using fallback"
+                )
                 results.append(self._fallback_classification(email_data))
 
         return results

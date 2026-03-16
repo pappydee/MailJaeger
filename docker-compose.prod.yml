@@ -77,7 +77,7 @@ services:
       - QUARANTINE_FOLDER=${QUARANTINE_FOLDER:-Quarantine}
       
       # Scheduling
-      - SCHEDULE_TIME=${SCHEDULE_TIME:-08:00}
+      - SCHEDULE_TIME=${SCHEDULE_TIME:-02:00}
       - SCHEDULE_TIMEZONE=${SCHEDULE_TIMEZONE:-Europe/Berlin}
       
       # Learning
