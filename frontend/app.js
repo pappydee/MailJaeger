@@ -502,20 +502,114 @@ async function openDailyReport() {
         const r = await fetch(`${API_BASE}/api/reports/daily`);
         if (!r.ok) { body.innerHTML = '<div class="loading">Fehler beim Laden des Berichts</div>'; return; }
         const d = await r.json();
+        const totals = d.totals || {};
+        const totalProcessed = totals.total_processed ?? d.total_processed ?? 0;
+        const actionRequired = totals.action_required ?? d.action_required ?? 0;
+        const spamDetected = totals.spam_detected ?? d.spam_detected ?? 0;
+        const unresolved = totals.unresolved ?? d.unresolved ?? 0;
+        const safeModeActive = (d.suggested_actions || []).some(a => a.safe_mode);
         body.innerHTML = `
             <div class="report-meta">
                 <span>Erstellt: ${fmtDt(d.generated_at)}</span>
                 <span>Zeitraum: letzte ${d.period_hours}h</span>
             </div>
             <div class="report-stats">
-                <span>📧 ${d.total_processed} verarbeitet</span>
-                <span>⚡ ${d.action_required} Aktion erforderlich</span>
-                <span>🚫 ${d.spam_detected} Spam</span>
-                <span>⏳ ${d.unresolved} ungelöst</span>
+                <span>📧 ${totalProcessed} verarbeitet</span>
+                <span>⚡ ${actionRequired} Aktion erforderlich</span>
+                <span>🚫 ${spamDetected} Spam</span>
+                <span>⏳ ${unresolved} ungelöst</span>
             </div>
+            ${safeModeActive ? '<div class="report-safe-hint">SAFE MODE aktiv: Vorschläge werden nur in die Freigabe-Warteschlange eingestellt.</div>' : ''}
+            ${renderReportSection('Wichtige E-Mails', d.important_items)}
+            ${renderReportSection('Aktion erforderlich', d.action_items)}
+            ${renderReportSection('Ungelöste Elemente', d.unresolved_items)}
+            ${renderReportSection('Spam / Bulk', d.spam_items)}
+            ${renderSuggestedActions(d.suggested_actions)}
             <pre class="report-text">${escHtml(d.report_text)}</pre>`;
+        body.querySelectorAll('.report-action-btn').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                try {
+                    const suggestion = JSON.parse(decodeURIComponent(btn.dataset.suggestion || '%7B%7D'));
+                    await queueSuggestedAction(suggestion, btn);
+                } catch {
+                    showToast('Vorschlagsdaten sind ungültig', 'error');
+                }
+            });
+        });
     } catch {
         body.innerHTML = '<div class="loading">Fehler beim Laden des Berichts</div>';
+    }
+}
+
+function renderReportSection(title, items = []) {
+    const list = (items || []).slice(0, 8);
+    if (!list.length) return '';
+    return `
+        <section class="report-section">
+            <h3>${escHtml(title)}</h3>
+            <ul>
+                ${list.map(i => `
+                    <li>
+                        <strong>${escHtml(i.subject || '(kein Betreff)')}</strong>
+                        <span>${escHtml(i.sender || 'Unbekannt')}</span>
+                    </li>
+                `).join('')}
+            </ul>
+        </section>`;
+}
+
+function renderSuggestedActions(actions = []) {
+    if (!actions.length) return '';
+    return `
+        <section class="report-section">
+            <h3>Vorgeschlagene Aktionen</h3>
+            <div class="report-suggested-actions">
+                ${actions.map(action => `
+                    <div class="report-action-card">
+                        <div>
+                            <strong>${escHtml(action.description || action.action_type)}</strong>
+                            <div class="report-action-context">E-Mail #${escHtml(action.email_id)}${action.thread_id ? ` · Thread ${escHtml(action.thread_id)}` : ''}</div>
+                        </div>
+                        <button class="btn btn-secondary report-action-btn" data-suggestion='${encodeURIComponent(JSON.stringify(action))}'>Vorschlag in Warteschlange</button>
+                    </div>
+                `).join('')}
+            </div>
+        </section>`;
+}
+
+async function queueSuggestedAction(action, button) {
+    if (!action || !action.email_id || !action.action_type) {
+        showToast('Ungültiger Aktionsvorschlag', 'error');
+        return;
+    }
+    const originalLabel = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Wird eingestellt…';
+    try {
+        const r = await fetch(`${API_BASE}/api/reports/daily/suggested-actions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                email_id: action.email_id,
+                thread_id: action.thread_id || null,
+                action_type: action.action_type,
+                payload: action.payload || null,
+                safe_mode: !!action.safe_mode,
+                description: action.description || null,
+            }),
+        });
+        if (!r.ok) {
+            const d = await r.json().catch(() => ({}));
+            throw new Error(d.detail || 'Queue-Fehler');
+        }
+        const queued = await r.json();
+        button.textContent = `In Warteschlange (#${queued.id})`;
+        showToast('Vorschlag wurde zur Freigabe eingereiht', 'success', 3000);
+        loadDashboard();
+    } catch (e) {
+        button.disabled = false;
+        button.textContent = originalLabel;
+        showToast(e?.message || 'Aktion konnte nicht eingereiht werden', 'error');
     }
 }
 
