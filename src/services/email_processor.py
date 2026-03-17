@@ -11,6 +11,7 @@ is only used for backward-compatible helpers such as _process_single_email.
 """
 
 import logging
+import json
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from datetime import datetime
 from sqlalchemy import nullslast, desc as sa_desc
@@ -836,8 +837,9 @@ class EmailProcessor:
                     self.stats["action_required"] += 1
 
         email_record.actions_taken = {"actions": actions_taken}
-
         self.db.add(email_record)
+        self.db.flush()
+        self._queue_action_proposals(email_record, analysis)
         self.db.add(AuditLog(
             event_type="EMAIL_PROCESSED",
             email_message_id=message_id,
@@ -857,6 +859,76 @@ class EmailProcessor:
         ))
         self.db.commit()
         self.stats["processed"] += 1
+
+    def _queue_action_proposals(
+        self,
+        email_record: ProcessedEmail,
+        analysis: Dict[str, Any],
+    ) -> None:
+        """Create structured action proposals (status=proposed) from analysis output."""
+        from src.models.database import ActionQueue
+
+        try:
+            proposed_actions = analysis.get("proposed_actions")
+            candidates = []
+
+            if isinstance(proposed_actions, list):
+                for item in proposed_actions:
+                    if not isinstance(item, dict):
+                        continue
+                    action_type = str(item.get("action_type", "")).strip().lower()
+                    payload = item.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        continue
+                    if action_type:
+                        candidates.append({"action_type": action_type, "payload": payload})
+            else:
+                suggested_folder = analysis.get("suggested_folder")
+                if suggested_folder:
+                    candidates.append(
+                        {
+                            "action_type": "move",
+                            "payload": {"target_folder": suggested_folder},
+                        }
+                    )
+
+            if not candidates:
+                return
+
+            existing = (
+                self.db.query(ActionQueue)
+                .filter(ActionQueue.email_id == email_record.id)
+                .all()
+            )
+            existing_pairs = {
+                (
+                    row.action_type,
+                    json.dumps(row.payload or {}, sort_keys=True),
+                )
+                for row in existing
+            }
+
+            for item in candidates:
+                payload_key = json.dumps(item["payload"], sort_keys=True)
+                pair = (item["action_type"], payload_key)
+                if pair in existing_pairs:
+                    continue
+                self.db.add(
+                    ActionQueue(
+                        email_id=email_record.id,
+                        thread_id=email_record.thread_id,
+                        action_type=item["action_type"],
+                        payload=item["payload"],
+                        status="proposed",
+                    )
+                )
+                existing_pairs.add(pair)
+        except Exception as exc:
+            logger.warning(
+                "Skipping action proposal enqueue for email %s: %s",
+                email_record.message_id,
+                sanitize_error(exc, debug=self.settings.debug),
+            )
 
     # ------------------------------------------------------------------
     # Legacy method — kept for backward compatibility with tests and
@@ -1027,9 +1099,10 @@ class EmailProcessor:
                         email_record.is_flagged = True
                     self.stats["action_required"] += 1
 
-        email_record.actions_taken = {"actions": actions_taken}
-
         self.db.add(email_record)
+        self.db.flush()
+        email_record.actions_taken = {"actions": actions_taken}
+        self._queue_action_proposals(email_record, analysis)
 
         audit = AuditLog(
             event_type="EMAIL_PROCESSED",
