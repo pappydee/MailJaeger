@@ -143,11 +143,19 @@ class ReportEmailItem(BaseModel):
     """A single email entry inside the structured daily report."""
 
     email_id: int
+    thread_id: Optional[str] = None
     subject: Optional[str] = None
     sender: Optional[str] = None
     summary: Optional[str] = None
     priority: Optional[str] = None
     category: Optional[str] = None
+
+
+class ReportTotals(BaseModel):
+    total_processed: int = 0
+    action_required: int = 0
+    unresolved: int = 0
+    spam_detected: int = 0
 
 
 class ReportSuggestedAction(BaseModel):
@@ -160,15 +168,18 @@ class ReportSuggestedAction(BaseModel):
     """
 
     email_id: int
-    action_type: str  # MOVE_FOLDER | MARK_READ | ADD_FLAG | MARK_SPAM | MARK_RESOLVED | REPLY_DRAFT
-    target_folder: Optional[str] = None
+    thread_id: Optional[str] = None
+    action_type: str  # move | archive | mark_spam | delete | mark_read | mark_resolved | reply_draft
+    payload: Optional[dict] = None
+    target_folder: Optional[str] = None  # Backward-compatible mirror for move/archive actions
+    safe_mode: bool = True
     description: str  # human-readable label shown in the UI
-    safe_mode: bool = True  # True → action goes to queue, False → applied immediately
 
 
 class DailyReportResponse(BaseModel):
     generated_at: str
     period_hours: int = 24
+    totals: ReportTotals = ReportTotals()
     # Flat counters (backward-compatible)
     total_processed: int = 0
     action_required: int = 0
@@ -262,6 +273,15 @@ class PendingActionWithEmailResponse(PendingActionResponse):
 
 class ApproveActionRequest(BaseModel):
     approve: bool = True
+
+
+class QueueSuggestedActionRequest(BaseModel):
+    email_id: int
+    thread_id: Optional[str] = None
+    action_type: str
+    payload: Optional[dict] = None
+    safe_mode: bool = True
+    description: Optional[str] = None
 
 
 class ApplyActionsRequest(BaseModel):

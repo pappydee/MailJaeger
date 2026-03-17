@@ -200,11 +200,13 @@ class TestDailyReportStructured:
             assert "unresolved_items" in data
             assert "spam_items" in data
             assert "suggested_actions" in data
+            assert "totals" in data
             assert isinstance(data["important_items"], list)
             assert isinstance(data["action_items"], list)
             assert isinstance(data["unresolved_items"], list)
             assert isinstance(data["spam_items"], list)
             assert isinstance(data["suggested_actions"], list)
+            assert isinstance(data["totals"], dict)
 
     def test_daily_report_backward_compat_fields_present(self):
         """Backward-compatible fields (total_processed, action_required, etc.) must still exist."""
@@ -263,13 +265,17 @@ class TestSafeModeSuggestedActions:
         from src.models.schemas import ReportSuggestedAction
         action = ReportSuggestedAction(
             email_id=1,
-            action_type="MOVE_FOLDER",
+            thread_id="thread-1",
+            action_type="archive",
+            payload={"target_folder": "Archive"},
             target_folder="Archive",
             description="Archivieren: Test",
             safe_mode=True,
         )
         assert action.email_id == 1
-        assert action.action_type == "MOVE_FOLDER"
+        assert action.thread_id == "thread-1"
+        assert action.action_type == "archive"
+        assert action.payload["target_folder"] == "Archive"
         assert action.safe_mode is True
 
     def test_suggested_actions_have_email_ids(self):
@@ -287,8 +293,8 @@ class TestSafeModeSuggestedActions:
         """Supported action_type values must include the expected set."""
         from src.models.schemas import ReportSuggestedAction
         valid_types = [
-            "MOVE_FOLDER", "MARK_READ", "ADD_FLAG",
-            "MARK_SPAM", "MARK_RESOLVED", "REPLY_DRAFT",
+            "move", "archive", "mark_read",
+            "mark_spam", "mark_resolved", "reply_draft", "delete",
         ]
         for atype in valid_types:
             a = ReportSuggestedAction(
@@ -314,6 +320,12 @@ class TestSafeModeSuggestedActions:
             assert "suggested_actions" in data
             # In safe mode with no emails, list should be empty (not raise an error)
             assert isinstance(data["suggested_actions"], list)
+
+    def test_report_ui_supports_queueing_suggested_actions(self):
+        """Frontend should post suggested-action clicks to report queue endpoint."""
+        content = (REPO_ROOT / "frontend" / "app.js").read_text()
+        assert "/api/reports/daily/suggested-actions" in content
+        assert "SAFE MODE aktiv" in content
 
 
 # ===========================================================================

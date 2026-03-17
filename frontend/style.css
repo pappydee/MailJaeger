@@ -502,3 +502,52 @@ body {
     max-height: 420px;
     overflow-y: auto;
 }
+.report-safe-hint {
+    font-size: 12px;
+    color: #92400E;
+    background: #FEF3C7;
+    border: 1px solid #FCD34D;
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-bottom: 12px;
+}
+.report-section {
+    margin-bottom: 12px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+}
+.report-section h3 {
+    font-size: 13px;
+    margin: 0 0 8px;
+}
+.report-section ul {
+    margin: 0;
+    padding-left: 18px;
+    display: grid;
+    gap: 6px;
+    font-size: 12px;
+}
+.report-section li strong { display: inline-block; margin-right: 6px; }
+.report-suggested-actions {
+    display: grid;
+    gap: 8px;
+}
+.report-action-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px;
+    border-radius: 6px;
+    background: var(--background);
+}
+.report-action-context {
+    font-size: 11px;
+    color: var(--text-light);
+    margin-top: 2px;
+}
+.report-action-btn {
+    white-space: nowrap;
+}

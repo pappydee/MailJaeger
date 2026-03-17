@@ -23,6 +23,7 @@ from src.models.schemas import (
     EmailDetailResponse,
     DashboardResponse,
     DailyReportResponse,
+    ReportTotals,
     ReportEmailItem,
     ReportSuggestedAction,
     ProcessingRunResponse,
@@ -34,6 +35,7 @@ from src.models.schemas import (
     PendingActionResponse,
     PendingActionWithEmailResponse,
     ApproveActionRequest,
+    QueueSuggestedActionRequest,
     ApplyActionsRequest,
     PreviewActionsRequest,
     PreviewActionsResponse,
@@ -49,6 +51,7 @@ from src.models.database import (
     ApplyToken,
     ClassificationOverride,
     ActionQueue,
+    DecisionEvent,
 )
 from src.services.scheduler import get_scheduler, get_run_status
 from src.services.imap_service import IMAPService
@@ -69,6 +72,16 @@ from src import __version__, CHANGELOG
 # Setup logging
 setup_logging()
 logger = get_logger(__name__)
+
+DAILY_REPORT_ACTION_TYPES = {
+    "move",
+    "archive",
+    "mark_spam",
+    "delete",
+    "mark_read",
+    "mark_resolved",
+    "reply_draft",
+}
 
 # In-memory session store: imported from session_store so that
 # require_authentication() in auth.py can validate cookies without a
@@ -126,6 +139,47 @@ def _daily_report_available(db: Session) -> bool:
         return count > 0
     except Exception:
         return False
+
+
+def _is_report_suggested_action(action: ActionQueue) -> bool:
+    payload = action.payload or {}
+    return isinstance(payload, dict) and payload.get("source") == "daily_report_suggestion"
+
+
+def _record_decision_event(
+    db: Session,
+    *,
+    email_id: int,
+    thread_id: Optional[str],
+    event_type: str,
+    old_value: Optional[str],
+    new_value: Optional[str],
+    user_confirmed: bool,
+) -> None:
+    db.add(
+        DecisionEvent(
+            email_id=email_id,
+            thread_id=thread_id,
+            event_type=event_type,
+            source="user",
+            old_value=old_value,
+            new_value=new_value,
+            user_confirmed=user_confirmed,
+        )
+    )
+
+
+def _build_reply_draft_payload(subject: Optional[str]) -> Dict[str, str]:
+    safe_subject = subject or "(kein Betreff)"
+    return {
+        "draft_summary": f"Antwortentwurf für {safe_subject}",
+        "draft_text": (
+            f"Hallo,\n\nvielen Dank für Ihre Nachricht "
+            f"zu „{subject or 'dem Thema'}“.\n"
+            "Ich melde mich mit einer detaillierten Rückmeldung.\n\n"
+            "Viele Grüße"
+        ),
+    }
 
 
 # Global authentication middleware (fail-closed)
@@ -1015,6 +1069,68 @@ async def list_actions(
 
 
 @app.post(
+    "/api/reports/daily/suggested-actions",
+    response_model=ActionQueueResponse,
+    dependencies=[Depends(require_authentication)],
+)
+async def queue_daily_report_suggested_action(
+    request: QueueSuggestedActionRequest, db: Session = Depends(get_db)
+):
+    """
+    Queue one daily-report suggested action.
+
+    This endpoint never executes actions directly; it only creates a proposal
+    in the existing action queue/approval flow.
+    """
+    email = db.query(ProcessedEmail).filter(ProcessedEmail.id == request.email_id).first()
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    normalized_type = (request.action_type or "").strip().lower()
+    if not normalized_type:
+        raise HTTPException(status_code=400, detail="action_type is required")
+    if normalized_type not in DAILY_REPORT_ACTION_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported suggested action type")
+
+    payload = dict(request.payload or {})
+    queue_action_type = normalized_type
+
+    if normalized_type == "archive":
+        queue_action_type = "move"
+        payload["target_folder"] = payload.get("target_folder") or settings.archive_folder
+    elif normalized_type == "mark_spam":
+        queue_action_type = "move"
+        payload["target_folder"] = payload.get("target_folder") or settings.quarantine_folder
+    elif normalized_type == "move":
+        queue_action_type = "move"
+        payload["target_folder"] = payload.get("target_folder") or settings.archive_folder
+    elif normalized_type in ("mark_read", "delete", "mark_resolved", "reply_draft"):
+        queue_action_type = normalized_type
+
+    if queue_action_type == "reply_draft":
+        reply_payload = _build_reply_draft_payload(email.subject)
+        payload.setdefault("draft_summary", reply_payload["draft_summary"])
+        payload.setdefault("draft_text", reply_payload["draft_text"])
+
+    payload["source"] = "daily_report_suggestion"
+    payload["safe_mode"] = bool(request.safe_mode)
+    if request.description:
+        payload["description"] = request.description
+
+    action = ActionQueue(
+        email_id=email.id,
+        thread_id=request.thread_id or email.thread_id,
+        action_type=queue_action_type,
+        payload=payload,
+        status="proposed_action",
+    )
+    db.add(action)
+    db.commit()
+    db.refresh(action)
+    return action
+
+
+@app.post(
     "/api/actions/{action_id}/approve",
     response_model=ActionQueueResponse,
     dependencies=[Depends(require_authentication)],
@@ -1028,9 +1144,20 @@ async def approve_action(action_id: int, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=400, detail=f"Cannot approve action with status {action.status}"
         )
+    previous_status = action.status
     action.status = "approved"
     action.approved_at = datetime.utcnow()
     action.updated_at = datetime.utcnow()
+    if _is_report_suggested_action(action):
+        _record_decision_event(
+            db,
+            email_id=action.email_id,
+            thread_id=action.thread_id,
+            event_type="approve_suggestion",
+            old_value=previous_status,
+            new_value=action.action_type,
+            user_confirmed=True,
+        )
     db.commit()
     db.refresh(action)
     return action
@@ -1048,9 +1175,20 @@ async def reject_action(action_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Action not found")
     if action.status in ("executed", "executed_action"):
         raise HTTPException(status_code=400, detail="Cannot reject an executed action")
+    previous_status = action.status
     action.status = "failed"
     action.error_message = "Rejected by user"
     action.updated_at = datetime.utcnow()
+    if _is_report_suggested_action(action):
+        _record_decision_event(
+            db,
+            email_id=action.email_id,
+            thread_id=action.thread_id,
+            event_type="reject_suggestion",
+            old_value=previous_status,
+            new_value=action.action_type,
+            user_confirmed=False,
+        )
     db.commit()
     db.refresh(action)
     return action
@@ -1091,6 +1229,19 @@ async def execute_action(action_id: int, db: Session = Depends(get_db)):
             db.add(action)
             if email:
                 db.add(email)
+            if _is_report_suggested_action(action) and action.status in (
+                "executed",
+                "executed_action",
+            ):
+                _record_decision_event(
+                    db,
+                    email_id=action.email_id,
+                    thread_id=action.thread_id,
+                    event_type="execute_suggestion",
+                    old_value="approved",
+                    new_value=action.action_type,
+                    user_confirmed=True,
+                )
             db.commit()
             db.refresh(action)
             return action
@@ -1923,6 +2074,7 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
         def _to_item(e: ProcessedEmail) -> ReportEmailItem:
             return ReportEmailItem(
                 email_id=e.id,
+                thread_id=e.thread_id,
                 subject=e.subject,
                 sender=e.sender,
                 summary=e.summary,
@@ -1967,7 +2119,9 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
                 suggested_actions.append(
                     ReportSuggestedAction(
                         email_id=e.id,
-                        action_type="MOVE_FOLDER",
+                        thread_id=e.thread_id,
+                        action_type="mark_spam",
+                        payload={"target_folder": settings.quarantine_folder},
                         target_folder=settings.quarantine_folder,
                         description=f"Spam verschieben: {e.subject or '(kein Betreff)'}",
                         safe_mode=safe_mode_active,
@@ -1977,7 +2131,9 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
                 suggested_actions.append(
                     ReportSuggestedAction(
                         email_id=e.id,
-                        action_type="MARK_RESOLVED",
+                        thread_id=e.thread_id,
+                        action_type="mark_resolved",
+                        payload={"reason": "daily_report_unresolved"},
                         description=f"Als erledigt markieren: {e.subject or '(kein Betreff)'}",
                         safe_mode=safe_mode_active,
                     )
@@ -1985,7 +2141,9 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
                 suggested_actions.append(
                     ReportSuggestedAction(
                         email_id=e.id,
-                        action_type="REPLY_DRAFT",
+                        thread_id=e.thread_id,
+                        action_type="reply_draft",
+                        payload=_build_reply_draft_payload(e.subject),
                         description=f"Antwort-Entwurf erstellen: {e.subject or '(kein Betreff)'}",
                         safe_mode=safe_mode_active,
                     )
@@ -1994,7 +2152,9 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
                 suggested_actions.append(
                     ReportSuggestedAction(
                         email_id=e.id,
-                        action_type="MOVE_FOLDER",
+                        thread_id=e.thread_id,
+                        action_type="archive",
+                        payload={"target_folder": settings.archive_folder},
                         target_folder=settings.archive_folder,
                         description=f"Archivieren: {e.subject or '(kein Betreff)'}",
                         safe_mode=safe_mode_active,
@@ -2069,6 +2229,12 @@ Halte den Bericht präzise und handlungsorientiert."""
         return DailyReportResponse(
             generated_at=datetime.utcnow().isoformat(),
             period_hours=24,
+            totals=ReportTotals(
+                total_processed=total_processed,
+                action_required=action_required_count,
+                unresolved=unresolved_count,
+                spam_detected=spam_count,
+            ),
             total_processed=total_processed,
             action_required=action_required_count,
             spam_detected=spam_count,
