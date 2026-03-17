@@ -66,3 +66,7 @@ htmlcov/
 *.tmp
 *.bak
 .~*
+
+# Custom CA certificates (keep the certs/ directory itself, but never commit real certs)
+certs/*.crt
+certs/*.pem

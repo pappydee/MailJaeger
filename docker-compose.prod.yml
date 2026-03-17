@@ -1,5 +1,26 @@
 # Production Docker Compose with Secrets Support
 # Use with: docker compose -f docker-compose.prod.yml up -d
+#
+# Ollama (AI) notes
+# -----------------
+# By default this file reaches the Ollama instance running on the HOST machine
+# (via host.docker.internal).  This is consistent with the local dev setup and
+# avoids needing a containerised Ollama for most deployments.
+#
+# If you want a fully self-contained deployment with a containerised Ollama,
+# start it with the optional profile:
+#
+#   docker compose -f docker-compose.prod.yml --profile with-ollama up -d
+#
+# and override AI_ENDPOINT in your .env or environment:
+#
+#   AI_ENDPOINT=http://ollama:11434
+#
+# Custom CA certificates
+# ----------------------
+# Place *.crt / *.pem files in the ./certs/ directory on the host.
+# They are imported automatically at container startup (TLS stays enabled).
+# Leave the directory empty if no custom certs are needed.
 
 version: '3.8'
 
@@ -10,8 +31,10 @@ secrets:
     file: ./secrets/imap_password.txt
 
 services:
-  # Ollama AI Service
+  # ── Optional: containerised Ollama ─────────────────────────────────────────
+  # Activate with:  docker compose -f docker-compose.prod.yml --profile with-ollama up -d
   ollama:
+    profiles: [with-ollama]
     image: ollama/ollama:latest
     container_name: mailjaeger-ollama
     volumes:
@@ -29,7 +52,7 @@ services:
     #           count: 1
     #           capabilities: [gpu]
 
-  # MailJaeger Application
+  # ── MailJaeger Application ──────────────────────────────────────────────────
   mailjaeger:
     build: .
     container_name: mailjaeger-app
@@ -44,71 +67,83 @@ services:
       # Security - Read API key from Docker secret
       - API_KEY_FILE=/run/secrets/mailjaeger_api_key
       - TRUST_PROXY=true  # Enable when behind reverse proxy
-      
+
       # Server Configuration
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8000
       # Update CORS_ORIGINS to match your domain
       - CORS_ORIGINS=https://mail.yourdomain.com
-      
+
       # IMAP Configuration
       - IMAP_HOST=${IMAP_HOST}
       - IMAP_PORT=${IMAP_PORT:-993}
       - IMAP_USERNAME=${IMAP_USERNAME}
       # IMAP password from Docker secret (read in entrypoint or config)
       - IMAP_PASSWORD_FILE=/run/secrets/imap_password
-      
+
       # AI Configuration
-      - AI_ENDPOINT=http://ollama:11434
-      - AI_MODEL=${AI_MODEL:-mistral:7b-instruct-q4_0}
+      # Default: host-local Ollama (same as local dev setup).
+      # Override with AI_ENDPOINT=http://ollama:11434 when using the
+      # containerised Ollama started via --profile with-ollama.
+      - AI_ENDPOINT=${AI_ENDPOINT:-http://host.docker.internal:11434}
+      - AI_MODEL=${AI_MODEL:-mistral-small3.1}
       - AI_TIMEOUT=${AI_TIMEOUT:-120}
-      
+
       # Database
       - DATABASE_URL=sqlite:///./data/mailjaeger.db
-      
+
       # Processing
       - SPAM_THRESHOLD=${SPAM_THRESHOLD:-0.7}
       - MAX_EMAILS_PER_RUN=${MAX_EMAILS_PER_RUN:-200}
-      
+
       # Mail Action Safety
       - SAFE_MODE=${SAFE_MODE:-true}
       - MARK_AS_READ=${MARK_AS_READ:-false}
       - DELETE_SPAM=${DELETE_SPAM:-false}
       - QUARANTINE_FOLDER=${QUARANTINE_FOLDER:-Quarantine}
-      
+
       # Scheduling
       - SCHEDULE_TIME=${SCHEDULE_TIME:-02:00}
       - SCHEDULE_TIMEZONE=${SCHEDULE_TIMEZONE:-Europe/Berlin}
-      
+
       # Learning
       - LEARNING_ENABLED=${LEARNING_ENABLED:-true}
       - LEARNING_CONFIDENCE_THRESHOLD=${LEARNING_CONFIDENCE_THRESHOLD:-0.8}
-      
+
       # Storage & Privacy
       - STORE_EMAIL_BODY=${STORE_EMAIL_BODY:-false}
       - STORE_ATTACHMENTS=${STORE_ATTACHMENTS:-false}
-      
+
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DEBUG=false  # Never enable in production
-    
+
+    extra_hosts:
+      # Allows the container to reach the host machine's Ollama instance.
+      - "host.docker.internal:host-gateway"
+
     volumes:
       - mailjaeger_data:/app/data
-    
-    depends_on:
-      - ollama
-    
+      # Custom CA certificates — place *.crt / *.pem in ./certs/ on the host.
+      # Imported automatically at startup; leave empty if not needed.
+      - ./certs:/app/certs:ro
+
     restart: unless-stopped
-    
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
-    
-    # Security: Run as non-root user
-    user: "1000:1000"
+
+    # NOTE: The user directive is intentionally omitted here.
+    # Hardcoding a UID:GID (e.g. "1000:1000") causes permission errors on macOS
+    # and many Linux volume setups.  The container runs as root inside its own
+    # namespace, which is safe because the data volume is private.
+    # Linux users who need a non-root container user can override per-environment:
+    #   user: "${UID}:${GID}"
+    # (in a docker-compose.override.yml file)
 
 networks:
   mailjaeger_internal:

@@ -73,11 +73,12 @@ services:
     
     volumes:
       - mailjaeger_data:/app/data
-      # Optional: mount custom CA certificates for local TLS interception
-      # (e.g. corporate antivirus proxies).  Place *.crt or *.pem files in
-      # a local ./certs/ directory and uncomment the line below.
-      # The container startup script will import them automatically.
-      # - ./certs:/app/certs:ro
+      # Custom CA certificates for local TLS interception (e.g. corporate antivirus).
+      # Place *.crt or *.pem files in the ./certs/ directory; they are imported
+      # automatically at container startup via scripts/entrypoint.sh.
+      # The directory is present in the repo (certs/.gitkeep) and is safe to leave
+      # empty — startup succeeds with no certs present.
+      - ./certs:/app/certs:ro
       # Optional: Mount .env file for secrets (alternative to environment variables)
       # - ./.env:/app/.env:ro
     
