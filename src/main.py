@@ -38,16 +38,25 @@ from src.models.schemas import (
     PreviewActionsRequest,
     PreviewActionsResponse,
     ApplyActionsResponse,
+    ActionQueueResponse,
     ClassificationOverrideRequest,
     ClassificationOverrideResponse,
 )
-from src.models.database import ProcessedEmail, ProcessingRun, PendingAction, ApplyToken, ClassificationOverride
+from src.models.database import (
+    ProcessedEmail,
+    ProcessingRun,
+    PendingAction,
+    ApplyToken,
+    ClassificationOverride,
+    ActionQueue,
+)
 from src.services.scheduler import get_scheduler, get_run_status
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
 from src.services.search_service import SearchService
 from src.services.learning_service import LearningService
 from src.services.email_processor import EmailProcessor
+from src.services.action_executor import ActionExecutor
 from src.middleware.auth import require_authentication, AuthenticationError
 from src.middleware.session_store import _sessions, SESSION_COOKIE, SESSION_EXPIRY_HOURS
 from src.middleware.security_headers import SecurityHeadersMiddleware
@@ -977,6 +986,117 @@ async def update_settings_api(request: SettingsUpdate):
         "success": True,
         "message": "Settings update requires restart to take effect",
     }
+
+
+# Action Queue API endpoints
+@app.get(
+    "/api/actions",
+    response_model=List[ActionQueueResponse],
+    dependencies=[Depends(require_authentication)],
+)
+async def list_actions(
+    status: Optional[str] = Query(
+        None, description="Optional filter: proposed, approved, executed, failed"
+    ),
+    db: Session = Depends(get_db),
+):
+    """List action_queue entries with optional status filter."""
+    query = db.query(ActionQueue)
+    if status:
+        normalized = status.lower()
+        aliases = {
+            "proposed": ["proposed", "proposed_action"],
+            "approved": ["approved", "approved_action"],
+            "executed": ["executed", "executed_action"],
+            "failed": ["failed", "failed_action", "rejected_action"],
+        }
+        query = query.filter(ActionQueue.status.in_(aliases.get(normalized, [normalized])))
+    return query.order_by(ActionQueue.created_at.desc()).all()
+
+
+@app.post(
+    "/api/actions/{action_id}/approve",
+    response_model=ActionQueueResponse,
+    dependencies=[Depends(require_authentication)],
+)
+async def approve_action(action_id: int, db: Session = Depends(get_db)):
+    """Approve a proposed action."""
+    action = db.query(ActionQueue).filter(ActionQueue.id == action_id).first()
+    if not action:
+        raise HTTPException(status_code=404, detail="Action not found")
+    if action.status not in ("proposed", "proposed_action"):
+        raise HTTPException(
+            status_code=400, detail=f"Cannot approve action with status {action.status}"
+        )
+    action.status = "approved"
+    action.approved_at = datetime.utcnow()
+    action.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(action)
+    return action
+
+
+@app.post(
+    "/api/actions/{action_id}/reject",
+    response_model=ActionQueueResponse,
+    dependencies=[Depends(require_authentication)],
+)
+async def reject_action(action_id: int, db: Session = Depends(get_db)):
+    """Reject an action by marking it failed."""
+    action = db.query(ActionQueue).filter(ActionQueue.id == action_id).first()
+    if not action:
+        raise HTTPException(status_code=404, detail="Action not found")
+    if action.status in ("executed", "executed_action"):
+        raise HTTPException(status_code=400, detail="Cannot reject an executed action")
+    action.status = "failed"
+    action.error_message = "Rejected by user"
+    action.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(action)
+    return action
+
+
+@app.post(
+    "/api/actions/{action_id}/execute",
+    response_model=ActionQueueResponse,
+    dependencies=[Depends(require_authentication)],
+)
+async def execute_action(action_id: int, db: Session = Depends(get_db)):
+    """Execute an approved action via explicit API call only."""
+    action = db.query(ActionQueue).filter(ActionQueue.id == action_id).first()
+    if not action:
+        raise HTTPException(status_code=404, detail="Action not found")
+
+    if action.status in ("executed", "executed_action"):
+        return action
+
+    if action.status not in ("approved", "approved_action"):
+        raise HTTPException(
+            status_code=400, detail=f"Only approved actions can be executed (got {action.status})"
+        )
+
+    if get_settings().safe_mode:
+        raise HTTPException(
+            status_code=409,
+            detail="SAFE_MODE enabled; action execution requires SAFE_MODE=false",
+        )
+
+    email = db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+
+    try:
+        with IMAPService() as imap:
+            executor = ActionExecutor(imap)
+            _ = executor.execute(action, email)
+            action.updated_at = datetime.utcnow()
+            db.add(action)
+            if email:
+                db.add(email)
+            db.commit()
+            db.refresh(action)
+            return action
+    except RuntimeError as exc:
+        sanitized_error = sanitize_error(exc, debug=settings.debug)
+        raise HTTPException(status_code=503, detail=sanitized_error)
 
 
 # Pending Actions API endpoints

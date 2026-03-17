@@ -377,47 +377,43 @@ class DecisionEvent(Base):
 
 
 class ActionQueue(Base):
-    """Action queue with state machine for safe email actions (Priority 6)"""
+    """Structured action queue for propose/approve/execute flow."""
 
     __tablename__ = "action_queue"
 
     id = Column(Integer, primary_key=True, index=True)
     email_id = Column(Integer, ForeignKey("processed_emails.id"), nullable=False)
+    thread_id = Column(String(200), index=True, nullable=True)
 
     # Action details
-    action_type = Column(
-        String(50), nullable=False, index=True
-    )  # MOVE_FOLDER, MARK_READ, ADD_FLAG, DELETE, MARK_SPAM, ARCHIVE
-    target_folder = Column(String(200))  # For MOVE_FOLDER actions
-    parameters = Column(JSON)  # Additional action parameters
+    action_type = Column(String(50), nullable=False, index=True)
+    payload = Column(JSON)
 
-    # State machine: proposed_action → queued_action → approved_action → executed_action
-    status = Column(
-        String(30), default="proposed_action", index=True
-    )  # proposed_action, queued_action, approved_action, executed_action, rejected_action, failed_action
-
-    # Metadata
-    source = Column(String(50))  # system, user, rule, pipeline
-    confidence = Column(Float)
-    reasoning = Column(Text)
+    # Compatibility note:
+    # Legacy state-machine docs/tests reference:
+    # proposed_action, queued_action, approved_action, executed_action,
+    # rejected_action, failed_action.
+    # The API foundation introduced in this branch uses:
+    # proposed, approved, executed, failed.
+    status = Column(String(30), default="proposed_action", index=True)
 
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     queued_at = Column(DateTime)
     approved_at = Column(DateTime)
     executed_at = Column(DateTime)
-    rejected_at = Column(DateTime)
 
     # Error tracking
     error_message = Column(Text)
-    retry_count = Column(Integer, default=0)
 
     # Relationships
     email = relationship("ProcessedEmail", back_populates="action_queue_items")
 
     __table_args__ = (
-        Index("idx_action_queue_status", "status", "created_at"),
-        Index("idx_action_queue_email", "email_id", "status"),
+        Index("idx_action_queue_status", "status"),
+        Index("idx_action_queue_email", "email_id"),
+        Index("idx_action_queue_thread", "thread_id"),
     )
 
 

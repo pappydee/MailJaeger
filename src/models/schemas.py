@@ -290,3 +290,26 @@ class ApplyActionsResponse(BaseModel):
     applied: int
     failed: int
     actions: List[dict]
+
+
+class ActionQueueStatus(str, Enum):
+    proposed = "proposed"
+    approved = "approved"
+    executed = "executed"
+    failed = "failed"
+
+
+class ActionQueueResponse(BaseModel):
+    id: int
+    email_id: int
+    thread_id: Optional[str] = None
+    action_type: str
+    payload: Optional[dict] = None
+    status: str
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    executed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+
+    class Config:
+        from_attributes = True

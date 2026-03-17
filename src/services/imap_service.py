@@ -315,6 +315,19 @@ class IMAPService:
             logger.error(f"Failed to flag email {uid}: {sanitized_error}")
             return False
 
+    def delete_message(self, uid: int) -> bool:
+        """Delete email."""
+        if not self.client:
+            return False
+
+        try:
+            self.client.delete_messages([uid])
+            return True
+        except Exception as e:
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            logger.error(f"Failed to delete email {uid}: {sanitized_error}")
+            return False
+
     def _ensure_folder_exists(self, folder: str):
         """Ensure folder exists, create if needed"""
         try:
