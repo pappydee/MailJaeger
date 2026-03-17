@@ -127,6 +127,16 @@ class TestCertsVolumeMount:
             f"entrypoint.sh has syntax errors: {result.stderr}"
         )
 
+    def test_env_example_does_not_say_uncomment_certs_volume(self):
+        """.env.example must not instruct users to manually uncomment the certs volume.
+        The mount is now active by default so those instructions are stale."""
+        content = (REPO_ROOT / ".env.example").read_text()
+        # The old step 3 told users to uncomment the line in docker-compose.yml
+        assert "Uncomment the certs volume" not in content, (
+            ".env.example still says to uncomment the certs volume — "
+            "update the comment to reflect that the mount is now active by default"
+        )
+
 
 # ===========================================================================
 # Task 3 — Local Ollama: configurable AI endpoint in prod compose
