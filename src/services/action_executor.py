@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 class ActionExecutor:
     """Execute approved actions safely and idempotently."""
 
-    SUPPORTED_ACTIONS = {"move", "mark_read", "delete", "reply"}
+    SUPPORTED_ACTIONS = {"move", "mark_read", "delete"}
 
     def __init__(self, imap: IMAPService):
         self.imap = imap
@@ -35,9 +35,6 @@ class ActionExecutor:
             if not isinstance(target_folder, str) or not target_folder.strip():
                 return False, "move action requires payload.target_folder"
 
-        if action.action_type == "reply":
-            return False, "reply action is not implemented yet"
-
         return True, ""
 
     def execute(self, action: ActionQueue, email: ProcessedEmail) -> bool:
@@ -47,6 +44,10 @@ class ActionExecutor:
         Idempotency:
         - already executed -> no-op success
         - only approved actions can execute
+
+        Compatibility:
+        - accepts legacy state names approved_action/executed_action
+          while writing normalized status values approved/executed/failed.
         """
         if action.status in ("executed", "executed_action"):
             return True

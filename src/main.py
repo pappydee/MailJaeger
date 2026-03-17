@@ -1086,7 +1086,7 @@ async def execute_action(action_id: int, db: Session = Depends(get_db)):
     try:
         with IMAPService() as imap:
             executor = ActionExecutor(imap)
-            _ = executor.execute(action, email)
+            executor.execute(action, email)
             action.updated_at = datetime.utcnow()
             db.add(action)
             if email:
@@ -1095,7 +1095,7 @@ async def execute_action(action_id: int, db: Session = Depends(get_db)):
             db.refresh(action)
             return action
     except RuntimeError as exc:
-        sanitized_error = sanitize_error(exc, debug=settings.debug)
+        sanitized_error = sanitize_error(exc, debug=get_settings().debug)
         raise HTTPException(status_code=503, detail=sanitized_error)
 
 

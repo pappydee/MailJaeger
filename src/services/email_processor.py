@@ -838,6 +838,7 @@ class EmailProcessor:
 
         email_record.actions_taken = {"actions": actions_taken}
         self.db.add(email_record)
+        self.db.flush()
         self._queue_action_proposals(email_record, analysis)
         self.db.add(AuditLog(
             event_type="EMAIL_PROCESSED",
