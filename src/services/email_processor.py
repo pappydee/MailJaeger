@@ -498,7 +498,6 @@ class EmailProcessor:
             ingestion_service = MailIngestionService(self.db)
             stats = ingestion_service.ingest_folder(
                 folder=self.settings.inbox_folder,
-                max_emails=self.settings.max_emails_per_run,
                 run_id=run_id,
             )
             return stats

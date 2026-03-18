@@ -18,6 +18,7 @@ import re
 import uuid
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
+from sqlalchemy import Integer, cast, desc
 from sqlalchemy.orm import Session
 
 from src.config import get_settings
@@ -60,32 +61,53 @@ class MailIngestionService:
         Returns a summary dict with counts of new, skipped, and failed emails.
         Supports pause/resume via the analysis_progress table.
         """
-        effective_max = max_emails or self.settings.max_emails_per_batch
+        effective_max = max_emails if max_emails and max_emails > 0 else None
         run_id = run_id or str(uuid.uuid4())
 
         progress = self._get_or_create_progress(run_id, "ingestion", folder)
         stats = {"new": 0, "skipped": 0, "failed": 0, "total": 0}
+        checkpoint_uid: Optional[int] = None
+        server_total = 0
 
         logger.info(
-            f"Starting ingestion: folder={folder}, max={effective_max}, run_id={run_id}"
+            "Starting ingestion: folder=%s, run_id=%s, uid_checkpoint_strategy=enabled, explicit_max=%s",
+            folder,
+            run_id,
+            effective_max if effective_max is not None else "none",
         )
 
         try:
             with IMAPService() as imap:
                 imap.client.select_folder(folder)
                 message_uids = imap.client.search(["ALL"])
+                server_total = len(message_uids)
 
                 if not message_uids:
-                    logger.info(f"No messages found in {folder}")
+                    logger.info(
+                        "No messages found in %s (server_total=0, considered=0, uid_checkpoint=none)",
+                        folder,
+                    )
                     self._mark_progress_complete(progress, stats)
                     return stats
 
-                # Apply resource budget limit
-                if len(message_uids) > effective_max:
+                checkpoint_uid = self._get_latest_uid_checkpoint(folder)
+                if checkpoint_uid is not None:
+                    message_uids = [uid for uid in message_uids if int(uid) > checkpoint_uid]
+
+                if effective_max is not None and len(message_uids) > effective_max:
                     message_uids = message_uids[:effective_max]
 
+                skipped_by_uid_checkpoint = server_total - len(message_uids)
                 stats["total"] = len(message_uids)
-                logger.info(f"Found {stats['total']} messages to check in {folder}")
+                logger.info(
+                    "Found %s messages to check in %s (server_total=%s, uid_checkpoint=%s, skipped_by_uid_checkpoint=%s, explicit_max=%s)",
+                    stats["total"],
+                    folder,
+                    server_total,
+                    checkpoint_uid if checkpoint_uid is not None else "none",
+                    skipped_by_uid_checkpoint,
+                    effective_max if effective_max is not None else "none",
+                )
 
                 # Fetch in batches to control memory
                 batch_size = min(self.settings.max_emails_per_batch, 25)
@@ -137,8 +159,15 @@ class MailIngestionService:
 
         self._mark_progress_complete(progress, stats)
         logger.info(
-            f"Ingestion complete: {stats['new']} new, {stats['skipped']} skipped, "
-            f"{stats['failed']} failed"
+            "Ingestion complete: folder=%s, server_total=%s, considered=%s, known=%s, new=%s, failed=%s, uid_checkpoint=%s, explicit_max=%s",
+            folder,
+            server_total,
+            stats["total"],
+            stats["skipped"],
+            stats["new"],
+            stats["failed"],
+            checkpoint_uid if checkpoint_uid is not None else "none",
+            effective_max if effective_max is not None else "none",
         )
         return stats
 
@@ -348,6 +377,29 @@ class MailIngestionService:
         if len(snippet) > max_length:
             snippet = snippet[:max_length] + "…"
         return snippet
+
+    def _get_latest_uid_checkpoint(self, folder: str) -> Optional[int]:
+        """
+        Return the highest known IMAP UID for a folder.
+
+        This enables incremental ingestion so only newly appended UIDs
+        are considered in normal runs.
+        """
+        latest_uid = (
+            self.db.query(ProcessedEmail.imap_uid)
+            .filter(
+                ProcessedEmail.folder == folder,
+                ProcessedEmail.imap_uid.isnot(None),
+            )
+            .order_by(desc(cast(ProcessedEmail.imap_uid, Integer)))
+            .first()
+        )
+        if not latest_uid or latest_uid[0] is None:
+            return None
+        try:
+            return int(latest_uid[0])
+        except (TypeError, ValueError):
+            return None
 
     # ------------------------------------------------------------------
     # Progress tracking (Priority 7)
