@@ -398,7 +398,7 @@ class TestDailyReportEndpoint:
         finally:
             app.dependency_overrides.clear()
 
-    def test_daily_report_fallback_when_ai_unavailable(self):
+    def test_daily_report_returns_pending_status_without_blocking(self):
         """Endpoint should return async status quickly without blocking on AI generation."""
         app, _ = self._client(emails_in_db=[])
         try:

@@ -2673,11 +2673,7 @@ async def get_daily_report(
         .first()
     )
 
-    if (
-        latest_report
-        and latest_report.generated_at
-        and latest_report.generated_at >= cutoff
-    ):
+    if latest_report and latest_report.generated_at:
         status_value = (latest_report.generation_status or "failed").lower()
         if status_value == "ready":
             cached_report = (
@@ -2713,8 +2709,13 @@ async def get_daily_report(
     db.add(queued_report)
     db.commit()
     db.refresh(queued_report)
+    # Defensive guard: mocked DB sessions in tests may not populate PKs.
     if isinstance(queued_report.id, int):
         background_tasks.add_task(_generate_daily_report_in_background, queued_report.id)
+    else:
+        logger.warning(
+            "Daily report queued without integer id; background generation not scheduled"
+        )
 
     return DailyReportEndpointResponse(
         status="pending",
