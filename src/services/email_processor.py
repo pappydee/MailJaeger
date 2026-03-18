@@ -262,9 +262,7 @@ class EmailProcessor:
             # but only when SAFE_MODE is disabled.
             approved_stats = {"total": 0, "executed": 0, "failed": 0}
             if self.settings.safe_mode:
-                logger.info(
-                    "SAFE_MODE active; skipping approved action auto-execution for this run"
-                )
+                logger.info("SAFE MODE: skipping auto-execution of approved actions")
             else:
                 self._update_status(
                     phase="ingestion",
