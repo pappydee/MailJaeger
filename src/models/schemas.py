@@ -262,6 +262,7 @@ class SettingsUpdate(BaseModel):
     learning_confidence_threshold: Optional[float] = Field(None, ge=0.0, le=1.0)
     store_email_body: Optional[bool] = None
     store_attachments: Optional[bool] = None
+    safe_mode: Optional[bool] = None
 
 
 class PendingActionStatus(str, Enum):

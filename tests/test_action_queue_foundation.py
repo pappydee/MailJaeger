@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from src.main import app
 from src.database.connection import get_db as _get_db
-from src.models.database import Base, ProcessedEmail, ActionQueue
+from src.models.database import Base, ProcessedEmail, ActionQueue, AppSetting
 from src.services.email_processor import EmailProcessor
 from src.config import Settings
 
@@ -74,7 +74,7 @@ def sample_email_data():
 
 def _settings_for_processor():
     settings = Mock(spec=Settings)
-    settings.safe_mode = True
+    settings.safe_mode = False
     settings.require_approval = False
     settings.spam_threshold = 0.7
     settings.ai_batch_size = 10
@@ -294,7 +294,7 @@ def test_reply_draft_execution_is_safe_and_keeps_draft_payload(
     mock_imap_cls.return_value.__enter__.return_value.delete_message.assert_not_called()
 
 
-def test_process_run_auto_executes_only_approved_actions_even_in_safe_mode(db_session):
+def test_process_run_auto_executes_only_approved_actions_when_safe_mode_disabled(db_session):
     email_approved = _create_email(db_session, uid="801")
     email_proposed = _create_email(db_session, uid="802")
     approved = ActionQueue(
@@ -313,7 +313,7 @@ def test_process_run_auto_executes_only_approved_actions_even_in_safe_mode(db_se
     db_session.commit()
 
     settings = _settings_for_processor()
-    settings.safe_mode = True
+    settings.safe_mode = False
     settings.require_approval = True
 
     with patch("src.services.email_processor.get_settings", return_value=settings):
@@ -340,6 +340,43 @@ def test_process_run_auto_executes_only_approved_actions_even_in_safe_mode(db_se
     imap.mark_as_read.assert_called_once_with(801)
 
 
+def test_process_run_skips_auto_execution_when_safe_mode_enabled(db_session):
+    email = _create_email(db_session, uid="804")
+    approved = ActionQueue(
+        email_id=email.id,
+        action_type="mark_read",
+        payload={"source": "test"},
+        status="approved",
+    )
+    db_session.add(approved)
+    db_session.commit()
+
+    settings = _settings_for_processor()
+    settings.safe_mode = True
+    settings.require_approval = True
+
+    with patch("src.services.email_processor.get_settings", return_value=settings):
+        with patch("src.services.email_processor.IMAPService") as mock_imap_cls:
+            imap = Mock()
+            imap.connect.return_value = True
+            imap.mark_as_read.return_value = True
+            mock_imap_cls.return_value = imap
+
+            processor = EmailProcessor(db_session)
+            with patch.object(
+                processor,
+                "_run_ingestion",
+                return_value={"new": 0, "skipped": 0, "failed": 0},
+            ):
+                run = processor.process_emails(trigger_type="MANUAL")
+
+    db_session.refresh(approved)
+    assert run.status == "SUCCESS"
+    assert approved.status == "approved"
+    assert approved.executed_at is None
+    imap.mark_as_read.assert_not_called()
+
+
 def test_process_run_marks_failed_when_approved_action_execution_fails(db_session):
     email = _create_email(db_session, uid="803")
     approved = ActionQueue(
@@ -352,7 +389,7 @@ def test_process_run_marks_failed_when_approved_action_execution_fails(db_sessio
     db_session.commit()
 
     settings = _settings_for_processor()
-    settings.safe_mode = True
+    settings.safe_mode = False
     settings.require_approval = True
 
     with patch("src.services.email_processor.get_settings", return_value=settings):
@@ -377,6 +414,76 @@ def test_process_run_marks_failed_when_approved_action_execution_fails(db_sessio
     imap.move_to_folder.assert_called_once_with(803, "Archive")
 
 
+def test_settings_endpoint_updates_and_persists_safe_mode(
+    client, auth_headers, db_session, override_db
+):
+    import src.main
+
+    src.main.settings.safe_mode = False
+
+    response = client.post(
+        "/api/settings",
+        headers=auth_headers,
+        json={"safe_mode": True},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["safe_mode"] is True
+    assert "safe_mode" in body["updated_fields"]
+
+    persisted = (
+        db_session.query(AppSetting)
+        .filter(AppSetting.key == "safe_mode")
+        .first()
+    )
+    assert persisted is not None
+    assert persisted.value is True
+
+    # Simulate stale in-memory config; GET must still return persisted state.
+    src.main.settings.safe_mode = False
+    effective = client.get("/api/settings", headers=auth_headers)
+    assert effective.status_code == 200
+    assert effective.json()["safe_mode"] is True
+
+
+def test_persisted_safe_mode_is_applied_after_settings_reload(db_session):
+    import src.main
+    from src.config import get_settings, reload_settings
+
+    src.main._set_app_setting(db_session, key="safe_mode", value=True)
+    db_session.commit()
+
+    # Simulate process restart config reload from env (SAFE_MODE=false in tests)
+    reload_settings()
+    src.main.settings = get_settings()
+    assert src.main.settings.safe_mode is False
+
+    src.main._apply_persisted_safe_mode(db_session)
+    assert src.main.settings.safe_mode is True
+
+
+def test_apply_persisted_safe_mode_initializes_from_current_settings_when_missing(db_session):
+    import src.main
+
+    src.main.settings.safe_mode = False
+    db_session.query(AppSetting).filter(AppSetting.key == "safe_mode").delete()
+    db_session.commit()
+
+    effective = src.main._apply_persisted_safe_mode(db_session)
+    db_session.commit()
+
+    persisted = (
+        db_session.query(AppSetting)
+        .filter(AppSetting.key == "safe_mode")
+        .first()
+    )
+    assert effective is False
+    assert persisted is not None
+    assert persisted.value is False
+
+
 def test_process_run_does_not_retry_failed_actions(db_session):
     email_failed = _create_email(db_session, uid="901", thread_id="thread-failed")
     email_approved = _create_email(db_session, uid="902", thread_id="thread-failed")
@@ -399,7 +506,7 @@ def test_process_run_does_not_retry_failed_actions(db_session):
     db_session.commit()
 
     settings = _settings_for_processor()
-    settings.safe_mode = True
+    settings.safe_mode = False
     settings.require_approval = True
 
     with patch("src.services.email_processor.get_settings", return_value=settings):
@@ -448,7 +555,7 @@ def test_process_run_executes_approved_in_created_order(db_session):
     db_session.commit()
 
     settings = _settings_for_processor()
-    settings.safe_mode = True
+    settings.safe_mode = False
     settings.require_approval = True
 
     with patch("src.services.email_processor.get_settings", return_value=settings):

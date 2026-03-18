@@ -65,6 +65,7 @@ from src.models.database import (
     ActionQueue,
     DecisionEvent,
     DailyReport,
+    AppSetting,
 )
 from src.services.scheduler import get_scheduler, get_run_status
 from src.services.imap_service import IMAPService
@@ -109,6 +110,7 @@ DECISION_EVENT_TYPES = {
     "open_related_email_from_report",
 }
 DECISION_EVENT_SOURCES = {"daily_report", "report_suggestion", "queue_ui", "user"}
+APP_SETTING_SAFE_MODE = "safe_mode"
 
 # In-memory session store: imported from session_store so that
 # require_authentication() in auth.py can validate cookies without a
@@ -211,6 +213,33 @@ def _build_reply_draft_payload(subject: Optional[str]) -> Dict[str, str]:
             "Viele Grüße"
         ),
     }
+
+
+def _set_app_setting(db: Session, *, key: str, value) -> None:
+    setting = db.query(AppSetting).filter(AppSetting.key == key).first()
+    if setting:
+        setting.value = value
+        setting.updated_at = datetime.utcnow()
+    else:
+        db.add(AppSetting(key=key, value=value))
+    db.flush()
+
+
+def _get_app_setting(db: Session, *, key: str):
+    setting = db.query(AppSetting).filter(AppSetting.key == key).first()
+    return setting.value if setting else None
+
+
+def _apply_persisted_safe_mode(db: Session) -> bool:
+    persisted_safe_mode = _get_app_setting(db, key=APP_SETTING_SAFE_MODE)
+    if persisted_safe_mode is None:
+        _set_app_setting(
+            db, key=APP_SETTING_SAFE_MODE, value=bool(get_settings().safe_mode)
+        )
+        return bool(get_settings().safe_mode)
+
+    get_settings().safe_mode = bool(persisted_safe_mode)
+    return bool(get_settings().safe_mode)
 
 
 def _normalize_action_status(status_value: Optional[str]) -> str:
@@ -564,6 +593,10 @@ async def startup_event():
     # Initialize database
     init_db()
     logger.info("Database initialized")
+
+    with get_db_session() as db:
+        effective_safe_mode = _apply_persisted_safe_mode(db)
+    logger.info(f"Safe mode (effective): {effective_safe_mode}")
 
     # Verify critical tables exist (fail-closed startup check)
     try:
@@ -1165,8 +1198,9 @@ async def get_processing_run(run_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/api/settings", dependencies=[Depends(require_authentication)])
-async def get_settings_api():
+async def get_settings_api(db: Session = Depends(get_db)):
     """Get current settings (sanitized - no sensitive credentials)"""
+    _apply_persisted_safe_mode(db)
     return {
         "imap_host": settings.imap_host,
         "imap_port": settings.imap_port,
@@ -1186,13 +1220,23 @@ async def get_settings_api():
 
 
 @app.post("/api/settings", dependencies=[Depends(require_authentication)])
-async def update_settings_api(request: SettingsUpdate):
+async def update_settings_api(request: SettingsUpdate, db: Session = Depends(get_db)):
     """Update settings (partial update)"""
-    # Note: This would require reloading configuration
-    # For production, consider using a configuration management system
+    updated_fields = []
+    if request.safe_mode is not None:
+        settings.safe_mode = bool(request.safe_mode)
+        _set_app_setting(db, key=APP_SETTING_SAFE_MODE, value=settings.safe_mode)
+        updated_fields.append("safe_mode")
+
     return {
         "success": True,
-        "message": "Settings update requires restart to take effect",
+        "message": (
+            "Settings updated"
+            if updated_fields
+            else "No runtime-updatable settings provided"
+        ),
+        "updated_fields": updated_fields,
+        "safe_mode": settings.safe_mode,
     }
 
 
@@ -1531,12 +1575,6 @@ async def execute_action(
         raise HTTPException(
             status_code=400,
             detail=f"Only approved actions can be executed (got {action.status})",
-        )
-
-    if get_settings().safe_mode:
-        raise HTTPException(
-            status_code=409,
-            detail="SAFE_MODE enabled; action execution requires SAFE_MODE=false",
         )
 
     email = (
