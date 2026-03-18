@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional
 
 from sqlalchemy.orm import Session
@@ -21,16 +21,21 @@ class ThreadSummaryService:
     def _cache_key(thread_id: str) -> str:
         return f"thread_summary::{thread_id}"
 
-    @staticmethod
-    def _signature(emails: List[ProcessedEmail]) -> str:
+    @classmethod
+    def _signature(cls, emails: List[ProcessedEmail]) -> str:
         latest = emails[0] if emails else None
         payload = {
             "count": len(emails),
             "latest_id": latest.id if latest else None,
             "latest_message_id": latest.message_id if latest else None,
             "latest_date": (
-                (latest.date or latest.processed_at or latest.created_at).isoformat()
-                if latest and (latest.date or latest.processed_at or latest.created_at)
+                cls._normalize_datetime(
+                    latest.date or latest.processed_at or latest.created_at
+                ).isoformat()
+                if latest
+                and cls._normalize_datetime(
+                    latest.date or latest.processed_at or latest.created_at
+                )
                 else None
             ),
         }
@@ -50,7 +55,7 @@ class ThreadSummaryService:
         row = db.query(AppSetting).filter(AppSetting.key == key).first()
         if row:
             row.value = payload
-            row.updated_at = datetime.utcnow()
+            row.updated_at = datetime.now(timezone.utc)
         else:
             db.add(AppSetting(key=key, value=payload))
         db.flush()
@@ -140,15 +145,7 @@ class ThreadSummaryService:
         if not thread_id:
             return None
         ordered = list(emails)
-        ordered.sort(
-            key=lambda email: (
-                email.date or datetime.min,
-                email.processed_at or datetime.min,
-                email.created_at or datetime.min,
-                email.id or 0,
-            ),
-            reverse=True,
-        )
+        ordered.sort(key=lambda email: (self._datetime_sort_value(email), email.id or 0), reverse=True)
         if not ordered:
             return None
 
@@ -172,7 +169,19 @@ class ThreadSummaryService:
             {
                 "thread_id": thread_id,
                 "signature": signature,
-                "generated_at": datetime.utcnow().isoformat(),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
             }
         )
         return self._store_cached(db, thread_id=thread_id, payload=payload)
+    @staticmethod
+    def _normalize_datetime(value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+    @classmethod
+    def _datetime_sort_value(cls, email: ProcessedEmail) -> float:
+        dt = cls._normalize_datetime(email.date or email.processed_at or email.created_at)
+        return dt.timestamp() if dt else 0.0

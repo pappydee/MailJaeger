@@ -1,6 +1,6 @@
 """Thread-level state inference and lightweight summary helpers."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from sqlalchemy.orm import Session
@@ -44,7 +44,7 @@ def infer_thread_state(
             sender="me@example.com" if last_sender_is_user else "other@example.com",
             action_required=has_action_required,
             is_resolved=has_resolved,
-            date=datetime.utcnow(),
+            date=datetime.now(timezone.utc),
         )
     ]
     return infer_thread_state_from_emails(

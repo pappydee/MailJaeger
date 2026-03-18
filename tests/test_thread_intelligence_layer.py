@@ -69,7 +69,7 @@ def _mk_client(db_session):
 
 
 def test_thread_state_inference_all_branches():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     assert (
         infer_thread_state_from_emails(
             emails=[
@@ -169,14 +169,14 @@ def test_importance_priority_and_sort_key():
                 thread_id="urgent-thread",
                 sender="boss@example.com",
                 action_required=True,
-                date=datetime.utcnow(),
+                date=datetime.now(timezone.utc),
                 flags=[],
             ),
             _mk_email(
                 message_id="u2",
                 thread_id="urgent-thread",
                 sender="me@example.com",
-                date=datetime.utcnow() - timedelta(hours=1),
+                date=datetime.now(timezone.utc) - timedelta(hours=1),
             ),
         ],
         user_address="me@example.com",
@@ -189,7 +189,7 @@ def test_importance_priority_and_sort_key():
                 thread_id="low-thread",
                 sender="noreply@example.com",
                 subject="Newsletter",
-                date=datetime.utcnow() - timedelta(days=5),
+                date=datetime.now(timezone.utc) - timedelta(days=5),
                 is_spam=True,
                 spam_probability=0.99,
             )
@@ -206,7 +206,7 @@ def test_importance_priority_and_sort_key():
 def test_thread_summary_regeneration_only_on_change():
     db = _session()
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         emails = [
             _mk_email(
                 message_id="s1",
@@ -273,7 +273,7 @@ def test_actions_api_exposes_thread_intelligence_and_sorting():
             thread_id="thread-waiting",
             sender="user@example.com",
             action_required=True,
-            date=datetime.utcnow(),
+            date=datetime.now(timezone.utc),
         )
         low_email = _mk_email(
             message_id="api2",
@@ -281,7 +281,7 @@ def test_actions_api_exposes_thread_intelligence_and_sorting():
             sender="noreply@example.com",
             subject="newsletter digest",
             is_spam=True,
-            date=datetime.utcnow() - timedelta(days=2),
+            date=datetime.now(timezone.utc) - timedelta(days=2),
         )
         db.add_all([waiting_email, low_email])
         db.flush()
@@ -322,7 +322,7 @@ def test_actions_api_exposes_thread_intelligence_and_sorting():
 def test_daily_report_groups_by_threads_and_keeps_compatibility_fields():
     db = _session()
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         db.add_all(
             [
                 _mk_email(

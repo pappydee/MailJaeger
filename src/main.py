@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import defaultdict
 import sys
@@ -1581,9 +1581,12 @@ async def approve_action(
             status_code=400, detail=f"Cannot approve action with status {action.status}"
         )
     previous_status = action.status
+    transition_time = datetime.now(timezone.utc)
     action.status = "approved"
-    action.approved_at = datetime.utcnow()
-    action.updated_at = datetime.utcnow()
+    action.approved_at = transition_time
+    action.updated_at = transition_time
+    # Intentional broad capture: every user queue decision is now used
+    # as thread-level learning signal (not only daily-report suggestions).
     _record_decision_event(
         db,
         email_id=action.email_id,
@@ -1627,7 +1630,7 @@ async def reject_action(
     previous_status = action.status
     action.status = "rejected"
     action.error_message = "Rejected by user"
-    action.updated_at = datetime.utcnow()
+    action.updated_at = datetime.now(timezone.utc)
     _record_decision_event(
         db,
         email_id=action.email_id,
@@ -1702,6 +1705,7 @@ async def execute_action(
             db.add(action)
             if email:
                 db.add(email)
+            # Intentional broad capture for thread-level learning hooks.
             if action.status in (
                 "executed",
                 "executed_action",

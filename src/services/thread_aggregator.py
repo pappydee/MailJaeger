@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable, Iterable, List, Optional, Set, Tuple
 
@@ -49,6 +49,21 @@ _NEWSLETTER_HINTS = (
 )
 
 
+def _normalize_datetime(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _datetime_sort_value(email: ProcessedEmail) -> float:
+    dt = _normalize_datetime(email.date or email.processed_at or email.created_at)
+    if dt is None:
+        return 0.0
+    return dt.timestamp()
+
+
 def _sender_is_user(sender: Optional[str], user_address: Optional[str]) -> bool:
     if not sender or not user_address:
         return False
@@ -91,7 +106,7 @@ def infer_thread_state_from_emails(
     if not ordered:
         return "informational"
 
-    current_time = now or datetime.utcnow()
+    current_time = _normalize_datetime(now) or datetime.now(timezone.utc)
     latest = ordered[0]
     has_action_required = any(bool(email.action_required) for email in ordered)
     if has_action_required:
@@ -115,7 +130,7 @@ def infer_thread_state_from_emails(
             return "in_conversation"
 
     has_resolved = any(bool(email.is_resolved) for email in ordered)
-    latest_dt = latest.date or latest.processed_at or latest.created_at
+    latest_dt = _normalize_datetime(latest.date or latest.processed_at or latest.created_at)
     has_recent_activity = bool(
         latest_dt and latest_dt >= current_time - timedelta(hours=recent_hours)
     )
@@ -194,12 +209,7 @@ def build_thread_context(
 ) -> ThreadContext:
     ordered = list(emails)
     ordered.sort(
-        key=lambda email: (
-            email.date or datetime.min,
-            email.processed_at or datetime.min,
-            email.created_at or datetime.min,
-            email.id or 0,
-        ),
+        key=lambda email: (_datetime_sort_value(email), email.id or 0),
         reverse=True,
     )
 
@@ -208,7 +218,10 @@ def build_thread_context(
         latest.date or latest.processed_at or latest.created_at if latest else None
     )
     has_recent_activity = bool(
-        last_activity and last_activity >= (now or datetime.utcnow()) - timedelta(hours=48)
+        _normalize_datetime(last_activity)
+        and _normalize_datetime(last_activity)
+        >= (_normalize_datetime(now) or datetime.now(timezone.utc))
+        - timedelta(hours=48)
     )
     has_action_required = any(bool(email.action_required) for email in ordered)
     state = infer_thread_state_from_emails(
