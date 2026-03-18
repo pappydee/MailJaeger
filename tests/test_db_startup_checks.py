@@ -207,6 +207,29 @@ def _create_legacy_action_queue_database(db_file: Path):
     return engine
 
 
+def _create_legacy_processed_emails_database(db_file: Path):
+    engine = create_engine(f"sqlite:///{db_file}")
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS processed_emails_legacy (
+                    id INTEGER PRIMARY KEY,
+                    message_id VARCHAR(500) NOT NULL,
+                    uid VARCHAR(100),
+                    thread_id VARCHAR(200),
+                    sender VARCHAR(200),
+                    subject VARCHAR(500)
+                )
+                """
+            )
+        )
+        connection.execute(text("DROP TABLE processed_emails"))
+        connection.execute(text("ALTER TABLE processed_emails_legacy RENAME TO processed_emails"))
+    return engine
+
+
 class TestActionQueueSchemaRepair:
     def test_init_db_repairs_missing_action_queue_columns_and_preserves_rows(
         self, tmp_path, monkeypatch
@@ -318,6 +341,19 @@ class TestActionQueueSchemaRepair:
         client.close()
         app.dependency_overrides.clear()
         db_session.close()
+
+    def test_init_db_repairs_missing_processed_email_thread_columns(self, tmp_path):
+        from src.database.startup_checks import ensure_processed_emails_thread_state_schema
+
+        db_file = tmp_path / "legacy_processed_emails.sqlite"
+        engine = _create_legacy_processed_emails_database(db_file)
+        ensure_processed_emails_thread_state_schema(engine, debug=False)
+
+        inspector = inspect(engine)
+        columns = {column["name"] for column in inspector.get_columns("processed_emails")}
+        assert "thread_state" in columns
+        assert "thread_priority" in columns
+        assert "thread_importance_score" in columns
 
 
 if __name__ == "__main__":

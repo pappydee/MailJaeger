@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections import defaultdict
 import sys
 import secrets
 import hashlib
@@ -34,6 +35,7 @@ from src.models.schemas import (
     DashboardResponse,
     DailyReportResponse,
     DailyReportEndpointResponse,
+    DailyReportThreadGroup,
     ReportTotals,
     ReportEmailItem,
     ReportSuggestedAction,
@@ -79,6 +81,12 @@ from src.services.thread_context import (
     normalize_thread_state,
     update_thread_state_for_thread,
 )
+from src.services.thread_aggregator import (
+    build_thread_context,
+    query_open_action_count,
+    thread_sort_key,
+)
+from src.services.thread_summary_service import ThreadSummaryService
 from src.middleware.auth import require_authentication, AuthenticationError
 from src.middleware.session_store import _sessions, SESSION_COOKIE, SESSION_EXPIRY_HOURS
 from src.middleware.security_headers import SecurityHeadersMiddleware
@@ -337,16 +345,42 @@ def _safe_thread_state_from_context(
 
 
 def _serialize_action_queue(
-    db: Session, action: ActionQueue, *, email: Optional[ProcessedEmail] = None
+    db: Session,
+    action: ActionQueue,
+    *,
+    email: Optional[ProcessedEmail] = None,
+    thread_context: Optional[dict] = None,
 ) -> Dict:
     payload_out = action.payload if isinstance(action.payload, dict) else {}
     thread_id = action.thread_id or (email.thread_id if email else None)
-    thread_state = _safe_thread_state_from_context(db, thread_id=thread_id, email=email)
+    thread_state = (
+        thread_context.get("thread_state")
+        if isinstance(thread_context, dict)
+        else _safe_thread_state_from_context(db, thread_id=thread_id, email=email)
+    )
+    thread_priority = (
+        thread_context.get("thread_priority")
+        if isinstance(thread_context, dict)
+        else (email.thread_priority if email else None)
+    )
+    thread_importance_score = (
+        thread_context.get("thread_importance_score")
+        if isinstance(thread_context, dict)
+        else (email.thread_importance_score if email else None)
+    )
+    thread_last_activity_at = (
+        thread_context.get("thread_last_activity_at")
+        if isinstance(thread_context, dict)
+        else (email.date if email else None)
+    )
     return {
         "id": action.id,
         "email_id": action.email_id,
         "thread_id": thread_id,
         "thread_state": thread_state,
+        "thread_priority": thread_priority,
+        "thread_importance_score": thread_importance_score,
+        "thread_last_activity_at": thread_last_activity_at,
         "thread_summary": get_thread_summary(db, thread_id=thread_id),
         "action_type": action.action_type,
         "payload": action.payload,
@@ -1269,14 +1303,86 @@ async def list_actions(
         )
     actions = query.order_by(ActionQueue.created_at.desc()).all()
 
-    normalized_actions = []
+    action_rows = []
+    emails_by_id: Dict[int, ProcessedEmail] = {}
+    thread_ids = set()
     for action in actions:
         email = (
             db.query(ProcessedEmail)
             .filter(ProcessedEmail.id == action.email_id)
             .first()
         )
-        normalized_actions.append(_serialize_action_queue(db, action, email=email))
+        action_rows.append((action, email))
+        if email:
+            emails_by_id[email.id] = email
+        thread_id = action.thread_id or (email.thread_id if email else None)
+        if thread_id:
+            thread_ids.add(thread_id)
+
+    contexts_by_thread: Dict[str, dict] = {}
+    for thread_id in thread_ids:
+        thread_emails = (
+            db.query(ProcessedEmail)
+            .filter(ProcessedEmail.thread_id == thread_id)
+            .order_by(
+                ProcessedEmail.date.desc(),
+                ProcessedEmail.processed_at.desc(),
+                ProcessedEmail.created_at.desc(),
+                ProcessedEmail.id.desc(),
+            )
+            .all()
+        )
+        if not thread_emails:
+            continue
+        context = build_thread_context(
+            thread_id=thread_id,
+            emails=thread_emails,
+            user_address=getattr(settings, "imap_username", None),
+            open_actions_count=query_open_action_count(db, thread_id=thread_id),
+        )
+        for email in thread_emails:
+            email.thread_state = context.thread_state
+            email.thread_priority = context.thread_priority
+            email.thread_importance_score = context.thread_importance_score
+        contexts_by_thread[thread_id] = {
+            "thread_state": context.thread_state,
+            "thread_priority": context.thread_priority,
+            "thread_importance_score": context.thread_importance_score,
+            "thread_last_activity_at": context.thread_last_activity_at,
+            "sort_key": thread_sort_key(context),
+        }
+    db.flush()
+
+    action_rows.sort(
+        key=lambda row: (
+            contexts_by_thread.get(
+                row[0].thread_id or (row[1].thread_id if row[1] else None), {}
+            ).get("sort_key", (2, 0.0, 0.0))[0],
+            -contexts_by_thread.get(
+                row[0].thread_id or (row[1].thread_id if row[1] else None), {}
+            ).get("sort_key", (2, 0.0, 0.0))[1],
+            -contexts_by_thread.get(
+                row[0].thread_id or (row[1].thread_id if row[1] else None), {}
+            ).get("sort_key", (2, 0.0, 0.0))[2],
+            -(
+                (row[0].created_at or datetime.min).timestamp()
+                if row[0].created_at
+                else 0.0
+            ),
+        )
+    )
+
+    normalized_actions = []
+    for action, email in action_rows:
+        thread_id = action.thread_id or (email.thread_id if email else None)
+        normalized_actions.append(
+            _serialize_action_queue(
+                db,
+                action,
+                email=email,
+                thread_context=contexts_by_thread.get(thread_id),
+            )
+        )
     return normalized_actions
 
 
@@ -1478,17 +1584,16 @@ async def approve_action(
     action.status = "approved"
     action.approved_at = datetime.utcnow()
     action.updated_at = datetime.utcnow()
-    if _is_report_suggested_action(action):
-        _record_decision_event(
-            db,
-            email_id=action.email_id,
-            thread_id=action.thread_id,
-            event_type="approve_suggestion",
-            source=source or "queue_ui",
-            old_value=previous_status,
-            new_value=action.action_type,
-            user_confirmed=True,
-        )
+    _record_decision_event(
+        db,
+        email_id=action.email_id,
+        thread_id=action.thread_id,
+        event_type="approve_suggestion",
+        source=source or "queue_ui",
+        old_value=previous_status,
+        new_value=action.action_type,
+        user_confirmed=True,
+    )
     logger.info(
         "Action %s transition %s -> %s",
         action.id,
@@ -1523,17 +1628,16 @@ async def reject_action(
     action.status = "rejected"
     action.error_message = "Rejected by user"
     action.updated_at = datetime.utcnow()
-    if _is_report_suggested_action(action):
-        _record_decision_event(
-            db,
-            email_id=action.email_id,
-            thread_id=action.thread_id,
-            event_type="reject_suggestion",
-            source=source or "queue_ui",
-            old_value=previous_status,
-            new_value=action.action_type,
-            user_confirmed=False,
-        )
+    _record_decision_event(
+        db,
+        email_id=action.email_id,
+        thread_id=action.thread_id,
+        event_type="reject_suggestion",
+        source=source or "queue_ui",
+        old_value=previous_status,
+        new_value=action.action_type,
+        user_confirmed=False,
+    )
     logger.info(
         "Action %s transition %s -> %s",
         action.id,
@@ -1598,7 +1702,7 @@ async def execute_action(
             db.add(action)
             if email:
                 db.add(email)
-            if _is_report_suggested_action(action) and action.status in (
+            if action.status in (
                 "executed",
                 "executed_action",
             ):
@@ -2432,14 +2536,57 @@ def _build_daily_report_response(
         1 for e in recent_emails if e.action_required and not e.is_resolved
     )
     thread_ids = {e.thread_id for e in recent_emails if e.thread_id}
+    thread_recent_emails_map: Dict[str, List[ProcessedEmail]] = defaultdict(list)
+    for email in recent_emails:
+        if email.thread_id:
+            thread_recent_emails_map[email.thread_id].append(email)
+
+    thread_contexts: Dict[str, dict] = {}
+    summary_service = ThreadSummaryService()
     for thread_id in thread_ids:
-        update_thread_state_for_thread(
+        thread_emails = (
+            db.query(ProcessedEmail)
+            .filter(ProcessedEmail.thread_id == thread_id)
+            .order_by(
+                ProcessedEmail.date.desc(),
+                ProcessedEmail.processed_at.desc(),
+                ProcessedEmail.created_at.desc(),
+                ProcessedEmail.id.desc(),
+            )
+            .all()
+        )
+        if not thread_emails:
+            continue
+        context = build_thread_context(
+            thread_id=thread_id,
+            emails=thread_emails,
+            user_address=getattr(settings, "imap_username", None),
+            open_actions_count=query_open_action_count(db, thread_id=thread_id),
+        )
+        for email in thread_emails:
+            email.thread_state = context.thread_state
+            email.thread_priority = context.thread_priority
+            email.thread_importance_score = context.thread_importance_score
+        thread_summary = summary_service.get_or_generate_summary(
             db,
             thread_id=thread_id,
-            user_address=getattr(settings, "imap_username", None),
+            emails=thread_emails,
+            thread_state=context.thread_state,
+            allow_generate=True,
         )
+        thread_contexts[thread_id] = {
+            "thread_state": context.thread_state,
+            "thread_priority": context.thread_priority,
+            "thread_importance_score": context.thread_importance_score,
+            "thread_last_activity_at": context.thread_last_activity_at,
+            "summary": (thread_summary or {}).get("summary"),
+            "key_topic": (thread_summary or {}).get("key_topic"),
+            "status": (thread_summary or {}).get("status"),
+        }
+    db.flush()
 
     def _to_item(e: ProcessedEmail) -> ReportEmailItem:
+        thread_context = thread_contexts.get(e.thread_id) if e.thread_id else None
         return ReportEmailItem(
             email_id=e.id,
             thread_id=e.thread_id,
@@ -2448,7 +2595,13 @@ def _build_daily_report_response(
             summary=e.summary,
             priority=e.priority,
             category=e.category,
-            thread_state=normalize_thread_state(e.thread_state),
+            thread_state=normalize_thread_state(
+                (thread_context or {}).get("thread_state", e.thread_state)
+            ),
+            thread_priority=(thread_context or {}).get("thread_priority", e.thread_priority),
+            thread_importance_score=(thread_context or {}).get(
+                "thread_importance_score", e.thread_importance_score
+            ),
         )
 
     important_items = [
@@ -2598,6 +2751,55 @@ def _build_daily_report_response(
             suggestion.thread_suggestion_count = thread_suggestion_counts.get(
                 suggestion.thread_id, 0
             )
+    suggested_actions.sort(
+        key=lambda suggestion: (
+            0
+            if suggestion.thread_id
+            and thread_contexts.get(suggestion.thread_id, {}).get("thread_state")
+            == "waiting_for_me"
+            else 1,
+            float(
+                thread_contexts.get(suggestion.thread_id, {}).get(
+                    "thread_importance_score", 0.0
+                )
+            )
+            if suggestion.thread_id
+            else 0.0,
+        ),
+        reverse=True,
+    )
+
+    thread_groups: List[DailyReportThreadGroup] = []
+    for thread_id, thread_emails in thread_recent_emails_map.items():
+        context = thread_contexts.get(thread_id, {})
+        items = [_to_item(email) for email in thread_emails]
+        items.sort(
+            key=lambda item: (
+                item.thread_importance_score or 0.0,
+                item.email_id or 0,
+            ),
+            reverse=True,
+        )
+        thread_groups.append(
+            DailyReportThreadGroup(
+                thread_id=thread_id,
+                thread_state=normalize_thread_state(
+                    context.get("thread_state", "informational")
+                ),
+                priority=context.get("thread_priority", "normal"),
+                importance_score=float(context.get("thread_importance_score") or 0.0),
+                thread_last_activity_at=(
+                    context.get("thread_last_activity_at").isoformat()
+                    if context.get("thread_last_activity_at")
+                    else None
+                ),
+                summary=context.get("summary"),
+                key_topic=context.get("key_topic"),
+                status=context.get("status"),
+                emails=items,
+            )
+        )
+    thread_groups.sort(key=lambda group: group.importance_score, reverse=True)
 
     email_summaries = []
     for e in recent_emails[:30]:  # include top 30 in prompt to stay concise
@@ -2673,6 +2875,7 @@ Halte den Bericht präzise und handlungsorientiert."""
         action_items=action_items,
         unresolved_items=unresolved_items,
         spam_items=spam_items,
+        threads=thread_groups,
         suggested_actions=suggested_actions,
         report_text=report_text,
     )

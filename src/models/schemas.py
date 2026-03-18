@@ -156,6 +156,8 @@ class ReportEmailItem(BaseModel):
     priority: Optional[str] = None
     category: Optional[str] = None
     thread_state: Optional[str] = None
+    thread_priority: Optional[str] = None
+    thread_importance_score: Optional[float] = None
 
 
 class ReportTotals(BaseModel):
@@ -189,6 +191,18 @@ class ReportSuggestedAction(BaseModel):
     thread_suggestion_count: Optional[int] = None
 
 
+class DailyReportThreadGroup(BaseModel):
+    thread_id: str
+    thread_state: str
+    priority: str
+    importance_score: float
+    thread_last_activity_at: Optional[str] = None
+    summary: Optional[str] = None
+    key_topic: Optional[str] = None
+    status: Optional[str] = None
+    emails: List[ReportEmailItem] = []
+
+
 class DailyReportResponse(BaseModel):
     generated_at: str
     period_hours: int = 24
@@ -203,6 +217,7 @@ class DailyReportResponse(BaseModel):
     action_items: List[ReportEmailItem] = []
     unresolved_items: List[ReportEmailItem] = []
     spam_items: List[ReportEmailItem] = []
+    threads: List[DailyReportThreadGroup] = []
     # Clickable suggested actions (safe-mode-aware)
     suggested_actions: List[ReportSuggestedAction] = []
     report_text: str  # AI-generated or fallback plain-text summary
@@ -355,6 +370,9 @@ class ActionQueueResponse(BaseModel):
     email_id: int
     thread_id: Optional[str] = None
     thread_state: Optional[str] = None
+    thread_priority: Optional[str] = None
+    thread_importance_score: Optional[float] = None
+    thread_last_activity_at: Optional[datetime] = None
     thread_summary: Optional[dict] = None
     action_type: str
     payload: Optional[dict] = None

@@ -1,35 +1,33 @@
 """Thread-level state inference and lightweight summary helpers."""
 
+from datetime import datetime
 from typing import Dict, Optional
 
 from sqlalchemy.orm import Session
 
-from src.models.database import ActionQueue, ProcessedEmail
+from src.models.database import ProcessedEmail
+from src.services.thread_aggregator import (
+    build_thread_context,
+    infer_thread_state_from_emails,
+    query_open_action_count,
+)
+from src.services.thread_summary_service import ThreadSummaryService
 
 
 THREAD_STATES = {
     "open",
     "waiting_for_me",
     "waiting_for_other",
+    "in_conversation",
     "resolved",
     "informational",
+    "auto_generated",
 }
 
 
 def normalize_thread_state(value: Optional[str]) -> str:
     state = (value or "").strip().lower()
     return state if state in THREAD_STATES else "informational"
-
-
-def _sender_is_user(sender: Optional[str], user_address: Optional[str]) -> bool:
-    if not sender or not user_address:
-        return False
-    sender_l = sender.lower()
-    user_l = user_address.lower()
-    if user_l in sender_l:
-        return True
-    user_local = user_l.split("@", 1)[0]
-    return bool(user_local and user_local in sender_l)
 
 
 def infer_thread_state(
@@ -39,14 +37,21 @@ def infer_thread_state(
     has_resolved: bool,
     open_actions_count: int,
 ) -> str:
-    """Infer thread state using the lightweight rule-set."""
-    if has_action_required:
-        return "waiting_for_me"
-    if last_sender_is_user:
-        return "waiting_for_other"
-    if has_resolved or open_actions_count == 0:
-        return "resolved"
-    return "informational"
+    """Backward-compatible lightweight inference wrapper for unit tests."""
+    synthetic_emails = [
+        ProcessedEmail(
+            message_id="synthetic-thread",
+            sender="me@example.com" if last_sender_is_user else "other@example.com",
+            action_required=has_action_required,
+            is_resolved=has_resolved,
+            date=datetime.utcnow(),
+        )
+    ]
+    return infer_thread_state_from_emails(
+        emails=synthetic_emails,
+        user_address="me@example.com",
+        open_actions_count=open_actions_count,
+    )
 
 
 def update_thread_state_for_thread(
@@ -73,29 +78,19 @@ def update_thread_state_for_thread(
     if not emails:
         return "informational"
 
-    has_action_required = any(bool(email.action_required) for email in emails)
-    has_resolved = any(bool(email.is_resolved) for email in emails)
-    last_sender_is_user = _sender_is_user(emails[0].sender, user_address)
-    open_actions_count = (
-        db.query(ActionQueue)
-        .filter(
-            ActionQueue.thread_id == thread_id,
-            ActionQueue.status.in_(
-                ("proposed", "proposed_action", "approved", "approved_action")
-            ),
-        )
-        .count()
-    )
-    new_state = infer_thread_state(
-        has_action_required=has_action_required,
-        last_sender_is_user=last_sender_is_user,
-        has_resolved=has_resolved,
+    open_actions_count = query_open_action_count(db, thread_id=thread_id)
+    context = build_thread_context(
+        thread_id=thread_id,
+        emails=emails,
+        user_address=user_address,
         open_actions_count=open_actions_count,
     )
     for email in emails:
-        email.thread_state = new_state
+        email.thread_state = context.thread_state
+        email.thread_priority = context.thread_priority
+        email.thread_importance_score = context.thread_importance_score
     db.flush()
-    return new_state
+    return context.thread_state
 
 
 def get_thread_summary(
@@ -103,10 +98,11 @@ def get_thread_summary(
     *,
     thread_id: Optional[str],
 ) -> Optional[Dict[str, Optional[str]]]:
-    """Return lightweight thread summary from the latest email in a thread."""
+    """Return cached thread summary plus latest metadata."""
     if not thread_id:
         return None
-    latest = (
+
+    emails = (
         db.query(ProcessedEmail)
         .filter(ProcessedEmail.thread_id == thread_id)
         .order_by(
@@ -115,15 +111,35 @@ def get_thread_summary(
             ProcessedEmail.created_at.desc(),
             ProcessedEmail.id.desc(),
         )
-        .first()
+        .limit(10)
+        .all()
     )
-    if not latest:
+    if not emails:
         return None
-    summary_text = (latest.summary or latest.snippet or "").strip()
+    latest = emails[0]
+    summary_service = ThreadSummaryService()
+    context = build_thread_context(
+        thread_id=thread_id,
+        emails=emails,
+        user_address=None,
+        open_actions_count=query_open_action_count(db, thread_id=thread_id),
+    )
+    cached = summary_service.get_or_generate_summary(
+        db,
+        thread_id=thread_id,
+        emails=emails,
+        thread_state=context.thread_state,
+        allow_generate=False,
+    )
+    summary_text = (
+        (cached or {}).get("summary") or (latest.summary or latest.snippet or "")
+    ).strip()
     if summary_text:
         summary_text = summary_text[:200]
     return {
         "latest_subject": latest.subject,
         "last_sender": latest.sender,
+        "key_topic": (cached or {}).get("key_topic") if cached else None,
+        "status": (cached or {}).get("status") if cached else None,
         "summary": summary_text or None,
     }
