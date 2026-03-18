@@ -91,21 +91,27 @@ class MailIngestionService:
                     return stats
 
                 checkpoint_uid = self._get_latest_uid_checkpoint(folder)
+                checkpoint_filtered = 0
                 if checkpoint_uid is not None:
+                    pre_checkpoint_count = len(message_uids)
                     message_uids = [uid for uid in message_uids if int(uid) > checkpoint_uid]
+                    checkpoint_filtered = pre_checkpoint_count - len(message_uids)
 
+                max_filtered = 0
                 if effective_max is not None and len(message_uids) > effective_max:
+                    pre_max_count = len(message_uids)
                     message_uids = message_uids[:effective_max]
+                    max_filtered = pre_max_count - len(message_uids)
 
-                skipped_by_uid_checkpoint = server_total - len(message_uids)
                 stats["total"] = len(message_uids)
                 logger.info(
-                    "Found %s messages to check in %s (server_total=%s, uid_checkpoint=%s, skipped_by_uid_checkpoint=%s, explicit_max=%s)",
+                    "Found %s messages to check in %s (server_total=%s, uid_checkpoint=%s, filtered_by_uid_checkpoint=%s, filtered_by_explicit_max=%s, explicit_max=%s)",
                     stats["total"],
                     folder,
                     server_total,
                     checkpoint_uid if checkpoint_uid is not None else "none",
-                    skipped_by_uid_checkpoint,
+                    checkpoint_filtered,
+                    max_filtered,
                     effective_max if effective_max is not None else "none",
                 )
 
