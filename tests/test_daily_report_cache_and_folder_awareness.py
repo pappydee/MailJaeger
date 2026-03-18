@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -164,6 +165,90 @@ def test_get_folders_endpoint_returns_live_imap_folders():
         body = response.json()
         assert "folders" in body
         assert any(f["name"] == "Alles ab Juni 2025" for f in body["folders"])
+        assert body["cache_saved"] is True
+        cached = (
+            db.query(AppSetting)
+            .filter(AppSetting.key == "imap_folders_cache")
+            .order_by(AppSetting.updated_at.desc())
+            .first()
+        )
+        assert cached is not None
+        assert isinstance(cached.value, dict)
+        assert "fetched_at" in cached.value
+        assert cached.value["folders"] == body["folders"]
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_get_folders_endpoint_returns_200_when_cache_write_hits_sqlite_lock():
+    db = _make_session()
+    try:
+        client = _mk_client(db)
+
+        def _cache_lock_only(db_session, *, key, value):
+            if key == "imap_folders_cache":
+                raise OperationalError("UPDATE app_settings", {}, Exception("database is locked"))
+            return None
+
+        with (
+            patch("src.main.IMAPService") as imap_cls,
+            patch("src.main._set_app_setting", side_effect=_cache_lock_only),
+        ):
+            imap = Mock()
+            imap.list_folders.return_value = [
+                {
+                    "name": "INBOX",
+                    "normalized_name": "inbox",
+                    "delimiter": "/",
+                    "flags": [],
+                }
+            ]
+            imap_cls.return_value.__enter__.return_value = imap
+            response = client.get("/api/folders", headers=AUTH)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["folders"][0]["name"] == "INBOX"
+        assert body["cache_saved"] is False
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_get_folders_endpoint_fails_when_imap_discovery_fails():
+    db = _make_session()
+    try:
+        client = _mk_client(db)
+        with patch("src.main.IMAPService") as imap_cls:
+            imap = Mock()
+            imap.list_folders.return_value = []
+            imap_cls.return_value.__enter__.return_value = imap
+            response = client.get("/api/folders", headers=AUTH)
+        assert response.status_code == 503
+        assert "Could not retrieve IMAP folders" in response.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_post_settings_still_fails_loudly_on_operational_error():
+    db = _make_session()
+    try:
+        app.dependency_overrides[_get_db] = lambda: db
+        client = TestClient(app, raise_server_exceptions=False)
+        with patch(
+            "src.main._set_app_setting",
+            side_effect=OperationalError(
+                "UPDATE app_settings", {}, Exception("database is locked")
+            ),
+        ):
+            response = client.post(
+                "/api/settings",
+                headers=AUTH,
+                json={"archive_folder": "Alles ab Juni 2025"},
+            )
+        assert response.status_code == 500
     finally:
         app.dependency_overrides.clear()
         db.close()
