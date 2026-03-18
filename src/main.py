@@ -264,7 +264,6 @@ def _set_noncritical_cache_setting(
                 sanitize_error(exc, debug=settings.debug),
             )
             return False
-    return False
 
 
 def _get_app_setting(db: Session, *, key: str):
@@ -394,7 +393,7 @@ def _resolve_archive_folder(
     if allow_live_discovery:
         live_folders = _discover_live_imap_folders()
         if live_folders:
-            _set_noncritical_cache_setting(
+            _ = _set_noncritical_cache_setting(
                 db,
                 key=APP_SETTING_IMAP_FOLDERS_CACHE,
                 value={

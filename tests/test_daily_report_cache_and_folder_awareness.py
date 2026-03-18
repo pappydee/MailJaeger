@@ -186,7 +186,7 @@ def test_get_folders_endpoint_returns_200_when_cache_write_hits_sqlite_lock():
     try:
         client = _mk_client(db)
 
-        def _cache_lock_only(db_session, *, key, value):
+        def _cache_lock_only(_db_session, *, key, value):
             if key == "imap_folders_cache":
                 raise OperationalError("UPDATE app_settings", {}, Exception("database is locked"))
             return None
