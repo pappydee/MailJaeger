@@ -207,6 +207,13 @@ class DailyReportResponse(BaseModel):
     report_text: str  # AI-generated or fallback plain-text summary
 
 
+class DailyReportEndpointResponse(BaseModel):
+    status: str  # pending | running | ready | failed
+    report: Optional[DailyReportResponse] = None
+    generated_at: Optional[str] = None
+    error_message: Optional[str] = None
+
+
 class EmailListRequest(BaseModel):
     action_required: Optional[bool] = None
     priority: Optional[Priority] = None

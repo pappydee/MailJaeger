@@ -348,6 +348,8 @@ class TestDailyReportEndpoint:
             mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = (
                 emails_in_db or []
             )
+            mock_db.query.return_value.order_by.return_value.first.return_value = None
+            mock_db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
             mock_db.query.return_value.filter.return_value.count.return_value = len(
                 emails_in_db or []
             )
@@ -374,15 +376,12 @@ class TestDailyReportEndpoint:
         """GET /api/reports/daily must return 200 even when no emails processed."""
         app, _ = self._client(emails_in_db=[])
         try:
-            with patch("src.main.AIService") as mock_ai_cls:
-                mock_ai_cls.return_value.generate_report.return_value = "Keine Emails."
-                client = TestClient(app, raise_server_exceptions=False)
-                resp = client.get("/api/reports/daily", headers=AUTH)
+            client = TestClient(app, raise_server_exceptions=False)
+            resp = client.get("/api/reports/daily", headers=AUTH)
             assert resp.status_code == 200
             data = resp.json()
-            assert "report_text" in data
+            assert data["status"] == "pending"
             assert "generated_at" in data
-            assert data["period_hours"] == 24
         finally:
             app.dependency_overrides.clear()
 
@@ -390,29 +389,24 @@ class TestDailyReportEndpoint:
         """Response must include all required fields."""
         app, _ = self._client(emails_in_db=[])
         try:
-            with patch("src.main.AIService") as mock_ai_cls:
-                mock_ai_cls.return_value.generate_report.return_value = "Report text."
-                client = TestClient(app, raise_server_exceptions=False)
-                resp = client.get("/api/reports/daily", headers=AUTH)
+            client = TestClient(app, raise_server_exceptions=False)
+            resp = client.get("/api/reports/daily", headers=AUTH)
             assert resp.status_code == 200
             d = resp.json()
-            for key in ("generated_at", "period_hours", "total_processed",
-                        "action_required", "spam_detected", "unresolved", "report_text"):
+            for key in ("status", "generated_at"):
                 assert key in d, f"Missing key: {key}"
         finally:
             app.dependency_overrides.clear()
 
     def test_daily_report_fallback_when_ai_unavailable(self):
-        """When AI returns empty response, must fall back to plain-text summary."""
+        """Endpoint should return async status quickly without blocking on AI generation."""
         app, _ = self._client(emails_in_db=[])
         try:
-            with patch("src.main.AIService") as mock_ai_cls:
-                mock_ai_cls.return_value.generate_report.return_value = None
-                client = TestClient(app, raise_server_exceptions=False)
-                resp = client.get("/api/reports/daily", headers=AUTH)
+            client = TestClient(app, raise_server_exceptions=False)
+            resp = client.get("/api/reports/daily", headers=AUTH)
             assert resp.status_code == 200
             d = resp.json()
-            assert d["report_text"]  # must not be empty
+            assert d["status"] == "pending"
         finally:
             app.dependency_overrides.clear()
 

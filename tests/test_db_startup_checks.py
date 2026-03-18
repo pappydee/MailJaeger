@@ -308,8 +308,12 @@ class TestActionQueueSchemaRepair:
         report_response = client.get("/api/reports/daily", headers=headers)
         assert report_response.status_code == 200
         report_body = report_response.json()
-        assert "totals" in report_body
-        assert report_body["totals"]["total_processed"] >= 1
+        assert "status" in report_body
+        if report_body["status"] == "ready":
+            assert "report" in report_body
+            assert report_body["report"]["totals"]["total_processed"] >= 1
+        else:
+            assert report_body["status"] in {"pending", "running"}
 
         client.close()
         app.dependency_overrides.clear()

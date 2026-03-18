@@ -520,7 +520,21 @@ async function openDailyReport() {
             document.getElementById('retryDailyReportBtn')?.addEventListener('click', openDailyReport);
             return;
         }
-        const d = await r.json();
+        const payload = await r.json();
+        if (payload.status && payload.status !== 'ready') {
+            const statusText = payload.status === 'running'
+                ? 'Bericht wird aktuell im Hintergrund erstellt.'
+                : 'Bericht wurde zur Erstellung eingeplant.';
+            body.innerHTML = `
+                <div class="report-empty-state">
+                    <strong>${escHtml(statusText)}</strong>
+                    <p>Bitte in wenigen Sekunden erneut versuchen.</p>
+                    <button class="btn btn-secondary" id="retryDailyReportBtn">Aktualisieren</button>
+                </div>`;
+            document.getElementById('retryDailyReportBtn')?.addEventListener('click', openDailyReport);
+            return;
+        }
+        const d = payload.report || payload;
         const suggestions = Array.isArray(d.suggested_actions) ? d.suggested_actions : [];
         const totals = d.totals || {};
         const totalProcessed = totals.total_processed ?? d.total_processed ?? 0;
