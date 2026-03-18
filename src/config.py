@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     )
     ai_model: str = Field(
         default="qwen2.5:7b",
-        description="AI model to use (e.g. mistral-small3.1, mistral:7b-instruct-q4_0, phi3:mini)",
+        description="AI model to use (e.g. qwen2.5:7b, mistral:7b-instruct-q4_0, phi3:mini)",
     )
     ai_timeout: int = Field(default=30, description="AI request timeout in seconds")
 

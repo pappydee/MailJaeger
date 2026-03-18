@@ -86,7 +86,7 @@ services:
       # Override with AI_ENDPOINT=http://ollama:11434 when using the
       # containerised Ollama started via --profile with-ollama.
       - AI_ENDPOINT=${AI_ENDPOINT:-http://host.docker.internal:11434}
-      - AI_MODEL=${AI_MODEL:-mistral-small3.1}
+      - AI_MODEL=${AI_MODEL:-qwen2.5:7b}
       - AI_TIMEOUT=${AI_TIMEOUT:-120}
 
       # Database

@@ -29,7 +29,7 @@ services:
       # AI Configuration - uses host Ollama instance (not a Docker container)
       # host.docker.internal resolves to the host machine from inside the container
       - AI_ENDPOINT=${AI_ENDPOINT:-http://host.docker.internal:11434}
-      - AI_MODEL=${AI_MODEL:-mistral-small3.1}
+      - AI_MODEL=${AI_MODEL:-qwen2.5:7b}
       - AI_TIMEOUT=${AI_TIMEOUT:-120}
       
       # Database
