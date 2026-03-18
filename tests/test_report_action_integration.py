@@ -18,6 +18,13 @@ from src.models.database import (
 
 
 AUTH = {"Authorization": "Bearer test_key_abc123"}
+VALID_THREAD_STATES = {
+    "open",
+    "waiting_for_me",
+    "waiting_for_other",
+    "resolved",
+    "informational",
+}
 
 
 def _make_session():
@@ -587,13 +594,7 @@ def test_actions_endpoint_includes_thread_state_and_summary_fields():
         assert len(actions) == 2
         for action in actions:
             assert "thread_state" in action
-            assert action["thread_state"] in {
-                "open",
-                "waiting_for_me",
-                "waiting_for_other",
-                "resolved",
-                "informational",
-            }
+            assert action["thread_state"] in VALID_THREAD_STATES
             assert "thread_summary" in action
             assert isinstance(action["thread_summary"], dict)
             assert {"latest_subject", "last_sender", "summary"} <= set(
@@ -640,14 +641,7 @@ def test_daily_report_includes_thread_state_in_items_and_handles_missing_thread_
         assert payload["action_items"], "expected at least one action item"
         assert all("thread_state" in item for item in payload["action_items"])
         assert all(
-            item["thread_state"]
-            in {
-                "open",
-                "waiting_for_me",
-                "waiting_for_other",
-                "resolved",
-                "informational",
-            }
+            item["thread_state"] in VALID_THREAD_STATES
             for item in payload["action_items"]
         )
         assert all("thread_state" in item for item in payload["important_items"])

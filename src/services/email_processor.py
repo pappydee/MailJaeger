@@ -117,6 +117,7 @@ class EmailProcessor:
         approved_actions = (
             self.db.query(ActionQueue)
             .filter(ActionQueue.status.in_(("approved", "approved_action")))
+            # Deterministic execution order requirement: oldest queued action first.
             .order_by(ActionQueue.created_at.asc())
             .all()
         )

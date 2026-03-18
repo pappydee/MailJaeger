@@ -120,6 +120,7 @@ class ActionExecutor:
                 success = self.imap.delete_message(uid)
             elif action.action_type == "mark_resolved":
                 email.is_resolved = True
+                # Keep thread-state inference consistent by clearing open obligation.
                 email.action_required = False
                 success = True
             elif action.action_type == "reply_draft":

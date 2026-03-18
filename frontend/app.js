@@ -989,6 +989,8 @@ function statusLabel(s) {
     })[s] || s || '–';
 }
 
+const VALID_THREAD_STATES = ['open', 'waiting_for_me', 'waiting_for_other', 'resolved', 'informational'];
+
 function normalizeQueueStatus(status) {
     const normalized = (status || '').toLowerCase();
     if (normalized === 'proposed_action') return 'proposed';
@@ -1001,7 +1003,7 @@ function normalizeQueueStatus(status) {
 
 function normalizeThreadState(state) {
     const normalized = (state || '').toLowerCase();
-    if (['open', 'waiting_for_me', 'waiting_for_other', 'resolved', 'informational'].includes(normalized)) {
+    if (VALID_THREAD_STATES.includes(normalized)) {
         return normalized;
     }
     return 'informational';

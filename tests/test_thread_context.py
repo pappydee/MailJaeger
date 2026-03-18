@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -76,7 +76,7 @@ def test_update_thread_state_for_thread_handles_missing_and_partial_data():
             action_required=False,
             is_resolved=False,
             is_processed=True,
-            processed_at=datetime.utcnow(),
+            processed_at=datetime.now(timezone.utc),
         )
         db.add(email)
         db.commit()

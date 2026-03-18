@@ -17,6 +17,14 @@ from src.models.database import Base, ProcessedEmail, ActionQueue
 from src.services.email_processor import EmailProcessor
 from src.config import Settings
 
+VALID_THREAD_STATES = {
+    "open",
+    "waiting_for_me",
+    "waiting_for_other",
+    "resolved",
+    "informational",
+}
+
 
 @pytest.fixture
 def client():
@@ -180,13 +188,7 @@ def test_execution_flow_mock_imap(client, auth_headers, db_session, override_db)
     body = response.json()
     assert body["status"] == "executed"
     assert body["executed_at"] is not None
-    assert body["thread_state"] in (
-        "open",
-        "waiting_for_me",
-        "waiting_for_other",
-        "resolved",
-        "informational",
-    )
+    assert body["thread_state"] in VALID_THREAD_STATES
     assert isinstance(body["thread_summary"], dict)
     imap.move_to_folder.assert_called_once_with(314, "Archive")
 
