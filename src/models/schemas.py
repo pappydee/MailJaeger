@@ -66,7 +66,11 @@ class EmailResponse(BaseModel):
     # Coerce NULL DB values (emails not yet analysed) to False so that
     # Pydantic v2 strict bool validation never raises a ValidationError.
     @field_validator(
-        "action_required", "is_spam", "is_archived", "is_flagged", "is_resolved",
+        "action_required",
+        "is_spam",
+        "is_archived",
+        "is_flagged",
+        "is_resolved",
         mode="before",
     )
     @classmethod
@@ -137,6 +141,8 @@ class DashboardResponse(BaseModel):
     run_status: Optional[dict] = None
     # True when a daily report has been generated and is ready to view.
     daily_report_available: bool = False
+    # Indicates whether SAFE_MODE is active in backend config.
+    safe_mode: bool = True
 
 
 class ReportEmailItem(BaseModel):
@@ -171,9 +177,15 @@ class ReportSuggestedAction(BaseModel):
     thread_id: Optional[str] = None
     action_type: str  # move | archive | mark_spam | delete | mark_read | mark_resolved | reply_draft
     payload: Optional[dict] = None
-    target_folder: Optional[str] = None  # Backward-compatible mirror for move/archive actions
+    target_folder: Optional[str] = (
+        None  # Backward-compatible mirror for move/archive actions
+    )
     safe_mode: bool = True
     description: str  # human-readable label shown in the UI
+    queue_status: Optional[str] = None
+    queue_action_id: Optional[int] = None
+    queue_error: Optional[str] = None
+    thread_suggestion_count: Optional[int] = None
 
 
 class DailyReportResponse(BaseModel):
@@ -282,6 +294,15 @@ class QueueSuggestedActionRequest(BaseModel):
     payload: Optional[dict] = None
     safe_mode: bool = True
     description: Optional[str] = None
+    source: Optional[str] = "daily_report"
+
+
+class ReportDecisionEventRequest(BaseModel):
+    event_type: str
+    email_id: int
+    thread_id: Optional[str] = None
+    action_queue_id: Optional[int] = None
+    source: Optional[str] = "report_suggestion"
 
 
 class ApplyActionsRequest(BaseModel):
@@ -317,6 +338,7 @@ class ActionQueueStatus(str, Enum):
     approved = "approved"
     executed = "executed"
     failed = "failed"
+    rejected = "rejected"
 
 
 class ActionQueueResponse(BaseModel):
@@ -330,6 +352,7 @@ class ActionQueueResponse(BaseModel):
     updated_at: Optional[datetime] = None
     executed_at: Optional[datetime] = None
     error_message: Optional[str] = None
+    source: Optional[str] = None
 
     class Config:
         from_attributes = True

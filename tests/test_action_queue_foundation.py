@@ -159,7 +159,9 @@ def test_execution_flow_mock_imap(client, auth_headers, db_session, override_db)
         imap.move_to_folder.return_value = True
         mock_imap_cls.return_value.__enter__.return_value = imap
 
-        response = client.post(f"/api/actions/{action.id}/execute", headers=auth_headers)
+        response = client.post(
+            f"/api/actions/{action.id}/execute", headers=auth_headers
+        )
 
     assert response.status_code == 200
     body = response.json()
@@ -180,7 +182,9 @@ def test_invalid_payload_handling(client, auth_headers, db_session, override_db)
     db_session.commit()
 
     with patch("src.main.IMAPService") as mock_imap_cls:
-        response = client.post(f"/api/actions/{action.id}/execute", headers=auth_headers)
+        response = client.post(
+            f"/api/actions/{action.id}/execute", headers=auth_headers
+        )
 
     assert response.status_code == 200
     body = response.json()
@@ -202,8 +206,63 @@ def test_double_execution_prevention(client, auth_headers, db_session, override_
     db_session.commit()
 
     with patch("src.main.IMAPService") as mock_imap_cls:
-        response = client.post(f"/api/actions/{action.id}/execute", headers=auth_headers)
+        response = client.post(
+            f"/api/actions/{action.id}/execute", headers=auth_headers
+        )
 
     assert response.status_code == 200
     assert response.json()["status"] == "executed"
     mock_imap_cls.assert_not_called()
+
+
+def test_mark_resolved_execution_updates_email_without_imap(
+    client, auth_headers, db_session, override_db
+):
+    email = _create_email(db_session, uid="110")
+    email.is_resolved = False
+    action = ActionQueue(
+        email_id=email.id,
+        action_type="mark_resolved",
+        payload={"reason": "daily_report_unresolved"},
+        status="approved",
+    )
+    db_session.add(action)
+    db_session.commit()
+
+    with patch("src.main.IMAPService") as mock_imap_cls:
+        response = client.post(
+            f"/api/actions/{action.id}/execute", headers=auth_headers
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "executed"
+    db_session.refresh(email)
+    assert email.is_resolved is True
+    mock_imap_cls.assert_called_once()
+    mock_imap_cls.return_value.__enter__.return_value.move_to_folder.assert_not_called()
+
+
+def test_reply_draft_execution_is_safe_and_keeps_draft_payload(
+    client, auth_headers, db_session, override_db
+):
+    email = _create_email(db_session, uid="111")
+    action = ActionQueue(
+        email_id=email.id,
+        action_type="reply_draft",
+        payload={"draft_summary": "Kurzantwort", "draft_text": "Hallo,\nDanke."},
+        status="approved",
+    )
+    db_session.add(action)
+    db_session.commit()
+
+    with patch("src.main.IMAPService") as mock_imap_cls:
+        response = client.post(
+            f"/api/actions/{action.id}/execute", headers=auth_headers
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "executed"
+    assert body["payload"]["draft_state"] == "proposed_manual_send"
+    mock_imap_cls.assert_called_once()
+    mock_imap_cls.return_value.__enter__.return_value.delete_message.assert_not_called()

@@ -14,6 +14,7 @@ from pathlib import Path
 import sys
 import secrets
 import hashlib
+import json
 
 from src.config import get_settings
 from src.database.connection import init_db, get_db, get_engine
@@ -36,6 +37,7 @@ from src.models.schemas import (
     PendingActionWithEmailResponse,
     ApproveActionRequest,
     QueueSuggestedActionRequest,
+    ReportDecisionEventRequest,
     ApplyActionsRequest,
     PreviewActionsRequest,
     PreviewActionsResponse,
@@ -82,6 +84,15 @@ DAILY_REPORT_ACTION_TYPES = {
     "mark_resolved",
     "reply_draft",
 }
+DECISION_EVENT_TYPES = {
+    "approve_suggestion",
+    "reject_suggestion",
+    "execute_suggestion",
+    "queue_suggestion",
+    "preview_reply_draft",
+    "open_related_email_from_report",
+}
+DECISION_EVENT_SOURCES = {"daily_report", "report_suggestion", "queue_ui", "user"}
 
 # In-memory session store: imported from session_store so that
 # require_authentication() in auth.py can validate cookies without a
@@ -143,7 +154,9 @@ def _daily_report_available(db: Session) -> bool:
 
 def _is_report_suggested_action(action: ActionQueue) -> bool:
     payload = action.payload or {}
-    return isinstance(payload, dict) and payload.get("source") == "daily_report_suggestion"
+    return (
+        isinstance(payload, dict) and payload.get("source") == "daily_report_suggestion"
+    )
 
 
 def _record_decision_event(
@@ -152,16 +165,18 @@ def _record_decision_event(
     email_id: int,
     thread_id: Optional[str],
     event_type: str,
+    source: str = "user",
     old_value: Optional[str],
     new_value: Optional[str],
     user_confirmed: bool,
 ) -> None:
+    normalized_source = source if source in DECISION_EVENT_SOURCES else "user"
     db.add(
         DecisionEvent(
             email_id=email_id,
             thread_id=thread_id,
             event_type=event_type,
-            source="user",
+            source=normalized_source,
             old_value=old_value,
             new_value=new_value,
             user_confirmed=user_confirmed,
@@ -180,6 +195,77 @@ def _build_reply_draft_payload(subject: Optional[str]) -> Dict[str, str]:
             "Viele Grüße"
         ),
     }
+
+
+def _normalize_action_status(status_value: Optional[str]) -> str:
+    aliases = {
+        "proposed_action": "proposed",
+        "approved_action": "approved",
+        "executed_action": "executed",
+        "failed_action": "failed",
+        "rejected_action": "rejected",
+    }
+    return aliases.get((status_value or "").lower(), (status_value or "").lower())
+
+
+def _validate_daily_report_action_payload(
+    action_type: str, payload: Dict, *, email: ProcessedEmail
+) -> Dict:
+    """Validate and normalize queue payloads from report suggestions."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="payload must be a JSON object")
+
+    normalized_payload = dict(payload)
+
+    if action_type in ("move", "archive", "mark_spam"):
+        target_folder = normalized_payload.get("target_folder")
+        if not isinstance(target_folder, str) or not target_folder.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"{action_type} requires payload.target_folder",
+            )
+        normalized_payload["target_folder"] = target_folder.strip()
+
+    if action_type == "mark_resolved":
+        reason = normalized_payload.get("reason")
+        if reason is not None and (not isinstance(reason, str) or not reason.strip()):
+            raise HTTPException(
+                status_code=400,
+                detail="mark_resolved reason must be a non-empty string",
+            )
+
+    if action_type == "reply_draft":
+        summary = normalized_payload.get("draft_summary")
+        text = normalized_payload.get("draft_text")
+        if summary is not None and (
+            not isinstance(summary, str) or not summary.strip()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="reply_draft payload.draft_summary must be a non-empty string",
+            )
+        if text is not None and (not isinstance(text, str) or not text.strip()):
+            raise HTTPException(
+                status_code=400,
+                detail="reply_draft payload.draft_text must be a non-empty string",
+            )
+
+    if action_type in ("delete", "mark_read", "mark_resolved", "reply_draft"):
+        normalized_payload.pop("target_folder", None)
+
+    if not email.id:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    return normalized_payload
+
+
+def _payload_fingerprint(payload: Dict) -> str:
+    """Create stable payload fingerprint for duplicate detection."""
+    return hashlib.sha256(
+        json.dumps(
+            payload or {}, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 # Global authentication middleware (fail-closed)
@@ -464,6 +550,7 @@ async def root(request: Request):
 
 # ─── Auth endpoints (no authentication required) ──────────────────────────────
 
+
 @app.post("/api/auth/login")
 async def auth_login(request: Request, response: Response):
     """
@@ -557,6 +644,7 @@ async def auth_verify(request: Request):
 
 # ─── Version endpoint ──────────────────────────────────────────────────────────
 
+
 @app.get("/api/version")
 async def get_version():
     """Return current version and changelog."""
@@ -564,6 +652,7 @@ async def get_version():
 
 
 # ─── Status endpoint ───────────────────────────────────────────────────────────
+
 
 @app.get("/api/status", dependencies=[Depends(require_authentication)])
 async def get_status():
@@ -623,7 +712,9 @@ async def get_dashboard(db: Session = Depends(get_db)):
         #   OK       — all critical services healthy
         #   DEGRADED — at least one service is unhealthy but the app is running
         #   ERROR    — critical failure (reserved for future use)
-        degraded = _service_is_unhealthy(imap_health) or _service_is_unhealthy(ai_health)
+        degraded = _service_is_unhealthy(imap_health) or _service_is_unhealthy(
+            ai_health
+        )
         overall_status = "DEGRADED" if degraded else "OK"
 
         health_status = {
@@ -643,6 +734,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
             health_status=health_status,
             run_status=get_run_status().to_dict(),
             daily_report_available=_daily_report_available(db),
+            safe_mode=settings.safe_mode,
         )
 
     except Exception as e:
@@ -1050,7 +1142,8 @@ async def update_settings_api(request: SettingsUpdate):
 )
 async def list_actions(
     status: Optional[str] = Query(
-        None, description="Optional filter: proposed, approved, executed, failed"
+        None,
+        description="Optional filter: proposed, approved, executed, failed, rejected",
     ),
     db: Session = Depends(get_db),
 ):
@@ -1063,9 +1156,32 @@ async def list_actions(
             "approved": ["approved", "approved_action"],
             "executed": ["executed", "executed_action"],
             "failed": ["failed", "failed_action", "rejected_action"],
+            "rejected": ["rejected", "rejected_action"],
         }
-        query = query.filter(ActionQueue.status.in_(aliases.get(normalized, [normalized])))
-    return query.order_by(ActionQueue.created_at.desc()).all()
+        query = query.filter(
+            ActionQueue.status.in_(aliases.get(normalized, [normalized]))
+        )
+    actions = query.order_by(ActionQueue.created_at.desc()).all()
+
+    normalized_actions = []
+    for action in actions:
+        payload = action.payload or {}
+        normalized_actions.append(
+            {
+                "id": action.id,
+                "email_id": action.email_id,
+                "thread_id": action.thread_id,
+                "action_type": action.action_type,
+                "payload": payload,
+                "status": _normalize_action_status(action.status),
+                "created_at": action.created_at,
+                "updated_at": action.updated_at,
+                "executed_at": action.executed_at,
+                "error_message": action.error_message,
+                "source": payload.get("source") if isinstance(payload, dict) else None,
+            }
+        )
+    return normalized_actions
 
 
 @app.post(
@@ -1082,7 +1198,9 @@ async def queue_daily_report_suggested_action(
     This endpoint never executes actions directly; it only creates a proposal
     in the existing action queue/approval flow.
     """
-    email = db.query(ProcessedEmail).filter(ProcessedEmail.id == request.email_id).first()
+    email = (
+        db.query(ProcessedEmail).filter(ProcessedEmail.id == request.email_id).first()
+    )
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
 
@@ -1097,25 +1215,78 @@ async def queue_daily_report_suggested_action(
 
     if normalized_type == "archive":
         queue_action_type = "move"
-        payload["target_folder"] = payload.get("target_folder") or settings.archive_folder
+        payload["target_folder"] = (
+            payload.get("target_folder") or settings.archive_folder
+        )
     elif normalized_type == "mark_spam":
         queue_action_type = "move"
-        payload["target_folder"] = payload.get("target_folder") or settings.quarantine_folder
+        payload["target_folder"] = (
+            payload.get("target_folder") or settings.quarantine_folder
+        )
     elif normalized_type == "move":
         queue_action_type = "move"
-        payload["target_folder"] = payload.get("target_folder") or settings.archive_folder
+        payload["target_folder"] = (
+            payload.get("target_folder") or settings.archive_folder
+        )
     elif normalized_type in ("mark_read", "delete", "mark_resolved", "reply_draft"):
         queue_action_type = normalized_type
+
+    payload = _validate_daily_report_action_payload(
+        normalized_type, payload, email=email
+    )
 
     if queue_action_type == "reply_draft":
         reply_payload = _build_reply_draft_payload(email.subject)
         payload.setdefault("draft_summary", reply_payload["draft_summary"])
         payload.setdefault("draft_text", reply_payload["draft_text"])
+        payload["draft_state"] = payload.get("draft_state") or "proposed_manual_send"
 
+    payload_source = (request.source or "daily_report").strip().lower()
     payload["source"] = "daily_report_suggestion"
+    payload["source_context"] = (
+        payload_source if payload_source in DECISION_EVENT_SOURCES else "daily_report"
+    )
     payload["safe_mode"] = bool(request.safe_mode)
     if request.description:
         payload["description"] = request.description
+
+    duplicate_payload_fingerprint = _payload_fingerprint(payload)
+    duplicate = (
+        db.query(ActionQueue)
+        .filter(
+            ActionQueue.email_id == email.id,
+            ActionQueue.thread_id == (request.thread_id or email.thread_id),
+            ActionQueue.action_type == queue_action_type,
+            ActionQueue.status.in_(
+                [
+                    "proposed",
+                    "proposed_action",
+                    "approved",
+                    "approved_action",
+                    "executed",
+                    "executed_action",
+                ]
+            ),
+        )
+        .order_by(ActionQueue.created_at.desc())
+        .first()
+    )
+    if duplicate:
+        duplicate_payload = (
+            duplicate.payload if isinstance(duplicate.payload, dict) else {}
+        )
+        if _payload_fingerprint(duplicate_payload) == duplicate_payload_fingerprint:
+            logger.info(
+                "Skipped duplicate report suggestion for email=%s thread=%s action=%s existing_action_id=%s",
+                email.id,
+                request.thread_id or email.thread_id,
+                queue_action_type,
+                duplicate.id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=f"Action already queued as #{duplicate.id} ({_normalize_action_status(duplicate.status)})",
+            )
 
     action = ActionQueue(
         email_id=email.id,
@@ -1125,9 +1296,81 @@ async def queue_daily_report_suggested_action(
         status="proposed_action",
     )
     db.add(action)
+    db.flush()
+    _record_decision_event(
+        db,
+        email_id=action.email_id,
+        thread_id=action.thread_id,
+        event_type="queue_suggestion",
+        source=payload.get("source_context", "daily_report"),
+        old_value=None,
+        new_value=action.action_type,
+        user_confirmed=True,
+    )
+    logger.info(
+        "Action %s queued from daily report: email=%s thread=%s type=%s",
+        action.id,
+        action.email_id,
+        action.thread_id,
+        action.action_type,
+    )
     db.commit()
     db.refresh(action)
-    return action
+    payload_out = action.payload if isinstance(action.payload, dict) else {}
+    return {
+        "id": action.id,
+        "email_id": action.email_id,
+        "thread_id": action.thread_id,
+        "action_type": action.action_type,
+        "payload": action.payload,
+        "status": _normalize_action_status(action.status),
+        "created_at": action.created_at,
+        "updated_at": action.updated_at,
+        "executed_at": action.executed_at,
+        "error_message": action.error_message,
+        "source": payload_out.get("source"),
+    }
+
+
+@app.post(
+    "/api/reports/daily/events",
+    dependencies=[Depends(require_authentication)],
+)
+async def record_report_decision_event(
+    request: ReportDecisionEventRequest, db: Session = Depends(get_db)
+):
+    """Record report UI interaction events for future learning hooks."""
+    event_type = (request.event_type or "").strip().lower()
+    if event_type not in DECISION_EVENT_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported decision event type")
+
+    email = (
+        db.query(ProcessedEmail).filter(ProcessedEmail.id == request.email_id).first()
+    )
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    if request.action_queue_id:
+        action = (
+            db.query(ActionQueue)
+            .filter(ActionQueue.id == request.action_queue_id)
+            .first()
+        )
+        if not action:
+            raise HTTPException(status_code=404, detail="Action queue item not found")
+
+    _record_decision_event(
+        db,
+        email_id=request.email_id,
+        thread_id=request.thread_id or email.thread_id,
+        event_type=event_type,
+        source=request.source or "report_suggestion",
+        old_value=None,
+        new_value=str(request.action_queue_id) if request.action_queue_id else None,
+        user_confirmed=event_type not in {"reject_suggestion"},
+    )
+    db.commit()
+    return {"success": True}
 
 
 @app.post(
@@ -1135,7 +1378,11 @@ async def queue_daily_report_suggested_action(
     response_model=ActionQueueResponse,
     dependencies=[Depends(require_authentication)],
 )
-async def approve_action(action_id: int, db: Session = Depends(get_db)):
+async def approve_action(
+    action_id: int,
+    source: Optional[str] = Query(None, description="UI source for decision event"),
+    db: Session = Depends(get_db),
+):
     """Approve a proposed action."""
     action = db.query(ActionQueue).filter(ActionQueue.id == action_id).first()
     if not action:
@@ -1154,13 +1401,33 @@ async def approve_action(action_id: int, db: Session = Depends(get_db)):
             email_id=action.email_id,
             thread_id=action.thread_id,
             event_type="approve_suggestion",
+            source=source or "queue_ui",
             old_value=previous_status,
             new_value=action.action_type,
             user_confirmed=True,
         )
+    logger.info(
+        "Action %s transition %s -> %s",
+        action.id,
+        previous_status,
+        action.status,
+    )
     db.commit()
     db.refresh(action)
-    return action
+    payload_out = action.payload if isinstance(action.payload, dict) else {}
+    return {
+        "id": action.id,
+        "email_id": action.email_id,
+        "thread_id": action.thread_id,
+        "action_type": action.action_type,
+        "payload": action.payload,
+        "status": _normalize_action_status(action.status),
+        "created_at": action.created_at,
+        "updated_at": action.updated_at,
+        "executed_at": action.executed_at,
+        "error_message": action.error_message,
+        "source": payload_out.get("source"),
+    }
 
 
 @app.post(
@@ -1168,7 +1435,11 @@ async def approve_action(action_id: int, db: Session = Depends(get_db)):
     response_model=ActionQueueResponse,
     dependencies=[Depends(require_authentication)],
 )
-async def reject_action(action_id: int, db: Session = Depends(get_db)):
+async def reject_action(
+    action_id: int,
+    source: Optional[str] = Query(None, description="UI source for decision event"),
+    db: Session = Depends(get_db),
+):
     """Reject an action by marking it failed."""
     action = db.query(ActionQueue).filter(ActionQueue.id == action_id).first()
     if not action:
@@ -1176,7 +1447,7 @@ async def reject_action(action_id: int, db: Session = Depends(get_db)):
     if action.status in ("executed", "executed_action"):
         raise HTTPException(status_code=400, detail="Cannot reject an executed action")
     previous_status = action.status
-    action.status = "failed"
+    action.status = "rejected"
     action.error_message = "Rejected by user"
     action.updated_at = datetime.utcnow()
     if _is_report_suggested_action(action):
@@ -1185,13 +1456,33 @@ async def reject_action(action_id: int, db: Session = Depends(get_db)):
             email_id=action.email_id,
             thread_id=action.thread_id,
             event_type="reject_suggestion",
+            source=source or "queue_ui",
             old_value=previous_status,
             new_value=action.action_type,
             user_confirmed=False,
         )
+    logger.info(
+        "Action %s transition %s -> %s",
+        action.id,
+        previous_status,
+        action.status,
+    )
     db.commit()
     db.refresh(action)
-    return action
+    payload_out = action.payload if isinstance(action.payload, dict) else {}
+    return {
+        "id": action.id,
+        "email_id": action.email_id,
+        "thread_id": action.thread_id,
+        "action_type": action.action_type,
+        "payload": action.payload,
+        "status": _normalize_action_status(action.status),
+        "created_at": action.created_at,
+        "updated_at": action.updated_at,
+        "executed_at": action.executed_at,
+        "error_message": action.error_message,
+        "source": payload_out.get("source"),
+    }
 
 
 @app.post(
@@ -1199,18 +1490,36 @@ async def reject_action(action_id: int, db: Session = Depends(get_db)):
     response_model=ActionQueueResponse,
     dependencies=[Depends(require_authentication)],
 )
-async def execute_action(action_id: int, db: Session = Depends(get_db)):
+async def execute_action(
+    action_id: int,
+    source: Optional[str] = Query(None, description="UI source for decision event"),
+    db: Session = Depends(get_db),
+):
     """Execute an approved action via explicit API call only."""
     action = db.query(ActionQueue).filter(ActionQueue.id == action_id).first()
     if not action:
         raise HTTPException(status_code=404, detail="Action not found")
 
     if action.status in ("executed", "executed_action"):
-        return action
+        payload_out = action.payload if isinstance(action.payload, dict) else {}
+        return {
+            "id": action.id,
+            "email_id": action.email_id,
+            "thread_id": action.thread_id,
+            "action_type": action.action_type,
+            "payload": action.payload,
+            "status": _normalize_action_status(action.status),
+            "created_at": action.created_at,
+            "updated_at": action.updated_at,
+            "executed_at": action.executed_at,
+            "error_message": action.error_message,
+            "source": payload_out.get("source"),
+        }
 
     if action.status not in ("approved", "approved_action"):
         raise HTTPException(
-            status_code=400, detail=f"Only approved actions can be executed (got {action.status})"
+            status_code=400,
+            detail=f"Only approved actions can be executed (got {action.status})",
         )
 
     if get_settings().safe_mode:
@@ -1219,7 +1528,9 @@ async def execute_action(action_id: int, db: Session = Depends(get_db)):
             detail="SAFE_MODE enabled; action execution requires SAFE_MODE=false",
         )
 
-    email = db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+    email = (
+        db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+    )
 
     try:
         with IMAPService() as imap:
@@ -1238,13 +1549,30 @@ async def execute_action(action_id: int, db: Session = Depends(get_db)):
                     email_id=action.email_id,
                     thread_id=action.thread_id,
                     event_type="execute_suggestion",
+                    source=source or "queue_ui",
                     old_value="approved",
                     new_value=action.action_type,
                     user_confirmed=True,
                 )
+            logger.info(
+                "Action %s execution result status=%s", action.id, action.status
+            )
             db.commit()
             db.refresh(action)
-            return action
+            payload_out = action.payload if isinstance(action.payload, dict) else {}
+            return {
+                "id": action.id,
+                "email_id": action.email_id,
+                "thread_id": action.thread_id,
+                "action_type": action.action_type,
+                "payload": action.payload,
+                "status": _normalize_action_status(action.status),
+                "created_at": action.created_at,
+                "updated_at": action.updated_at,
+                "executed_at": action.executed_at,
+                "error_message": action.error_message,
+                "source": payload_out.get("source"),
+            }
     except RuntimeError as exc:
         sanitized_error = sanitize_error(exc, debug=get_settings().debug)
         raise HTTPException(status_code=503, detail=sanitized_error)
@@ -1552,7 +1880,10 @@ async def apply_all_approved_actions(
 
             # Check safety validations
             warnings = []
-            if action.action_type == "DELETE" and not _cur_settings.allow_destructive_imap:
+            if (
+                action.action_type == "DELETE"
+                and not _cur_settings.allow_destructive_imap
+            ):
                 warnings.append("DELETE blocked (ALLOW_DESTRUCTIVE_IMAP=false)")
             if action.target_folder and action.target_folder not in safe_folders:
                 warnings.append(
@@ -1684,7 +2015,11 @@ async def apply_all_approved_actions(
                                 f"Applied action {action.id}: {action.action_type} for email {email.message_id}"
                             )
                             results.append(
-                                {"action_id": action.id, "status": "APPLIED", "error": None}
+                                {
+                                    "action_id": action.id,
+                                    "status": "APPLIED",
+                                    "error": None,
+                                }
                             )
                         else:
                             action.status = "FAILED"
@@ -1707,14 +2042,14 @@ async def apply_all_approved_actions(
                         failed += 1
                         sanitized_error = sanitize_error(e, settings.debug)
                         logger.error(
-                        f"Error applying action {action.id}: {sanitized_error}"
+                            f"Error applying action {action.id}: {sanitized_error}"
                         )
                         results.append(
-                        {
-                            "action_id": action.id,
-                            "status": "FAILED",
-                            "error": sanitized_error,
-                        }
+                            {
+                                "action_id": action.id,
+                                "status": "FAILED",
+                                "error": sanitized_error,
+                            }
                         )
 
         except RuntimeError as e:
@@ -1937,7 +2272,8 @@ async def apply_single_action(
                         email.is_flagged = True
                 else:
                     raise HTTPException(
-                        status_code=400, detail=f"Unknown action type: {action.action_type}"
+                        status_code=400,
+                        detail=f"Unknown action type: {action.action_type}",
                     )
 
                 if success:
@@ -1976,7 +2312,9 @@ async def apply_single_action(
         except RuntimeError as e:
             # IMAP connection failed - DO NOT mark token as used or change action status
             sanitized_error = sanitize_error(e, debug=settings.debug)
-            logger.error(f"IMAP connection failed for action {action.id}: {sanitized_error}")
+            logger.error(
+                f"IMAP connection failed for action {action.id}: {sanitized_error}"
+            )
 
             return JSONResponse(
                 status_code=503,
@@ -2026,7 +2364,6 @@ async def health_check():
             "scheduler": get_scheduler().get_status(),
         },
     }
-
 
 
 @app.get(
@@ -2111,11 +2448,40 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
         # ----------------------------------------------------------------
         safe_mode_active = settings.safe_mode
         suggested_actions: List[ReportSuggestedAction] = []
+        recent_email_ids = [e.id for e in recent_emails if e.id]
+        latest_action_by_key: Dict[tuple, ActionQueue] = {}
+
+        if recent_email_ids:
+            existing_actions = (
+                db.query(ActionQueue)
+                .filter(ActionQueue.email_id.in_(recent_email_ids))
+                .order_by(ActionQueue.created_at.desc())
+                .all()
+            )
+            for existing_action in existing_actions:
+                key = (
+                    existing_action.email_id,
+                    existing_action.thread_id or "",
+                    existing_action.action_type,
+                )
+                latest_action_by_key.setdefault(key, existing_action)
+
+        def _suggestion_queue_type_and_key(
+            action_type: str, email_id: int, thread_id: Optional[str]
+        ) -> tuple:
+            queue_type = (
+                "move"
+                if action_type in ("archive", "mark_spam", "move")
+                else action_type
+            )
+            return (email_id, thread_id or "", queue_type)
 
         for e in recent_emails:
             if not e.id:
                 continue
             if e.is_spam and not e.is_archived:
+                key = _suggestion_queue_type_and_key("mark_spam", e.id, e.thread_id)
+                existing = latest_action_by_key.get(key)
                 suggested_actions.append(
                     ReportSuggestedAction(
                         email_id=e.id,
@@ -2125,9 +2491,20 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
                         target_folder=settings.quarantine_folder,
                         description=f"Spam verschieben: {e.subject or '(kein Betreff)'}",
                         safe_mode=safe_mode_active,
+                        queue_status=(
+                            _normalize_action_status(existing.status)
+                            if existing
+                            else None
+                        ),
+                        queue_action_id=existing.id if existing else None,
+                        queue_error=existing.error_message if existing else None,
                     )
                 )
             elif e.action_required and not e.is_resolved:
+                resolved_key = _suggestion_queue_type_and_key(
+                    "mark_resolved", e.id, e.thread_id
+                )
+                resolved_existing = latest_action_by_key.get(resolved_key)
                 suggested_actions.append(
                     ReportSuggestedAction(
                         email_id=e.id,
@@ -2136,8 +2513,25 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
                         payload={"reason": "daily_report_unresolved"},
                         description=f"Als erledigt markieren: {e.subject or '(kein Betreff)'}",
                         safe_mode=safe_mode_active,
+                        queue_status=(
+                            _normalize_action_status(resolved_existing.status)
+                            if resolved_existing
+                            else None
+                        ),
+                        queue_action_id=(
+                            resolved_existing.id if resolved_existing else None
+                        ),
+                        queue_error=(
+                            resolved_existing.error_message
+                            if resolved_existing
+                            else None
+                        ),
                     )
                 )
+                reply_key = _suggestion_queue_type_and_key(
+                    "reply_draft", e.id, e.thread_id
+                )
+                reply_existing = latest_action_by_key.get(reply_key)
                 suggested_actions.append(
                     ReportSuggestedAction(
                         email_id=e.id,
@@ -2146,9 +2540,22 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
                         payload=_build_reply_draft_payload(e.subject),
                         description=f"Antwort-Entwurf erstellen: {e.subject or '(kein Betreff)'}",
                         safe_mode=safe_mode_active,
+                        queue_status=(
+                            _normalize_action_status(reply_existing.status)
+                            if reply_existing
+                            else None
+                        ),
+                        queue_action_id=reply_existing.id if reply_existing else None,
+                        queue_error=(
+                            reply_existing.error_message if reply_existing else None
+                        ),
                     )
                 )
             elif not e.is_archived and not e.is_spam:
+                archive_key = _suggestion_queue_type_and_key(
+                    "archive", e.id, e.thread_id
+                )
+                archive_existing = latest_action_by_key.get(archive_key)
                 suggested_actions.append(
                     ReportSuggestedAction(
                         email_id=e.id,
@@ -2158,11 +2565,34 @@ async def get_daily_report(request: Request, db: Session = Depends(get_db)):
                         target_folder=settings.archive_folder,
                         description=f"Archivieren: {e.subject or '(kein Betreff)'}",
                         safe_mode=safe_mode_active,
+                        queue_status=(
+                            _normalize_action_status(archive_existing.status)
+                            if archive_existing
+                            else None
+                        ),
+                        queue_action_id=(
+                            archive_existing.id if archive_existing else None
+                        ),
+                        queue_error=(
+                            archive_existing.error_message if archive_existing else None
+                        ),
                     )
                 )
             # Cap total suggestions to keep the response manageable
             if len(suggested_actions) >= 20:
                 break
+
+        thread_suggestion_counts: Dict[str, int] = {}
+        for suggestion in suggested_actions:
+            if suggestion.thread_id:
+                thread_suggestion_counts[suggestion.thread_id] = (
+                    thread_suggestion_counts.get(suggestion.thread_id, 0) + 1
+                )
+        for suggestion in suggested_actions:
+            if suggestion.thread_id:
+                suggestion.thread_suggestion_count = thread_suggestion_counts.get(
+                    suggestion.thread_id, 0
+                )
 
         # ----------------------------------------------------------------
         # Build AI prompt

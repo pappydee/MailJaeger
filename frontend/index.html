@@ -61,6 +61,19 @@
     </div>
 </div>
 
+<!-- Reply Draft Preview Modal -->
+<div class="modal" id="replyDraftModal">
+    <div class="modal-content" style="max-width:700px;">
+        <div class="modal-header">
+            <h2>Antwortentwurf</h2>
+            <button class="modal-close" id="closeReplyDraftModal">&times;</button>
+        </div>
+        <div class="modal-body" id="replyDraftModalBody">
+            <div class="loading">Lade Entwurf…</div>
+        </div>
+    </div>
+</div>
+
 <!-- Email Detail Modal -->
 <div class="modal" id="emailModal">
     <div class="modal-content">
@@ -191,6 +204,23 @@
                 <span class="info-label">Nächster Lauf:</span>
                 <span id="nextRunTime">–</span>
             </div>
+        </div>
+    </div>
+
+    <!-- Action Queue -->
+    <div class="info-section">
+        <div class="info-header">
+            <h2>Action Queue</h2>
+            <div style="display:flex;gap:8px;align-items:center;">
+                <span class="info-time" id="actionQueueSummary">Lade…</span>
+                <button id="refreshActionQueue" class="btn btn-secondary">Aktualisieren</button>
+            </div>
+        </div>
+        <div class="report-safe-hint" id="actionQueueSafeMode" style="display:none;">
+            SAFE MODE aktiv: Keine Aktion wird automatisch ausgeführt.
+        </div>
+        <div id="actionQueueList" class="action-queue-list">
+            <div class="loading">Lade Aktionen…</div>
         </div>
     </div>
 
