@@ -100,7 +100,7 @@ class Settings(BaseSettings):
         description="Local AI endpoint (Ollama on host machine)",
     )
     ai_model: str = Field(
-        default="mistral-small3.1",
+        default="qwen2.5:7b",
         description="AI model to use (e.g. mistral-small3.1, mistral:7b-instruct-q4_0, phi3:mini)",
     )
     ai_timeout: int = Field(default=30, description="AI request timeout in seconds")
