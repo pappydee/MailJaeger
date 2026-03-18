@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ import sys
 import secrets
 import hashlib
 import json
+import time
 
 from src.config import get_settings
 from src.database.connection import init_db, get_db, get_engine, get_db_session
@@ -236,6 +238,34 @@ def _set_app_setting(db: Session, *, key: str, value) -> None:
     db.flush()
 
 
+def _set_noncritical_cache_setting(
+    db: Session,
+    *,
+    key: str,
+    value,
+    max_attempts: int = 2,
+    retry_backoff_seconds: float = 0.05,
+) -> bool:
+    """Best-effort persistence for non-critical cache values."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            _set_app_setting(db, key=key, value=value)
+            return True
+        except OperationalError as exc:
+            if "database is locked" not in str(exc).lower():
+                raise
+            db.rollback()
+            if attempt < max_attempts:
+                time.sleep(retry_backoff_seconds)
+                continue
+            logger.warning(
+                "Non-critical cache write skipped for '%s' due to SQLite lock: %s",
+                key,
+                sanitize_error(exc, debug=settings.debug),
+            )
+            return False
+
+
 def _get_app_setting(db: Session, *, key: str):
     setting = db.query(AppSetting).filter(AppSetting.key == key).first()
     return setting.value if setting else None
@@ -363,7 +393,7 @@ def _resolve_archive_folder(
     if allow_live_discovery:
         live_folders = _discover_live_imap_folders()
         if live_folders:
-            _set_app_setting(
+            _ = _set_noncritical_cache_setting(
                 db,
                 key=APP_SETTING_IMAP_FOLDERS_CACHE,
                 value={
@@ -1480,7 +1510,7 @@ async def list_imap_folders(db: Session = Depends(get_db)):
             status_code=503,
             detail="Could not retrieve IMAP folders from mail server",
         )
-    _set_app_setting(
+    cache_saved = _set_noncritical_cache_setting(
         db,
         key=APP_SETTING_IMAP_FOLDERS_CACHE,
         value={"folders": folders, "fetched_at": datetime.now(timezone.utc).isoformat()},
@@ -1491,6 +1521,7 @@ async def list_imap_folders(db: Session = Depends(get_db)):
             db, email=None, allow_live_discovery=False
         )
         or settings.archive_folder,
+        "cache_saved": cache_saved,
     }
 
 
