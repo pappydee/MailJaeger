@@ -6,6 +6,7 @@ preventing silent failures where features queue actions but the DB schema is mis
 """
 
 import logging
+import re
 from sqlalchemy import inspect, text
 from src.utils.error_handling import sanitize_error
 
@@ -28,6 +29,14 @@ _ACTION_QUEUE_REQUIRED_INDEXES = {
     "idx_action_queue_email": "email_id",
     "idx_action_queue_thread": "thread_id",
 }
+
+_SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_sql_identifier(identifier: str) -> str:
+    if not _SQL_IDENTIFIER_RE.match(identifier):
+        raise ValueError(f"Unsafe SQL identifier: {identifier}")
+    return identifier
 
 
 def ensure_action_queue_schema_compatibility(engine, debug: bool = False):
@@ -60,9 +69,11 @@ def ensure_action_queue_schema_compatibility(engine, debug: bool = False):
             for column_name, column_type in _ACTION_QUEUE_REQUIRED_COLUMNS.items():
                 if column_name in existing_columns:
                     continue
+                safe_column_name = _safe_sql_identifier(column_name)
                 connection.execute(
                     text(
-                        f"ALTER TABLE action_queue ADD COLUMN {column_name} {column_type}"
+                        "ALTER TABLE action_queue ADD COLUMN "
+                        f"{safe_column_name} {column_type}"
                     )
                 )
                 columns_added.append(column_name)
@@ -76,10 +87,12 @@ def ensure_action_queue_schema_compatibility(engine, debug: bool = False):
                     continue
                 if index_column not in existing_columns and index_column not in columns_added:
                     continue
+                safe_index_name = _safe_sql_identifier(index_name)
+                safe_index_column = _safe_sql_identifier(index_column)
                 connection.execute(
                     text(
-                        f"CREATE INDEX IF NOT EXISTS {index_name} "
-                        f"ON action_queue ({index_column})"
+                        "CREATE INDEX IF NOT EXISTS "
+                        f"{safe_index_name} ON action_queue ({safe_index_column})"
                     )
                 )
                 indexes_added.append(index_name)

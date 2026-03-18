@@ -6,9 +6,9 @@ and fails closed with appropriate error messages.
 """
 
 import pytest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
@@ -278,7 +278,7 @@ class TestActionQueueSchemaRepair:
             is_spam=False,
             is_resolved=False,
             is_processed=True,
-            processed_at=datetime.utcnow(),
+            processed_at=datetime.now(timezone.utc),
         )
         db_session.add(email)
         db_session.execute(
@@ -289,7 +289,7 @@ class TestActionQueueSchemaRepair:
             {
                 "thread_id": email.thread_id,
                 "status": "proposed",
-                "created_at": datetime.utcnow(),
+                "created_at": datetime.now(timezone.utc),
             },
         )
         db_session.commit()
