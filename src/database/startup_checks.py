@@ -30,6 +30,10 @@ _ACTION_QUEUE_REQUIRED_INDEXES = {
     "idx_action_queue_thread": "thread_id",
 }
 
+_PROCESSED_EMAILS_REQUIRED_COLUMNS = {
+    "thread_state": "VARCHAR(30) DEFAULT 'informational'",
+}
+
 _SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -85,7 +89,10 @@ def ensure_action_queue_schema_compatibility(engine, debug: bool = False):
             for index_name, index_column in _ACTION_QUEUE_REQUIRED_INDEXES.items():
                 if index_name in existing_indexes:
                     continue
-                if index_column not in existing_columns and index_column not in columns_added:
+                if (
+                    index_column not in existing_columns
+                    and index_column not in columns_added
+                ):
                     continue
                 safe_index_name = _safe_sql_identifier(index_name)
                 safe_index_column = _safe_sql_identifier(index_column)
@@ -119,24 +126,60 @@ def ensure_action_queue_schema_compatibility(engine, debug: bool = False):
         raise RuntimeError(error_msg) from e
 
 
+def ensure_processed_emails_thread_state_schema(engine, debug: bool = False):
+    """Repair legacy SQLite processed_emails schema for thread_state support."""
+    if engine.dialect.name != "sqlite":
+        return {"columns_added": []}
+    try:
+        inspector = inspect(engine)
+        if "processed_emails" not in inspector.get_table_names():
+            return {"columns_added": []}
+        existing_columns = {
+            column["name"] for column in inspector.get_columns("processed_emails")
+        }
+        columns_added = []
+        with engine.begin() as connection:
+            for column_name, column_type in _PROCESSED_EMAILS_REQUIRED_COLUMNS.items():
+                if column_name in existing_columns:
+                    continue
+                safe_column_name = _safe_sql_identifier(column_name)
+                connection.execute(
+                    text(
+                        "ALTER TABLE processed_emails ADD COLUMN "
+                        f"{safe_column_name} {column_type}"
+                    )
+                )
+                columns_added.append(column_name)
+                logger.warning(
+                    "SQLite schema repair: added missing processed_emails column '%s'",
+                    column_name,
+                )
+        return {"columns_added": columns_added}
+    except Exception as e:
+        sanitized = sanitize_error(e, debug=debug)
+        error_msg = f"Failed to repair SQLite processed_emails schema: {sanitized}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg) from e
+
+
 def verify_pending_actions_table(engine, debug: bool = False):
     """
     Verify that the pending_actions table exists in the database.
-    
+
     This is a fail-closed check to prevent silent failures when REQUIRE_APPROVAL
     is enabled but the database schema is incomplete.
-    
+
     Args:
         engine: SQLAlchemy engine
         debug: Whether to include detailed error info
-        
+
     Raises:
         RuntimeError: If the pending_actions table is missing or unreachable
     """
     try:
         inspector = inspect(engine)
         table_names = inspector.get_table_names()
-        
+
         if "pending_actions" not in table_names:
             error_msg = (
                 "Database schema incomplete: 'pending_actions' table not found. "
@@ -145,10 +188,10 @@ def verify_pending_actions_table(engine, debug: bool = False):
             )
             logger.error(error_msg)
             raise RuntimeError(error_msg)
-        
+
         logger.info("Startup check passed: pending_actions table exists")
         return True
-        
+
     except RuntimeError:
         # Re-raise our own RuntimeError as-is
         raise

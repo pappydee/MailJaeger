@@ -155,6 +155,7 @@ class ReportEmailItem(BaseModel):
     summary: Optional[str] = None
     priority: Optional[str] = None
     category: Optional[str] = None
+    thread_state: Optional[str] = None
 
 
 class ReportTotals(BaseModel):
@@ -352,6 +353,8 @@ class ActionQueueResponse(BaseModel):
     id: int
     email_id: int
     thread_id: Optional[str] = None
+    thread_state: Optional[str] = None
+    thread_summary: Optional[dict] = None
     action_type: str
     payload: Optional[dict] = None
     status: str

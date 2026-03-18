@@ -73,6 +73,11 @@ from src.services.search_service import SearchService
 from src.services.learning_service import LearningService
 from src.services.email_processor import EmailProcessor
 from src.services.action_executor import ActionExecutor
+from src.services.thread_context import (
+    get_thread_summary,
+    normalize_thread_state,
+    update_thread_state_for_thread,
+)
 from src.middleware.auth import require_authentication, AuthenticationError
 from src.middleware.session_store import _sessions, SESSION_COOKIE, SESSION_EXPIRY_HOURS
 from src.middleware.security_headers import SecurityHeadersMiddleware
@@ -277,6 +282,52 @@ def _payload_fingerprint(payload: Dict) -> str:
             payload or {}, sort_keys=True, separators=(",", ":"), default=str
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _safe_thread_state_from_context(
+    db: Session, *, thread_id: Optional[str], email: Optional[ProcessedEmail]
+) -> str:
+    if email and normalize_thread_state(email.thread_state) != "informational":
+        return normalize_thread_state(email.thread_state)
+    if thread_id:
+        try:
+            return update_thread_state_for_thread(
+                db,
+                thread_id=thread_id,
+                user_address=getattr(settings, "imap_username", None),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not infer thread_state for thread=%s: %s",
+                thread_id,
+                sanitize_error(exc, debug=settings.debug),
+            )
+    if email:
+        return normalize_thread_state(email.thread_state)
+    return "informational"
+
+
+def _serialize_action_queue(
+    db: Session, action: ActionQueue, *, email: Optional[ProcessedEmail] = None
+) -> Dict:
+    payload_out = action.payload if isinstance(action.payload, dict) else {}
+    thread_id = action.thread_id or (email.thread_id if email else None)
+    thread_state = _safe_thread_state_from_context(db, thread_id=thread_id, email=email)
+    return {
+        "id": action.id,
+        "email_id": action.email_id,
+        "thread_id": thread_id,
+        "thread_state": thread_state,
+        "thread_summary": get_thread_summary(db, thread_id=thread_id),
+        "action_type": action.action_type,
+        "payload": action.payload,
+        "status": _normalize_action_status(action.status),
+        "created_at": action.created_at,
+        "updated_at": action.updated_at,
+        "executed_at": action.executed_at,
+        "error_message": action.error_message,
+        "source": payload_out.get("source"),
+    }
 
 
 # Global authentication middleware (fail-closed)
@@ -1176,22 +1227,12 @@ async def list_actions(
 
     normalized_actions = []
     for action in actions:
-        payload = action.payload or {}
-        normalized_actions.append(
-            {
-                "id": action.id,
-                "email_id": action.email_id,
-                "thread_id": action.thread_id,
-                "action_type": action.action_type,
-                "payload": payload,
-                "status": _normalize_action_status(action.status),
-                "created_at": action.created_at,
-                "updated_at": action.updated_at,
-                "executed_at": action.executed_at,
-                "error_message": action.error_message,
-                "source": payload.get("source") if isinstance(payload, dict) else None,
-            }
+        email = (
+            db.query(ProcessedEmail)
+            .filter(ProcessedEmail.id == action.email_id)
+            .first()
         )
+        normalized_actions.append(_serialize_action_queue(db, action, email=email))
     return normalized_actions
 
 
@@ -1327,20 +1368,7 @@ async def queue_daily_report_suggested_action(
     )
     db.commit()
     db.refresh(action)
-    payload_out = action.payload if isinstance(action.payload, dict) else {}
-    return {
-        "id": action.id,
-        "email_id": action.email_id,
-        "thread_id": action.thread_id,
-        "action_type": action.action_type,
-        "payload": action.payload,
-        "status": _normalize_action_status(action.status),
-        "created_at": action.created_at,
-        "updated_at": action.updated_at,
-        "executed_at": action.executed_at,
-        "error_message": action.error_message,
-        "source": payload_out.get("source"),
-    }
+    return _serialize_action_queue(db, action, email=email)
 
 
 @app.post(
@@ -1425,20 +1453,10 @@ async def approve_action(
     )
     db.commit()
     db.refresh(action)
-    payload_out = action.payload if isinstance(action.payload, dict) else {}
-    return {
-        "id": action.id,
-        "email_id": action.email_id,
-        "thread_id": action.thread_id,
-        "action_type": action.action_type,
-        "payload": action.payload,
-        "status": _normalize_action_status(action.status),
-        "created_at": action.created_at,
-        "updated_at": action.updated_at,
-        "executed_at": action.executed_at,
-        "error_message": action.error_message,
-        "source": payload_out.get("source"),
-    }
+    email = (
+        db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+    )
+    return _serialize_action_queue(db, action, email=email)
 
 
 @app.post(
@@ -1480,20 +1498,10 @@ async def reject_action(
     )
     db.commit()
     db.refresh(action)
-    payload_out = action.payload if isinstance(action.payload, dict) else {}
-    return {
-        "id": action.id,
-        "email_id": action.email_id,
-        "thread_id": action.thread_id,
-        "action_type": action.action_type,
-        "payload": action.payload,
-        "status": _normalize_action_status(action.status),
-        "created_at": action.created_at,
-        "updated_at": action.updated_at,
-        "executed_at": action.executed_at,
-        "error_message": action.error_message,
-        "source": payload_out.get("source"),
-    }
+    email = (
+        db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+    )
+    return _serialize_action_queue(db, action, email=email)
 
 
 @app.post(
@@ -1512,20 +1520,12 @@ async def execute_action(
         raise HTTPException(status_code=404, detail="Action not found")
 
     if action.status in ("executed", "executed_action"):
-        payload_out = action.payload if isinstance(action.payload, dict) else {}
-        return {
-            "id": action.id,
-            "email_id": action.email_id,
-            "thread_id": action.thread_id,
-            "action_type": action.action_type,
-            "payload": action.payload,
-            "status": _normalize_action_status(action.status),
-            "created_at": action.created_at,
-            "updated_at": action.updated_at,
-            "executed_at": action.executed_at,
-            "error_message": action.error_message,
-            "source": payload_out.get("source"),
-        }
+        email = (
+            db.query(ProcessedEmail)
+            .filter(ProcessedEmail.id == action.email_id)
+            .first()
+        )
+        return _serialize_action_queue(db, action, email=email)
 
     if action.status not in ("approved", "approved_action"):
         raise HTTPException(
@@ -1546,8 +1546,17 @@ async def execute_action(
     try:
         with IMAPService() as imap:
             executor = ActionExecutor(imap)
-            executor.execute(action, email)
+            success = executor.execute(action, email)
+            if not success and not action.error_message:
+                action.error_message = "Execution failed"
             action.updated_at = datetime.utcnow()
+            thread_id = action.thread_id or (email.thread_id if email else None)
+            if thread_id:
+                update_thread_state_for_thread(
+                    db,
+                    thread_id=thread_id,
+                    user_address=getattr(settings, "imap_username", None),
+                )
             db.add(action)
             if email:
                 db.add(email)
@@ -1566,24 +1575,14 @@ async def execute_action(
                     user_confirmed=True,
                 )
             logger.info(
-                "Action %s execution result status=%s", action.id, action.status
+                "Action %s execution result action_type=%s status=%s",
+                action.id,
+                action.action_type,
+                action.status,
             )
             db.commit()
             db.refresh(action)
-            payload_out = action.payload if isinstance(action.payload, dict) else {}
-            return {
-                "id": action.id,
-                "email_id": action.email_id,
-                "thread_id": action.thread_id,
-                "action_type": action.action_type,
-                "payload": action.payload,
-                "status": _normalize_action_status(action.status),
-                "created_at": action.created_at,
-                "updated_at": action.updated_at,
-                "executed_at": action.executed_at,
-                "error_message": action.error_message,
-                "source": payload_out.get("source"),
-            }
+            return _serialize_action_queue(db, action, email=email)
     except RuntimeError as exc:
         sanitized_error = sanitize_error(exc, debug=get_settings().debug)
         raise HTTPException(status_code=503, detail=sanitized_error)
@@ -2394,6 +2393,13 @@ def _build_daily_report_response(
     unresolved_count = sum(
         1 for e in recent_emails if e.action_required and not e.is_resolved
     )
+    thread_ids = {e.thread_id for e in recent_emails if e.thread_id}
+    for thread_id in thread_ids:
+        update_thread_state_for_thread(
+            db,
+            thread_id=thread_id,
+            user_address=getattr(settings, "imap_username", None),
+        )
 
     def _to_item(e: ProcessedEmail) -> ReportEmailItem:
         return ReportEmailItem(
@@ -2404,6 +2410,7 @@ def _build_daily_report_response(
             summary=e.summary,
             priority=e.priority,
             category=e.category,
+            thread_state=normalize_thread_state(e.thread_state),
         )
 
     important_items = [
@@ -2444,7 +2451,9 @@ def _build_daily_report_response(
     def _suggestion_queue_type_and_key(
         action_type: str, email_id: int, thread_id: Optional[str]
     ) -> tuple:
-        queue_type = "move" if action_type in ("archive", "mark_spam", "move") else action_type
+        queue_type = (
+            "move" if action_type in ("archive", "mark_spam", "move") else action_type
+        )
         return (email_id, thread_id or "", queue_type)
 
     for e in recent_emails:
@@ -2462,13 +2471,17 @@ def _build_daily_report_response(
                     target_folder=settings.quarantine_folder,
                     description=f"Spam verschieben: {e.subject or '(kein Betreff)'}",
                     safe_mode=safe_mode_active,
-                    queue_status=_normalize_action_status(existing.status) if existing else None,
+                    queue_status=(
+                        _normalize_action_status(existing.status) if existing else None
+                    ),
                     queue_action_id=existing.id if existing else None,
                     queue_error=existing.error_message if existing else None,
                 )
             )
         elif e.action_required and not e.is_resolved:
-            resolved_key = _suggestion_queue_type_and_key("mark_resolved", e.id, e.thread_id)
+            resolved_key = _suggestion_queue_type_and_key(
+                "mark_resolved", e.id, e.thread_id
+            )
             resolved_existing = latest_action_by_key.get(resolved_key)
             suggested_actions.append(
                 ReportSuggestedAction(
@@ -2499,11 +2512,15 @@ def _build_daily_report_response(
                     payload=_build_reply_draft_payload(e.subject),
                     description=f"Antwort-Entwurf erstellen: {e.subject or '(kein Betreff)'}",
                     safe_mode=safe_mode_active,
-                    queue_status=_normalize_action_status(reply_existing.status)
-                    if reply_existing
-                    else None,
+                    queue_status=(
+                        _normalize_action_status(reply_existing.status)
+                        if reply_existing
+                        else None
+                    ),
                     queue_action_id=reply_existing.id if reply_existing else None,
-                    queue_error=reply_existing.error_message if reply_existing else None,
+                    queue_error=(
+                        reply_existing.error_message if reply_existing else None
+                    ),
                 )
             )
         elif not e.is_archived and not e.is_spam:
@@ -2518,11 +2535,15 @@ def _build_daily_report_response(
                     target_folder=settings.archive_folder,
                     description=f"Archivieren: {e.subject or '(kein Betreff)'}",
                     safe_mode=safe_mode_active,
-                    queue_status=_normalize_action_status(archive_existing.status)
-                    if archive_existing
-                    else None,
+                    queue_status=(
+                        _normalize_action_status(archive_existing.status)
+                        if archive_existing
+                        else None
+                    ),
                     queue_action_id=archive_existing.id if archive_existing else None,
-                    queue_error=archive_existing.error_message if archive_existing else None,
+                    queue_error=(
+                        archive_existing.error_message if archive_existing else None
+                    ),
                 )
             )
         if len(suggested_actions) >= 20:
@@ -2647,7 +2668,9 @@ def _generate_daily_report_in_background(report_id: int) -> None:
                     report_row.generation_status = "failed"
                     report_row.error_message = sanitized_error
         except Exception:
-            logger.error("Failed to persist daily report generation error", exc_info=True)
+            logger.error(
+                "Failed to persist daily report generation error", exc_info=True
+            )
 
 
 @app.get(
@@ -2711,7 +2734,9 @@ async def get_daily_report(
     db.refresh(queued_report)
     # Defensive guard: mocked DB sessions in tests may not populate PKs.
     if isinstance(queued_report.id, int):
-        background_tasks.add_task(_generate_daily_report_in_background, queued_report.id)
+        background_tasks.add_task(
+            _generate_daily_report_in_background, queued_report.id
+        )
     else:
         logger.warning(
             "Daily report queued without integer id; background generation not scheduled"

@@ -833,6 +833,9 @@ function renderActionQueue(actions = []) {
     list.innerHTML = actions.slice(0, 20).map(action => {
         const status = normalizeQueueStatus(action.status);
         const payload = action.payload || {};
+        const threadState = normalizeThreadState(action.thread_state);
+        const threadSummary = action.thread_summary || {};
+        const threadSummaryLine = buildThreadSummaryLine(threadSummary);
         return `
             <article class="action-queue-card">
                 <div class="action-queue-head">
@@ -841,8 +844,12 @@ function renderActionQueue(actions = []) {
                         <div class="report-action-context">
                             E-Mail #${escHtml(action.email_id)}${action.thread_id ? ` · Thread ${escHtml(action.thread_id)}` : ''}
                         </div>
+                        ${threadSummaryLine ? `<div class="action-thread-summary">${escHtml(threadSummaryLine)}</div>` : ''}
                     </div>
-                    <span class="queue-status-badge ${escHtml(status)}">${escHtml(statusLabel(status))}</span>
+                    <div class="action-queue-badges">
+                        <span class="queue-status-badge ${escHtml(status)}">${escHtml(statusLabel(status))}</span>
+                        <span class="thread-state-badge ${escHtml(threadState)}">${escHtml(threadStateLabel(threadState))}</span>
+                    </div>
                 </div>
                 <div class="action-queue-meta">
                     <span>Erstellt: ${fmtDt(action.created_at)}</span>
@@ -982,6 +989,8 @@ function statusLabel(s) {
     })[s] || s || '–';
 }
 
+const VALID_THREAD_STATES = ['open', 'waiting_for_me', 'waiting_for_other', 'resolved', 'informational'];
+
 function normalizeQueueStatus(status) {
     const normalized = (status || '').toLowerCase();
     if (normalized === 'proposed_action') return 'proposed';
@@ -990,6 +999,34 @@ function normalizeQueueStatus(status) {
     if (normalized === 'failed_action') return 'failed';
     if (normalized === 'rejected_action') return 'rejected';
     return normalized || 'proposed';
+}
+
+function normalizeThreadState(state) {
+    const normalized = (state || '').toLowerCase();
+    if (VALID_THREAD_STATES.includes(normalized)) {
+        return normalized;
+    }
+    return 'informational';
+}
+
+function threadStateLabel(state) {
+    return ({
+        open: 'Offen',
+        waiting_for_me: 'Warte auf mich',
+        waiting_for_other: 'Warte auf andere',
+        resolved: 'Erledigt',
+        informational: 'Info',
+    })[normalizeThreadState(state)] || 'Info';
+}
+
+function buildThreadSummaryLine(summary) {
+    if (!summary || typeof summary !== 'object') return '';
+    const subject = (summary.latest_subject || '').trim();
+    const sender = (summary.last_sender || '').trim();
+    const text = (summary.summary || '').trim();
+    if (text) return text;
+    if (subject && sender) return `${subject} · ${sender}`;
+    return subject || sender || '';
 }
 
 function isDestructiveAction(actionType) {
