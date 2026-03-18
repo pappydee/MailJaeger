@@ -10,7 +10,10 @@ import logging
 
 from src.config import get_settings
 from src.models.database import Base
-from src.database.startup_checks import ensure_action_queue_schema_compatibility
+from src.database.startup_checks import (
+    ensure_action_queue_schema_compatibility,
+    ensure_processed_emails_thread_state_schema,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +43,7 @@ def init_db():
     # Create tables
     Base.metadata.create_all(bind=_engine)
     ensure_action_queue_schema_compatibility(_engine, debug=settings.debug)
+    ensure_processed_emails_thread_state_schema(_engine, debug=settings.debug)
 
     logger.info("Database initialized successfully")
 

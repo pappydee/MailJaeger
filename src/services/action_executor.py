@@ -55,6 +55,11 @@ class ActionExecutor:
           while writing normalized status values approved/executed/failed.
         """
         if action.status in ("executed", "executed_action"):
+            logger.info(
+                "action_execution action_id=%s action_type=%s result=skipped_already_executed",
+                getattr(action, "id", None),
+                action.action_type,
+            )
             return True
 
         if action.status not in ("approved", "approved_action"):
@@ -64,8 +69,9 @@ class ActionExecutor:
                 f"Action must be approved before execution (current={previous_status})"
             )
             logger.warning(
-                "Action %s transition %s -> %s failed: not approved",
+                "action_execution action_id=%s action_type=%s result=failure reason=not_approved transition=%s->%s",
                 getattr(action, "id", None),
+                action.action_type,
                 previous_status,
                 action.status,
             )
@@ -77,11 +83,12 @@ class ActionExecutor:
             action.status = "failed"
             action.error_message = validation_error
             logger.warning(
-                "Action %s transition %s -> %s failed: %s",
+                "action_execution action_id=%s action_type=%s result=failure reason=%s transition=%s->%s",
                 getattr(action, "id", None),
+                action.action_type,
+                validation_error,
                 previous_status,
                 action.status,
-                validation_error,
             )
             return False
 
@@ -90,8 +97,9 @@ class ActionExecutor:
             action.status = "failed"
             action.error_message = "Email or UID not found"
             logger.warning(
-                "Action %s transition %s -> %s failed: email/uid missing",
+                "action_execution action_id=%s action_type=%s result=failure reason=email_or_uid_missing transition=%s->%s",
                 getattr(action, "id", None),
+                action.action_type,
                 previous_status,
                 action.status,
             )
@@ -112,6 +120,7 @@ class ActionExecutor:
                 success = self.imap.delete_message(uid)
             elif action.action_type == "mark_resolved":
                 email.is_resolved = True
+                email.action_required = False
                 success = True
             elif action.action_type == "reply_draft":
                 payload["draft_state"] = (
@@ -126,8 +135,9 @@ class ActionExecutor:
                 action.executed_at = datetime.utcnow()
                 action.error_message = None
                 logger.info(
-                    "Action %s transition %s -> %s",
+                    "action_execution action_id=%s action_type=%s result=success transition=%s->%s",
                     getattr(action, "id", None),
+                    action.action_type,
                     previous_status,
                     action.status,
                 )
@@ -137,8 +147,9 @@ class ActionExecutor:
             action.status = "failed"
             action.error_message = "IMAP operation failed"
             logger.warning(
-                "Action %s transition %s -> %s failed: imap operation returned false",
+                "action_execution action_id=%s action_type=%s result=failure reason=imap_returned_false transition=%s->%s",
                 getattr(action, "id", None),
+                action.action_type,
                 previous_status,
                 action.status,
             )
@@ -148,10 +159,11 @@ class ActionExecutor:
             action.status = "failed"
             action.error_message = sanitize_error(exc, debug=False)
             logger.error(
-                "Action %s transition %s -> %s failed: %s",
+                "action_execution action_id=%s action_type=%s result=failure reason=%s transition=%s->%s",
                 getattr(action, "id", None),
+                action.action_type,
+                action.error_message,
                 previous_status,
                 action.status,
-                action.error_message,
             )
             return False

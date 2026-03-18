@@ -2,8 +2,8 @@
 Focused tests for action_queue foundation API and execution flow.
 """
 
-from datetime import datetime
-from unittest.mock import Mock, patch
+from datetime import datetime, timedelta
+from unittest.mock import Mock, patch, call
 
 import pytest
 from fastapi.testclient import TestClient
@@ -82,14 +82,25 @@ def _settings_for_processor():
     return settings
 
 
-def _create_email(db_session, uid: str = "42") -> ProcessedEmail:
+def _create_email(
+    db_session,
+    uid: str = "42",
+    *,
+    thread_id: str = "thread-default",
+    sender: str = "sender@example.com",
+    action_required: bool = False,
+    is_resolved: bool = False,
+) -> ProcessedEmail:
     email = ProcessedEmail(
         message_id=f"email-{uid}@example.com",
         uid=uid,
+        thread_id=thread_id,
         subject="Subject",
-        sender="sender@example.com",
+        sender=sender,
         is_processed=True,
         processed_at=datetime.utcnow(),
+        action_required=action_required,
+        is_resolved=is_resolved,
     )
     db_session.add(email)
     db_session.commit()
@@ -169,6 +180,14 @@ def test_execution_flow_mock_imap(client, auth_headers, db_session, override_db)
     body = response.json()
     assert body["status"] == "executed"
     assert body["executed_at"] is not None
+    assert body["thread_state"] in (
+        "open",
+        "waiting_for_me",
+        "waiting_for_other",
+        "resolved",
+        "informational",
+    )
+    assert isinstance(body["thread_summary"], dict)
     imap.move_to_folder.assert_called_once_with(314, "Archive")
 
 
@@ -238,8 +257,11 @@ def test_mark_resolved_execution_updates_email_without_imap(
 
     assert response.status_code == 200
     assert response.json()["status"] == "executed"
+    assert response.json()["thread_state"] == "resolved"
     db_session.refresh(email)
     assert email.is_resolved is True
+    assert email.action_required is False
+    assert email.thread_state == "resolved"
     mock_imap_cls.assert_called_once()
     mock_imap_cls.return_value.__enter__.return_value.move_to_folder.assert_not_called()
 
@@ -301,7 +323,9 @@ def test_process_run_auto_executes_only_approved_actions_even_in_safe_mode(db_se
 
             processor = EmailProcessor(db_session)
             with patch.object(
-                processor, "_run_ingestion", return_value={"new": 0, "skipped": 0, "failed": 0}
+                processor,
+                "_run_ingestion",
+                return_value={"new": 0, "skipped": 0, "failed": 0},
             ):
                 run = processor.process_emails(trigger_type="MANUAL")
 
@@ -338,7 +362,9 @@ def test_process_run_marks_failed_when_approved_action_execution_fails(db_sessio
 
             processor = EmailProcessor(db_session)
             with patch.object(
-                processor, "_run_ingestion", return_value={"new": 0, "skipped": 0, "failed": 0}
+                processor,
+                "_run_ingestion",
+                return_value={"new": 0, "skipped": 0, "failed": 0},
             ):
                 run = processor.process_emails(trigger_type="SCHEDULED")
 
@@ -347,3 +373,131 @@ def test_process_run_marks_failed_when_approved_action_execution_fails(db_sessio
     assert approved.status == "failed"
     assert approved.error_message == "IMAP operation failed"
     imap.move_to_folder.assert_called_once_with(803, "Archive")
+
+
+def test_process_run_does_not_retry_failed_actions(db_session):
+    email_failed = _create_email(db_session, uid="901", thread_id="thread-failed")
+    email_approved = _create_email(db_session, uid="902", thread_id="thread-failed")
+    already_failed = ActionQueue(
+        email_id=email_failed.id,
+        thread_id=email_failed.thread_id,
+        action_type="mark_read",
+        payload={"source": "test"},
+        status="failed",
+        error_message="previous failure",
+    )
+    approved = ActionQueue(
+        email_id=email_approved.id,
+        thread_id=email_approved.thread_id,
+        action_type="mark_read",
+        payload={"source": "test"},
+        status="approved",
+    )
+    db_session.add_all([already_failed, approved])
+    db_session.commit()
+
+    settings = _settings_for_processor()
+    settings.safe_mode = True
+    settings.require_approval = True
+
+    with patch("src.services.email_processor.get_settings", return_value=settings):
+        with patch("src.services.email_processor.IMAPService") as mock_imap_cls:
+            imap = Mock()
+            imap.connect.return_value = True
+            imap.mark_as_read.return_value = True
+            mock_imap_cls.return_value = imap
+            processor = EmailProcessor(db_session)
+            with patch.object(
+                processor,
+                "_run_ingestion",
+                return_value={"new": 0, "skipped": 0, "failed": 0},
+            ):
+                run = processor.process_emails(trigger_type="SCHEDULED")
+
+    db_session.refresh(already_failed)
+    db_session.refresh(approved)
+    assert run.status == "SUCCESS"
+    assert already_failed.status == "failed"
+    assert already_failed.error_message == "previous failure"
+    assert approved.status == "executed"
+    imap.mark_as_read.assert_called_once_with(902)
+
+
+def test_process_run_executes_approved_in_created_order(db_session):
+    early_email = _create_email(db_session, uid="911", thread_id="thread-order")
+    late_email = _create_email(db_session, uid="912", thread_id="thread-order")
+    early = ActionQueue(
+        email_id=early_email.id,
+        thread_id=early_email.thread_id,
+        action_type="mark_read",
+        payload={"source": "test"},
+        status="approved",
+        created_at=datetime.utcnow() - timedelta(minutes=5),
+    )
+    late = ActionQueue(
+        email_id=late_email.id,
+        thread_id=late_email.thread_id,
+        action_type="mark_read",
+        payload={"source": "test"},
+        status="approved",
+        created_at=datetime.utcnow(),
+    )
+    db_session.add_all([late, early])
+    db_session.commit()
+
+    settings = _settings_for_processor()
+    settings.safe_mode = True
+    settings.require_approval = True
+
+    with patch("src.services.email_processor.get_settings", return_value=settings):
+        with patch("src.services.email_processor.IMAPService") as mock_imap_cls:
+            imap = Mock()
+            imap.connect.return_value = True
+            imap.mark_as_read.return_value = True
+            mock_imap_cls.return_value = imap
+            processor = EmailProcessor(db_session)
+            with patch.object(
+                processor,
+                "_run_ingestion",
+                return_value={"new": 0, "skipped": 0, "failed": 0},
+            ):
+                run = processor.process_emails(trigger_type="MANUAL")
+
+    assert run.status == "SUCCESS"
+    assert imap.mark_as_read.call_args_list == [call(911), call(912)]
+
+
+def test_process_run_does_not_reexecute_already_executed_actions(db_session):
+    email = _create_email(db_session, uid="920", thread_id="thread-once")
+    executed_action = ActionQueue(
+        email_id=email.id,
+        thread_id=email.thread_id,
+        action_type="mark_read",
+        payload={"source": "test"},
+        status="executed",
+        executed_at=datetime.utcnow(),
+    )
+    db_session.add(executed_action)
+    db_session.commit()
+
+    settings = _settings_for_processor()
+    settings.safe_mode = True
+    settings.require_approval = True
+
+    with patch("src.services.email_processor.get_settings", return_value=settings):
+        with patch("src.services.email_processor.IMAPService") as mock_imap_cls:
+            imap = Mock()
+            imap.connect.return_value = True
+            mock_imap_cls.return_value = imap
+            processor = EmailProcessor(db_session)
+            with patch.object(
+                processor,
+                "_run_ingestion",
+                return_value={"new": 0, "skipped": 0, "failed": 0},
+            ):
+                run = processor.process_emails(trigger_type="MANUAL")
+
+    db_session.refresh(executed_action)
+    assert run.status == "SUCCESS"
+    assert executed_action.status == "executed"
+    imap.mark_as_read.assert_not_called()

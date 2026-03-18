@@ -43,19 +43,24 @@ def _create_email(
     is_resolved: bool = False,
     is_spam: bool = False,
     is_archived: bool = False,
+    priority: str = "LOW",
+    summary: str = "summary",
+    sender: str = "sender@example.com",
 ):
     email = ProcessedEmail(
         message_id=message_id,
         uid=uid,
         thread_id=thread_id,
         subject=f"Subject {message_id}",
-        sender="sender@example.com",
+        sender=sender,
         is_processed=True,
         processed_at=datetime.utcnow(),
         action_required=action_required,
         is_resolved=is_resolved,
         is_spam=is_spam,
         is_archived=is_archived,
+        priority=priority,
+        summary=summary,
     )
     db_session.add(email)
     db_session.commit()
@@ -131,7 +136,9 @@ def test_daily_report_sections_and_suggested_actions_present():
             assert key in report
         assert isinstance(report["totals"], dict)
         assert report["totals"]["action_required"] >= 1
-        assert any(a["action_type"] == "reply_draft" for a in report["suggested_actions"])
+        assert any(
+            a["action_type"] == "reply_draft" for a in report["suggested_actions"]
+        )
         assert "queue_status" in report["suggested_actions"][0]
     finally:
         app.dependency_overrides.clear()
@@ -537,6 +544,133 @@ def test_report_event_endpoint_records_preview_and_open_events():
             "preview_reply_draft",
             "open_related_email_from_report",
         ]
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_actions_endpoint_includes_thread_state_and_summary_fields():
+    db = _make_session()
+    try:
+        email = _create_email(
+            db,
+            message_id="m-thread-context@example.com",
+            thread_id="thread-context-1",
+            summary="Bitte Termin bestätigen.",
+            sender="patient@example.com",
+            action_required=True,
+        )
+        db.add(
+            ActionQueue(
+                email_id=email.id,
+                thread_id=email.thread_id,
+                action_type="mark_read",
+                payload={"source": "daily_report_suggestion"},
+                status="approved",
+            )
+        )
+        db.add(
+            ActionQueue(
+                email_id=email.id,
+                thread_id=None,
+                action_type="mark_read",
+                payload={"source": "daily_report_suggestion"},
+                status="proposed",
+            )
+        )
+        db.commit()
+
+        client = _mk_client(db)
+        resp = client.get("/api/actions", headers=AUTH)
+        assert resp.status_code == 200
+        actions = resp.json()
+        assert len(actions) == 2
+        for action in actions:
+            assert "thread_state" in action
+            assert action["thread_state"] in {
+                "open",
+                "waiting_for_me",
+                "waiting_for_other",
+                "resolved",
+                "informational",
+            }
+            assert "thread_summary" in action
+            assert isinstance(action["thread_summary"], dict)
+            assert {"latest_subject", "last_sender", "summary"} <= set(
+                action["thread_summary"].keys()
+            )
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_daily_report_includes_thread_state_in_items_and_handles_missing_thread_data():
+    db = _make_session()
+    try:
+        _create_email(
+            db,
+            message_id="m-thread-report-1@example.com",
+            thread_id="thread-report-1",
+            action_required=True,
+            is_resolved=False,
+            priority="HIGH",
+            summary="Rückruf dringend benötigt.",
+            sender="patient@example.com",
+        )
+        _create_email(
+            db,
+            message_id="m-thread-report-2@example.com",
+            thread_id=None,
+            action_required=False,
+            is_resolved=False,
+            priority="LOW",
+            summary="FYI",
+            sender="info@example.com",
+        )
+
+        from src.main import _build_daily_report_response
+
+        with patch("src.main.AIService.generate_report", return_value="Report"):
+            report = _build_daily_report_response(
+                db,
+                period_start=datetime.utcnow() - timedelta(hours=24),
+                period_end=datetime.utcnow(),
+            )
+        payload = report.model_dump()
+        assert payload["action_items"], "expected at least one action item"
+        assert all("thread_state" in item for item in payload["action_items"])
+        assert all(
+            item["thread_state"]
+            in {
+                "open",
+                "waiting_for_me",
+                "waiting_for_other",
+                "resolved",
+                "informational",
+            }
+            for item in payload["action_items"]
+        )
+        assert all("thread_state" in item for item in payload["important_items"])
+
+        db.add(
+            DailyReport(
+                generated_at=datetime.utcnow(),
+                period_start=datetime.utcnow() - timedelta(hours=24),
+                period_end=datetime.utcnow(),
+                report_json=payload,
+                report_text=payload["report_text"],
+                generation_status="ready",
+            )
+        )
+        db.commit()
+
+        client = _mk_client(db)
+        resp = client.get("/api/reports/daily", headers=AUTH)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ready"
+        report_json = body["report"]
+        assert all("thread_state" in item for item in report_json["action_items"])
     finally:
         app.dependency_overrides.clear()
         db.close()

@@ -31,10 +31,15 @@ class ProcessedEmail(Base):
     # Email identifiers
     message_id = Column(String(500), unique=True, index=True, nullable=False)
     uid = Column(String(100), index=True)
-    imap_uid = Column(String(100), index=True)  # Explicit IMAP UID for ingestion pipeline
+    imap_uid = Column(
+        String(100), index=True
+    )  # Explicit IMAP UID for ingestion pipeline
 
     # Thread reconstruction (Priority 3)
-    thread_id = Column(String(200), index=True)  # Derived from Message-ID/In-Reply-To/References
+    thread_id = Column(
+        String(200), index=True
+    )  # Derived from Message-ID/In-Reply-To/References
+    thread_state = Column(String(30), default="informational", index=True)
 
     # Header information
     subject = Column(String(500))
@@ -320,8 +325,10 @@ class ClassificationOverride(Base):
     id = Column(Integer, primary_key=True, index=True)
 
     # Match criteria — at least one must be set
-    sender_pattern = Column(String(200), nullable=True, index=True)  # domain or full addr
-    subject_pattern = Column(String(500), nullable=True)              # keyword substring
+    sender_pattern = Column(
+        String(200), nullable=True, index=True
+    )  # domain or full addr
+    subject_pattern = Column(String(500), nullable=True)  # keyword substring
 
     # Override values (any subset may be set)
     category = Column(String(50), nullable=True)
@@ -332,7 +339,9 @@ class ClassificationOverride(Base):
 
     # Audit
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    created_from_email_id = Column(Integer, nullable=True)  # source email (informational)
+    created_from_email_id = Column(
+        Integer, nullable=True
+    )  # source email (informational)
 
 
 class DecisionEvent(Base):
@@ -359,7 +368,9 @@ class DecisionEvent(Base):
     # Confidence and versioning
     confidence = Column(Float)
     model_version = Column(String(50))
-    rule_id = Column(Integer, nullable=True)  # FK to ClassificationOverride if rule-based
+    rule_id = Column(
+        Integer, nullable=True
+    )  # FK to ClassificationOverride if rule-based
 
     # User confirmation state
     user_confirmed = Column(Boolean, default=False, index=True)
@@ -428,12 +439,16 @@ class DailyReport(Base):
     period_end = Column(DateTime, nullable=False)
     report_json = Column(JSON)
     report_text = Column(Text)
-    generation_status = Column(String(20), default="pending", nullable=False, index=True)
+    generation_status = Column(
+        String(20), default="pending", nullable=False, index=True
+    )
     error_message = Column(Text, nullable=True)
 
     __table_args__ = (
         Index("idx_daily_reports_generated_at", "generated_at"),
-        Index("idx_daily_reports_status_generated", "generation_status", "generated_at"),
+        Index(
+            "idx_daily_reports_status_generated", "generation_status", "generated_at"
+        ),
     )
 
 
@@ -472,7 +487,9 @@ class AnalysisProgress(Base):
     paused_at = Column(DateTime)
     resumed_at = Column(DateTime)
     completed_at = Column(DateTime)
-    timestamp = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+    timestamp = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True
+    )
 
     __table_args__ = (
         Index("idx_progress_stage_status", "stage", "status"),

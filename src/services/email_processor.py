@@ -30,6 +30,7 @@ from src.models.database import (
 from src.services.action_executor import ActionExecutor
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
+from src.services.thread_context import update_thread_state_for_thread
 from src.utils.logging import get_logger
 from src.utils.error_handling import sanitize_error
 
@@ -46,10 +47,25 @@ class EmailProcessor:
     # Used by compute_importance_score to penalise low-value mail so that
     # important messages are processed before newsletters regardless of recency.
     _BULK_INDICATORS: tuple = (
-        "newsletter", "unsubscribe", "abmelden", "no-reply", "noreply",
-        "do-not-reply", "donotreply", "list-unsubscribe",
-        "bulk", "promo", "marketing", "digest", "weekly", "monthly",
-        "angebot", "rabatt", "sale", "offer", "deal",
+        "newsletter",
+        "unsubscribe",
+        "abmelden",
+        "no-reply",
+        "noreply",
+        "do-not-reply",
+        "donotreply",
+        "list-unsubscribe",
+        "bulk",
+        "promo",
+        "marketing",
+        "digest",
+        "weekly",
+        "monthly",
+        "angebot",
+        "rabatt",
+        "sale",
+        "offer",
+        "deal",
     )
 
     def __init__(self, db_session: Session, status: Optional["RunStatus"] = None):
@@ -80,12 +96,28 @@ class EmailProcessor:
         """Return True when a cancellation has been requested for this run."""
         return self._status is not None and self._status.cancel_requested
 
+    def _refresh_thread_state(self, thread_id: Optional[str]) -> str:
+        """Infer and persist thread state for one thread id."""
+        try:
+            return update_thread_state_for_thread(
+                self.db,
+                thread_id=thread_id,
+                user_address=getattr(self.settings, "imap_username", None),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to refresh thread_state for thread=%s: %s",
+                thread_id,
+                sanitize_error(exc, debug=self.settings.debug),
+            )
+            return "informational"
+
     def _execute_approved_actions(self) -> Dict[str, int]:
         """Execute all approved action_queue items before normal processing."""
         approved_actions = (
             self.db.query(ActionQueue)
             .filter(ActionQueue.status.in_(("approved", "approved_action")))
-            .order_by(ActionQueue.approved_at.asc(), ActionQueue.created_at.asc())
+            .order_by(ActionQueue.created_at.asc())
             .all()
         )
         if not approved_actions:
@@ -108,19 +140,71 @@ class EmailProcessor:
 
         try:
             for action in approved_actions:
-                email = (
-                    self.db.query(ProcessedEmail)
-                    .filter(ProcessedEmail.id == action.email_id)
-                    .first()
-                )
-                if executor.execute(action, email):
-                    executed += 1
-                else:
+                try:
+                    current_status = (action.status or "").lower()
+                    if current_status in ("executed", "executed_action"):
+                        logger.info(
+                            "action_execution action_id=%s action_type=%s result=skipped_already_executed",
+                            action.id,
+                            action.action_type,
+                        )
+                        continue
+                    if current_status in ("failed", "failed_action"):
+                        logger.info(
+                            "action_execution action_id=%s action_type=%s result=skipped_previously_failed",
+                            action.id,
+                            action.action_type,
+                        )
+                        continue
+                    if current_status not in ("approved", "approved_action"):
+                        logger.info(
+                            "action_execution action_id=%s action_type=%s result=skipped_status_%s",
+                            action.id,
+                            action.action_type,
+                            current_status or "unknown",
+                        )
+                        continue
+
+                    email = (
+                        self.db.query(ProcessedEmail)
+                        .filter(ProcessedEmail.id == action.email_id)
+                        .first()
+                    )
+                    success = executor.execute(action, email)
+                    if success:
+                        executed += 1
+                    else:
+                        failed += 1
+                        if not action.error_message:
+                            action.error_message = "Execution failed"
+                    action.updated_at = datetime.utcnow()
+                    self.db.add(action)
+                    if email:
+                        self.db.add(email)
+                    thread_id = action.thread_id or (email.thread_id if email else None)
+                    self._refresh_thread_state(thread_id)
+                    logger.info(
+                        "approved_action_run action_id=%s action_type=%s result=%s",
+                        action.id,
+                        action.action_type,
+                        "success" if success else "failure",
+                    )
+                except Exception as exc:
                     failed += 1
-                action.updated_at = datetime.utcnow()
-                self.db.add(action)
-                if email:
-                    self.db.add(email)
+                    action.status = "failed"
+                    action.error_message = (
+                        sanitize_error(exc, debug=self.settings.debug)
+                        or "Execution failed"
+                    )
+                    action.updated_at = datetime.utcnow()
+                    self.db.add(action)
+                    self._refresh_thread_state(action.thread_id)
+                    logger.error(
+                        "approved_action_run action_id=%s action_type=%s result=failure error=%s",
+                        action.id,
+                        action.action_type,
+                        action.error_message,
+                    )
 
             self.db.commit()
         finally:
@@ -290,7 +374,7 @@ class EmailProcessor:
                 idx = 0  # global email index across all batches
 
                 for batch_start in range(0, total, batch_size):
-                    batch = pending_emails[batch_start: batch_start + batch_size]
+                    batch = pending_emails[batch_start : batch_start + batch_size]
 
                     # --- cancellation checkpoint (per batch) ---
                     if self._should_cancel():
@@ -355,7 +439,9 @@ class EmailProcessor:
             was_cancelled = self._should_cancel()
 
             # Save run statistics
-            self._update_status(phase=None, current_step="Saving results…", progress_percent=95)
+            self._update_status(
+                phase=None, current_step="Saving results…", progress_percent=95
+            )
             run.emails_processed = self.stats["processed"]
             run.emails_spam = self.stats["spam"]
             run.emails_archived = self.stats["archived"]
@@ -485,9 +571,7 @@ class EmailProcessor:
             actions_taken.append("safe_mode_skip")
 
         elif self.settings.require_approval:
-            logger.info(
-                f"REQUIRE_APPROVAL: Enqueuing pending actions for {message_id}"
-            )
+            logger.info(f"REQUIRE_APPROVAL: Enqueuing pending actions for {message_id}")
             actions_taken.append("queued_pending_actions")
             self.db.add(email_record)
             self.db.flush()
@@ -540,7 +624,9 @@ class EmailProcessor:
                 )
                 if imap.move_to_folder(uid_int, target):
                     actions_taken.append(
-                        "moved_to_spam" if self.settings.delete_spam else "moved_to_quarantine"
+                        "moved_to_spam"
+                        if self.settings.delete_spam
+                        else "moved_to_quarantine"
                     )
                     email_record.is_archived = True
                     self.stats["spam"] += 1
@@ -564,6 +650,7 @@ class EmailProcessor:
 
         # Audit log
         self.db.add(email_record)
+        email_record.thread_state = self._refresh_thread_state(email_record.thread_id)
         self.db.add(
             AuditLog(
                 event_type="EMAIL_PROCESSED",
@@ -639,11 +726,19 @@ class EmailProcessor:
 
         # Subject keyword heuristics (German + English)
         urgent_keywords = [
-            "dringend", "urgent", "sofort", "immediately",
-            "frist", "deadline", "termin",
-            "notfall", "emergency",
-            "bitte antworten", "please reply",
-            "antwort erforderlich", "response required",
+            "dringend",
+            "urgent",
+            "sofort",
+            "immediately",
+            "frist",
+            "deadline",
+            "termin",
+            "notfall",
+            "emergency",
+            "bitte antworten",
+            "please reply",
+            "antwort erforderlich",
+            "response required",
         ]
         if any(kw in subject for kw in urgent_keywords):
             score += 20
@@ -671,7 +766,9 @@ class EmailProcessor:
                         .count()
                     )
                     action_rate = action_from_domain / total_from_domain
-                    score += action_rate * 20  # up to +20 for 100% action-required domain
+                    score += (
+                        action_rate * 20
+                    )  # up to +20 for 100% action-required domain
         except Exception:
             pass
 
@@ -693,7 +790,9 @@ class EmailProcessor:
                 return
             logger.info(f"Computing importance scores for {len(unscored)} emails")
             for email_record in unscored:
-                email_record.importance_score = self.compute_importance_score(email_record)
+                email_record.importance_score = self.compute_importance_score(
+                    email_record
+                )
                 self.db.add(email_record)
             self.db.commit()
         except Exception as e:
@@ -752,13 +851,15 @@ class EmailProcessor:
         # Build the lightweight dicts the AI service expects
         email_data_list = []
         for rec in email_records:
-            email_data_list.append({
-                "id": rec.id,
-                "subject": rec.subject or "",
-                "sender": rec.sender or "",
-                "body_plain": rec.body_plain or "",
-                "body_html": rec.body_html or "",
-            })
+            email_data_list.append(
+                {
+                    "id": rec.id,
+                    "subject": rec.subject or "",
+                    "sender": rec.sender or "",
+                    "body_plain": rec.body_plain or "",
+                    "body_html": rec.body_html or "",
+                }
+            )
 
         try:
             results = self.ai_service.analyze_emails_batch(email_data_list)
@@ -852,33 +953,41 @@ class EmailProcessor:
             self.db.add(email_record)
             self.db.flush()
             if is_spam:
-                self.db.add(PendingAction(
-                    email_id=email_record.id,
-                    action_type="MOVE_FOLDER",
-                    target_folder=self.settings.quarantine_folder,
-                    status="PENDING",
-                ))
+                self.db.add(
+                    PendingAction(
+                        email_id=email_record.id,
+                        action_type="MOVE_FOLDER",
+                        target_folder=self.settings.quarantine_folder,
+                        status="PENDING",
+                    )
+                )
                 self.stats["spam"] += 1
             else:
                 if self.settings.mark_as_read:
-                    self.db.add(PendingAction(
+                    self.db.add(
+                        PendingAction(
+                            email_id=email_record.id,
+                            action_type="MARK_READ",
+                            status="PENDING",
+                        )
+                    )
+                self.db.add(
+                    PendingAction(
                         email_id=email_record.id,
-                        action_type="MARK_READ",
+                        action_type="MOVE_FOLDER",
+                        target_folder=self.settings.archive_folder,
                         status="PENDING",
-                    ))
-                self.db.add(PendingAction(
-                    email_id=email_record.id,
-                    action_type="MOVE_FOLDER",
-                    target_folder=self.settings.archive_folder,
-                    status="PENDING",
-                ))
+                    )
+                )
                 self.stats["archived"] += 1
                 if action_required:
-                    self.db.add(PendingAction(
-                        email_id=email_record.id,
-                        action_type="ADD_FLAG",
-                        status="PENDING",
-                    ))
+                    self.db.add(
+                        PendingAction(
+                            email_id=email_record.id,
+                            action_type="ADD_FLAG",
+                            status="PENDING",
+                        )
+                    )
                     self.stats["action_required"] += 1
 
         elif imap and uid_int:
@@ -890,7 +999,9 @@ class EmailProcessor:
                 )
                 if imap.move_to_folder(uid_int, target):
                     actions_taken.append(
-                        "moved_to_spam" if self.settings.delete_spam else "moved_to_quarantine"
+                        "moved_to_spam"
+                        if self.settings.delete_spam
+                        else "moved_to_quarantine"
                     )
                     email_record.is_archived = True
                     self.stats["spam"] += 1
@@ -912,23 +1023,26 @@ class EmailProcessor:
         self.db.add(email_record)
         self.db.flush()
         self._queue_action_proposals(email_record, analysis)
-        self.db.add(AuditLog(
-            event_type="EMAIL_PROCESSED",
-            email_message_id=message_id,
-            description=(
-                f"Email processed (indexed): spam={is_spam}, "
-                f"action_required={action_required}, "
-                f"safe_mode={self.settings.safe_mode}, "
-                f"require_approval={self.settings.require_approval}"
-            ),
-            data={
-                "category": analysis.get("category"),
-                "priority": priority,
-                "actions": actions_taken,
-                "safe_mode": self.settings.safe_mode,
-                "require_approval": self.settings.require_approval,
-            },
-        ))
+        email_record.thread_state = self._refresh_thread_state(email_record.thread_id)
+        self.db.add(
+            AuditLog(
+                event_type="EMAIL_PROCESSED",
+                email_message_id=message_id,
+                description=(
+                    f"Email processed (indexed): spam={is_spam}, "
+                    f"action_required={action_required}, "
+                    f"safe_mode={self.settings.safe_mode}, "
+                    f"require_approval={self.settings.require_approval}"
+                ),
+                data={
+                    "category": analysis.get("category"),
+                    "priority": priority,
+                    "actions": actions_taken,
+                    "safe_mode": self.settings.safe_mode,
+                    "require_approval": self.settings.require_approval,
+                },
+            )
+        )
         self.db.commit()
         self.stats["processed"] += 1
 
@@ -953,7 +1067,9 @@ class EmailProcessor:
                     if not isinstance(payload, dict):
                         continue
                     if action_type:
-                        candidates.append({"action_type": action_type, "payload": payload})
+                        candidates.append(
+                            {"action_type": action_type, "payload": payload}
+                        )
             else:
                 suggested_folder = analysis.get("suggested_folder")
                 if suggested_folder:
@@ -1175,6 +1291,7 @@ class EmailProcessor:
         self.db.flush()
         email_record.actions_taken = {"actions": actions_taken}
         self._queue_action_proposals(email_record, analysis)
+        email_record.thread_state = self._refresh_thread_state(email_record.thread_id)
 
         audit = AuditLog(
             event_type="EMAIL_PROCESSED",
