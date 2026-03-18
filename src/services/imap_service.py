@@ -27,6 +27,7 @@ class IMAPService:
     def __init__(self):
         self.settings = get_settings()
         self.client: Optional[IMAPClient] = None
+        self.last_error: Optional[str] = None
 
     def connect(self) -> bool:
         """
@@ -36,6 +37,7 @@ class IMAPService:
         On failure, ensures self.client is None and performs best-effort cleanup.
         """
         temp_client = None
+        self.last_error = None
         try:
             # Build SSL context with configurable certificate verification
             ssl_context = None
@@ -75,6 +77,7 @@ class IMAPService:
             self.client = None
             
             sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            self.last_error = sanitized_error
             logger.error(
                 f"Failed to connect to IMAP server {self.settings.imap_host}: {sanitized_error}"
             )
@@ -287,19 +290,70 @@ class IMAPService:
     def move_to_folder(self, uid: int, folder: str) -> bool:
         """Move email to folder"""
         if not self.client:
+            self.last_error = "IMAP client not connected"
             return False
 
         try:
-            # Ensure folder exists
-            self._ensure_folder_exists(folder)
+            if not self.folder_exists(folder):
+                self.last_error = (
+                    f"Target folder not found on IMAP server: '{folder}'"
+                )
+                logger.warning(self.last_error)
+                return False
 
             # Move message
             self.client.move([uid], folder)
             logger.debug(f"Moved email {uid} to {folder}")
+            self.last_error = None
             return True
         except Exception as e:
             sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            self.last_error = (
+                f"Failed to move email {uid} to '{folder}': {sanitized_error}"
+            )
             logger.error(f"Failed to move email {uid} to {folder}: {sanitized_error}")
+            return False
+
+    def list_folders(self) -> List[Dict[str, str]]:
+        """Return live IMAP folder list with exact and normalized names."""
+        if not self.client:
+            self.last_error = "IMAP client not connected"
+            return []
+        try:
+            out: List[Dict[str, str]] = []
+            for flags, delimiter, name in self.client.list_folders():
+                folder_name = str(name)
+                out.append(
+                    {
+                        "name": folder_name,
+                        "normalized_name": folder_name.strip().lower(),
+                        "delimiter": str(delimiter) if delimiter is not None else "",
+                        "flags": [str(f) for f in (flags or ())],
+                    }
+                )
+            self.last_error = None
+            return out
+        except Exception as e:
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            self.last_error = f"Failed to list folders: {sanitized_error}"
+            logger.error(self.last_error)
+            return []
+
+    def folder_exists(self, folder: str) -> bool:
+        """Return True when the exact folder exists on the IMAP server."""
+        if not self.client:
+            self.last_error = "IMAP client not connected"
+            return False
+        try:
+            folders = [str(f[2]) for f in self.client.list_folders()]
+            exists = folder in folders
+            if not exists:
+                self.last_error = f"Target folder not found on IMAP server: '{folder}'"
+            return exists
+        except Exception as e:
+            sanitized_error = sanitize_error(e, debug=self.settings.debug)
+            self.last_error = f"Failed to validate folder '{folder}': {sanitized_error}"
+            logger.error(self.last_error)
             return False
 
     def add_flag(self, uid: int) -> bool:

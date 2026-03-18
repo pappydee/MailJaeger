@@ -8,6 +8,8 @@ let _isProcessing = false;
 let _dashboardTimer = null;
 let _actionQueueCache = [];
 let _safeModeEnabled = null;
+let _archiveFolder = '';
+let _foldersCache = [];
 const _reportQueueingKeys = new Set();
 let currentFilters = { category: null, priority: null, action_required: null };
 
@@ -31,6 +33,7 @@ async function checkAuthenticated() {
 async function boot() {
     await loadVersion();
     await loadDashboard();
+    await loadFolderSettings();
     await loadEmails();
     wireListeners();
     startStatusPolling();
@@ -313,6 +316,10 @@ async function loadDashboard() {
 
         _safeModeEnabled = Boolean(d.safe_mode);
         renderSafeModeState(_safeModeEnabled);
+        if (typeof d.archive_folder === 'string' && d.archive_folder.trim()) {
+            _archiveFolder = d.archive_folder.trim();
+            renderArchiveFolderCurrent();
+        }
 
         // Daily report button
         const reportBtn = document.getElementById('viewDailyReport');
@@ -321,6 +328,82 @@ async function loadDashboard() {
 
     } catch (ex) {
         showToast('Dashboard konnte nicht geladen werden', 'error');
+    }
+}
+
+async function loadFolderSettings() {
+    await Promise.all([loadSettingsSnapshot(), loadFolders()]);
+}
+
+async function loadSettingsSnapshot() {
+    try {
+        const r = await fetch(`${API_BASE}/api/settings`);
+        if (!r.ok) return;
+        const body = await r.json();
+        if (typeof body.archive_folder === 'string' && body.archive_folder.trim()) {
+            _archiveFolder = body.archive_folder.trim();
+        }
+        renderArchiveFolderCurrent();
+    } catch {}
+}
+
+function renderArchiveFolderCurrent() {
+    const current = document.getElementById('archiveFolderCurrent');
+    if (current) current.textContent = `Archivordner: ${_archiveFolder || '–'}`;
+}
+
+async function loadFolders() {
+    const select = document.getElementById('archiveFolderSelect');
+    if (select) {
+        select.innerHTML = '<option value="">Ordner laden…</option>';
+    }
+    try {
+        const r = await fetch(`${API_BASE}/api/folders`);
+        if (!r.ok) {
+            const body = await r.json().catch(() => ({}));
+            throw new Error(body.detail || 'Ordner konnten nicht geladen werden');
+        }
+        const body = await r.json();
+        _foldersCache = Array.isArray(body.folders) ? body.folders : [];
+        if (typeof body.current_archive_folder === 'string' && body.current_archive_folder.trim()) {
+            _archiveFolder = body.current_archive_folder.trim();
+        }
+        renderArchiveFolderCurrent();
+        if (select) {
+            const options = _foldersCache.map(folder => {
+                const name = folder?.name || '';
+                return `<option value="${escHtml(name)}">${escHtml(name)}</option>`;
+            }).join('');
+            select.innerHTML = `<option value="">Bitte wählen</option>${options}`;
+            if (_archiveFolder) select.value = _archiveFolder;
+        }
+    } catch (error) {
+        showToast(error?.message || 'Ordner konnten nicht geladen werden', 'error');
+    }
+}
+
+async function saveArchiveFolderSelection() {
+    const select = document.getElementById('archiveFolderSelect');
+    if (!select) return;
+    const selected = (select.value || '').trim();
+    if (!selected) {
+        showToast('Bitte zuerst einen Archivordner auswählen', 'info');
+        return;
+    }
+    try {
+        const r = await fetch(`${API_BASE}/api/settings`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ archive_folder: selected }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.detail || 'Archivordner konnte nicht gespeichert werden');
+        _archiveFolder = body.archive_folder || selected;
+        renderArchiveFolderCurrent();
+        showToast(`Archivordner gespeichert: ${_archiveFolder}`, 'success', 2800);
+        await loadActionQueue();
+    } catch (error) {
+        showToast(error?.message || 'Archivordner konnte nicht gespeichert werden', 'error');
     }
 }
 
@@ -623,6 +706,7 @@ async function openDailyReport() {
             ${renderReportSection('Aktion erforderlich', d.action_items, 'Keine offenen Aktionspunkte erkannt.')}
             ${renderReportSection('Ungelöste Elemente', d.unresolved_items, 'Keine ungelösten Elemente.')}
             ${renderReportSection('Spam / Bulk', d.spam_items, 'Keine Spam-/Bulk-Meldungen im Zeitraum.')}
+            ${renderThreadGroups(Array.isArray(d.threads) ? d.threads : [])}
             ${renderSuggestedActions(suggestions)}
             <section class="report-section">
                 <h3>Zusammenfassung</h3>
@@ -743,6 +827,50 @@ function renderSuggestedActions(actions = []) {
                             </button>
                         </div>
                     </div>
+                `).join('')}
+            </div>
+        </section>`;
+}
+
+function renderThreadGroups(threads = []) {
+    if (!threads.length) return '';
+    return `
+        <section class="report-section">
+            <h3>Threads</h3>
+            <div class="report-thread-groups">
+                ${threads.map(group => `
+                    <details class="report-thread-group" ${group.priority === 'urgent' || group.priority === 'high' ? 'open' : ''}>
+                        <summary>
+                            <span><strong>${escHtml(group.key_topic || group.summary || group.thread_id)}</strong></span>
+                            <span class="report-thread-badges">
+                                <span class="badge report-thread-priority priority-${escHtml(group.priority || 'normal')}">${escHtml((group.priority || 'normal').toUpperCase())}</span>
+                                <span class="thread-state-badge ${escHtml(normalizeThreadState(group.thread_state))}">${escHtml(threadStateLabel(group.thread_state))}</span>
+                                <span class="badge report-thread-score">${escHtml(Math.round(group.importance_score || 0))}</span>
+                            </span>
+                        </summary>
+                        ${group.summary ? `<div class="report-thread-summary">${escHtml(group.summary)}</div>` : ''}
+                        <div class="report-item-list">
+                            ${(group.emails || []).slice(0, 8).map(i => `
+                                <article class="report-item-card">
+                                    <div class="report-item-head">
+                                        <strong>${escHtml(i.subject || '(kein Betreff)')}</strong>
+                                        <div class="report-item-badges">
+                                            ${i.priority ? `<span class="badge report-badge-priority">${escHtml(i.priority)}</span>` : ''}
+                                            ${i.thread_priority ? `<span class="badge report-thread-priority priority-${escHtml(i.thread_priority)}">${escHtml((i.thread_priority || 'normal').toUpperCase())}</span>` : ''}
+                                        </div>
+                                    </div>
+                                    <div class="report-item-meta">
+                                        <span>Von: ${escHtml(i.sender || 'Unbekannt')}</span>
+                                        <span>E-Mail #${escHtml(i.email_id)}</span>
+                                    </div>
+                                    ${i.summary ? `<div class="report-item-summary">${escHtml(i.summary)}</div>` : ''}
+                                    <div class="report-item-actions">
+                                        <button class="btn btn-secondary report-open-email-btn" data-email-id="${escHtml(i.email_id)}" data-thread-id="${escHtml(i.thread_id || '')}">E-Mail öffnen</button>
+                                    </div>
+                                </article>
+                            `).join('')}
+                        </div>
+                    </details>
                 `).join('')}
             </div>
         </section>`;
@@ -881,10 +1009,17 @@ function renderActionQueue(actions = []) {
         const status = normalizeQueueStatus(action.status);
         const payload = action.payload || {};
         const threadState = normalizeThreadState(action.thread_state);
+        const threadPriority = normalizeThreadPriority(action.thread_priority);
+        const threadScore = Math.round(action.thread_importance_score || 0);
         const threadSummary = action.thread_summary || {};
         const threadSummaryLine = buildThreadSummaryLine(threadSummary);
+        const waitingLabel = threadState === 'waiting_for_me'
+            ? 'Handlung erforderlich'
+            : threadState === 'waiting_for_other'
+                ? 'Warte auf Antwort'
+                : null;
         return `
-            <article class="action-queue-card">
+            <article class="action-queue-card ${threadState === 'waiting_for_me' ? 'action-queue-card-waiting' : ''}">
                 <div class="action-queue-head">
                     <div>
                         <strong>${escHtml(action.action_type)}</strong>
@@ -892,14 +1027,18 @@ function renderActionQueue(actions = []) {
                             E-Mail #${escHtml(action.email_id)}${action.thread_id ? ` · Thread ${escHtml(action.thread_id)}` : ''}
                         </div>
                         ${threadSummaryLine ? `<div class="action-thread-summary">${escHtml(threadSummaryLine)}</div>` : ''}
+                        ${waitingLabel ? `<div class="action-thread-decision">${escHtml(waitingLabel)}</div>` : ''}
                     </div>
                     <div class="action-queue-badges">
                         <span class="queue-status-badge ${escHtml(status)}">${escHtml(statusLabel(status))}</span>
                         <span class="thread-state-badge ${escHtml(threadState)}">${escHtml(threadStateLabel(threadState))}</span>
+                        <span class="badge report-thread-priority priority-${escHtml(threadPriority)}">${escHtml(threadPriority.toUpperCase())}</span>
+                        <span class="badge report-thread-score">${escHtml(threadScore)}</span>
                     </div>
                 </div>
                 <div class="action-queue-meta">
                     <span>Erstellt: ${fmtDt(action.created_at)}</span>
+                    ${action.thread_last_activity_at ? `<span>Letzte Aktivität: ${fmtDt(action.thread_last_activity_at)}</span>` : ''}
                     <span>Quelle: ${escHtml(action.source || payload.source_context || payload.source || 'unbekannt')}</span>
                 </div>
                 ${action.action_type === 'move' && payload.target_folder ? `<div class="report-action-context"><strong>Zielordner:</strong> ${escHtml(payload.target_folder)}</div>` : ''}
@@ -974,6 +1113,8 @@ function wireListeners() {
     document.getElementById('viewDailyReport')?.addEventListener('click', openDailyReport);
     document.getElementById('closeReportModal')?.addEventListener('click', () => document.getElementById('reportModal').classList.remove('active'));
     document.getElementById('refreshActionQueue')?.addEventListener('click', loadActionQueue);
+    document.getElementById('refreshFoldersBtn')?.addEventListener('click', loadFolders);
+    document.getElementById('saveArchiveFolderBtn')?.addEventListener('click', saveArchiveFolderSelection);
     document.getElementById('applyFilters')?.addEventListener('click', applyFilters);
     document.getElementById('logoutBtn')?.addEventListener('click', handleLogout);
     document.getElementById('versionBadge')?.addEventListener('click', openVersionModal);
@@ -1037,7 +1178,8 @@ function statusLabel(s) {
     })[s] || s || '–';
 }
 
-const VALID_THREAD_STATES = ['open', 'waiting_for_me', 'waiting_for_other', 'resolved', 'informational'];
+const VALID_THREAD_STATES = ['open', 'waiting_for_me', 'waiting_for_other', 'in_conversation', 'resolved', 'informational', 'auto_generated'];
+const VALID_THREAD_PRIORITIES = ['urgent', 'high', 'normal', 'low'];
 
 function normalizeQueueStatus(status) {
     const normalized = (status || '').toLowerCase();
@@ -1062,9 +1204,16 @@ function threadStateLabel(state) {
         open: 'Offen',
         waiting_for_me: 'Warte auf mich',
         waiting_for_other: 'Warte auf andere',
+        in_conversation: 'Im Gespräch',
         resolved: 'Erledigt',
         informational: 'Info',
+        auto_generated: 'Automatisch',
     })[normalizeThreadState(state)] || 'Info';
+}
+
+function normalizeThreadPriority(priority) {
+    const normalized = (priority || '').toLowerCase();
+    return VALID_THREAD_PRIORITIES.includes(normalized) ? normalized : 'normal';
 }
 
 function buildThreadSummaryLine(summary) {

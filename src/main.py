@@ -17,9 +17,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
-from typing import List, Optional, Dict
-from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections import defaultdict
 import sys
 import secrets
 import hashlib
@@ -34,6 +35,7 @@ from src.models.schemas import (
     DashboardResponse,
     DailyReportResponse,
     DailyReportEndpointResponse,
+    DailyReportThreadGroup,
     ReportTotals,
     ReportEmailItem,
     ReportSuggestedAction,
@@ -79,6 +81,12 @@ from src.services.thread_context import (
     normalize_thread_state,
     update_thread_state_for_thread,
 )
+from src.services.thread_aggregator import (
+    build_thread_context,
+    query_open_action_count,
+    thread_sort_key,
+)
+from src.services.thread_summary_service import ThreadSummaryService
 from src.middleware.auth import require_authentication, AuthenticationError
 from src.middleware.session_store import _sessions, SESSION_COOKIE, SESSION_EXPIRY_HOURS
 from src.middleware.security_headers import SecurityHeadersMiddleware
@@ -111,6 +119,9 @@ DECISION_EVENT_TYPES = {
 }
 DECISION_EVENT_SOURCES = {"daily_report", "report_suggestion", "queue_ui", "user"}
 APP_SETTING_SAFE_MODE = "safe_mode"
+APP_SETTING_ARCHIVE_FOLDER = "archive_folder"
+APP_SETTING_IMAP_FOLDERS_CACHE = "imap_folders_cache"
+DAILY_REPORT_SCHEMA_VERSION = 2
 
 # In-memory session store: imported from session_store so that
 # require_authentication() in auth.py can validate cookies without a
@@ -242,6 +253,177 @@ def _apply_persisted_safe_mode(db: Session) -> bool:
     return bool(get_settings().safe_mode)
 
 
+def _apply_persisted_archive_folder(db: Session) -> str:
+    persisted_archive_folder = _get_app_setting(db, key=APP_SETTING_ARCHIVE_FOLDER)
+    if isinstance(persisted_archive_folder, str) and persisted_archive_folder.strip():
+        get_settings().archive_folder = persisted_archive_folder.strip()
+        return get_settings().archive_folder
+    return get_settings().archive_folder
+
+
+def _normalize_folder_name(value: Optional[str]) -> str:
+    return (value or "").strip().lower()
+
+
+def _folder_pref_keys_for_email(email: Optional[ProcessedEmail], action_type: str) -> List[str]:
+    keys = []
+    if email and email.category:
+        keys.append(f"folder_pref::{action_type}::category::{email.category.lower()}")
+    if email and email.sender and "@" in email.sender:
+        domain = email.sender.rsplit("@", 1)[-1].strip().lower()
+        if domain:
+            keys.append(f"folder_pref::{action_type}::domain::{domain}")
+    keys.append(f"folder_pref::{action_type}")
+    return keys
+
+
+def _learn_folder_preference(
+    db: Session,
+    *,
+    action_type: str,
+    target_folder: Optional[str],
+    email: Optional[ProcessedEmail] = None,
+) -> None:
+    folder = (target_folder or "").strip()
+    if not folder:
+        return
+    normalized_action = (action_type or "").strip().lower()
+    if normalized_action not in {"move", "archive"}:
+        return
+    for key in _folder_pref_keys_for_email(email, normalized_action):
+        _set_app_setting(db, key=key, value=folder)
+    if normalized_action in {"move", "archive"}:
+        _set_app_setting(db, key=APP_SETTING_ARCHIVE_FOLDER, value=folder)
+        get_settings().archive_folder = folder
+
+
+def _discover_live_imap_folders() -> List[Dict[str, Any]]:
+    try:
+        with IMAPService() as imap:
+            folders = imap.list_folders()
+            return folders if isinstance(folders, list) else []
+    except Exception as exc:
+        logger.warning(
+            "Could not fetch IMAP folder list: %s",
+            sanitize_error(exc, debug=settings.debug),
+        )
+        return []
+
+
+def _choose_archive_folder_from_discovered(folders: List[Dict[str, Any]]) -> Optional[str]:
+    if not folders:
+        return None
+    names = [str(folder.get("name", "")) for folder in folders if folder.get("name")]
+    normalized_map = {name: _normalize_folder_name(name) for name in names}
+
+    # Strong preference: explicit archive semantics in multiple languages.
+    for needle in ("archive", "archiv"):
+        for name, normalized in normalized_map.items():
+            if needle in normalized:
+                return name
+
+    # Secondary: "All mail"/"Alles …" style folders often used as archive sink.
+    for needle in ("all mail", "alles"):
+        for name, normalized in normalized_map.items():
+            if needle in normalized:
+                return name
+
+    # Fallback: first non-INBOX user folder.
+    for name, normalized in normalized_map.items():
+        if normalized and normalized != "inbox":
+            return name
+    return None
+
+
+def _resolve_archive_folder(
+    db: Session,
+    *,
+    email: Optional[ProcessedEmail] = None,
+    allow_live_discovery: bool = False,
+) -> Optional[str]:
+    configured = _get_app_setting(db, key=APP_SETTING_ARCHIVE_FOLDER)
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+
+    for key in _folder_pref_keys_for_email(email, "archive"):
+        candidate = _get_app_setting(db, key=key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    for key in _folder_pref_keys_for_email(email, "move"):
+        candidate = _get_app_setting(db, key=key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+
+    cached = _get_app_setting(db, key=APP_SETTING_IMAP_FOLDERS_CACHE)
+    if isinstance(cached, dict) and isinstance(cached.get("folders"), list):
+        candidate = _choose_archive_folder_from_discovered(cached.get("folders", []))
+        if candidate:
+            return candidate
+
+    if allow_live_discovery:
+        live_folders = _discover_live_imap_folders()
+        if live_folders:
+            _set_app_setting(
+                db,
+                key=APP_SETTING_IMAP_FOLDERS_CACHE,
+                value={
+                    "folders": live_folders,
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            candidate = _choose_archive_folder_from_discovered(live_folders)
+            if candidate:
+                return candidate
+    return None
+
+
+def _item_has_thread_intelligence(item: Dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    thread_state = item.get("thread_state")
+    thread_priority = item.get("thread_priority")
+    thread_importance_score = item.get("thread_importance_score")
+    return bool(thread_state) and bool(thread_priority) and (
+        isinstance(thread_importance_score, (int, float))
+    )
+
+
+def _is_daily_report_payload_compatible(payload: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("report_version") != DAILY_REPORT_SCHEMA_VERSION:
+        return False
+
+    threads = payload.get("threads")
+    if not isinstance(threads, list):
+        return False
+    for thread in threads:
+        if not isinstance(thread, dict):
+            return False
+        if not all(
+            key in thread
+            for key in (
+                "thread_id",
+                "thread_state",
+                "priority",
+                "importance_score",
+                "emails",
+            )
+        ):
+            return False
+        if not isinstance(thread.get("emails"), list):
+            return False
+
+    for section in ("important_items", "action_items", "unresolved_items", "spam_items"):
+        items = payload.get(section)
+        if not isinstance(items, list):
+            return False
+        for item in items:
+            if not _item_has_thread_intelligence(item):
+                return False
+    return True
+
+
 def _normalize_action_status(status_value: Optional[str]) -> str:
     aliases = {
         "proposed_action": "proposed",
@@ -337,16 +519,42 @@ def _safe_thread_state_from_context(
 
 
 def _serialize_action_queue(
-    db: Session, action: ActionQueue, *, email: Optional[ProcessedEmail] = None
+    db: Session,
+    action: ActionQueue,
+    *,
+    email: Optional[ProcessedEmail] = None,
+    thread_context: Optional[dict] = None,
 ) -> Dict:
     payload_out = action.payload if isinstance(action.payload, dict) else {}
     thread_id = action.thread_id or (email.thread_id if email else None)
-    thread_state = _safe_thread_state_from_context(db, thread_id=thread_id, email=email)
+    thread_state = (
+        thread_context.get("thread_state")
+        if isinstance(thread_context, dict)
+        else _safe_thread_state_from_context(db, thread_id=thread_id, email=email)
+    )
+    thread_priority = (
+        thread_context.get("thread_priority")
+        if isinstance(thread_context, dict)
+        else (email.thread_priority if email else None)
+    )
+    thread_importance_score = (
+        thread_context.get("thread_importance_score")
+        if isinstance(thread_context, dict)
+        else (email.thread_importance_score if email else None)
+    )
+    thread_last_activity_at = (
+        thread_context.get("thread_last_activity_at")
+        if isinstance(thread_context, dict)
+        else (email.date if email else None)
+    )
     return {
         "id": action.id,
         "email_id": action.email_id,
         "thread_id": thread_id,
         "thread_state": thread_state,
+        "thread_priority": thread_priority,
+        "thread_importance_score": thread_importance_score,
+        "thread_last_activity_at": thread_last_activity_at,
         "thread_summary": get_thread_summary(db, thread_id=thread_id),
         "action_type": action.action_type,
         "payload": action.payload,
@@ -596,7 +804,9 @@ async def startup_event():
 
     with get_db_session() as db:
         effective_safe_mode = _apply_persisted_safe_mode(db)
+        effective_archive_folder = _apply_persisted_archive_folder(db)
     logger.info(f"Safe mode (effective): {effective_safe_mode}")
+    logger.info(f"Archive folder (effective): {effective_archive_folder}")
 
     # Verify critical tables exist (fail-closed startup check)
     try:
@@ -1201,6 +1411,7 @@ async def get_processing_run(run_id: int, db: Session = Depends(get_db)):
 async def get_settings_api(db: Session = Depends(get_db)):
     """Get current settings (sanitized - no sensitive credentials)"""
     _apply_persisted_safe_mode(db)
+    _apply_persisted_archive_folder(db)
     return {
         "imap_host": settings.imap_host,
         "imap_port": settings.imap_port,
@@ -1214,6 +1425,7 @@ async def get_settings_api(db: Session = Depends(get_db)):
         "store_email_body": settings.store_email_body,
         "store_attachments": settings.store_attachments,
         "safe_mode": settings.safe_mode,
+        "archive_folder": settings.archive_folder,
         "require_approval": settings.require_approval,
         "mark_as_read": settings.mark_as_read,
     }
@@ -1227,6 +1439,21 @@ async def update_settings_api(request: SettingsUpdate, db: Session = Depends(get
         settings.safe_mode = bool(request.safe_mode)
         _set_app_setting(db, key=APP_SETTING_SAFE_MODE, value=settings.safe_mode)
         updated_fields.append("safe_mode")
+    if request.archive_folder is not None:
+        selected_folder = (request.archive_folder or "").strip()
+        if not selected_folder:
+            raise HTTPException(status_code=400, detail="archive_folder must be non-empty")
+        settings.archive_folder = selected_folder
+        _set_app_setting(
+            db, key=APP_SETTING_ARCHIVE_FOLDER, value=settings.archive_folder
+        )
+        _learn_folder_preference(
+            db,
+            action_type="archive",
+            target_folder=settings.archive_folder,
+            email=None,
+        )
+        updated_fields.append("archive_folder")
 
     return {
         "success": True,
@@ -1237,6 +1464,33 @@ async def update_settings_api(request: SettingsUpdate, db: Session = Depends(get
         ),
         "updated_fields": updated_fields,
         "safe_mode": settings.safe_mode,
+        "archive_folder": settings.archive_folder,
+    }
+
+
+@app.get(
+    "/api/folders",
+    dependencies=[Depends(require_authentication)],
+)
+async def list_imap_folders(db: Session = Depends(get_db)):
+    """Return live IMAP folders with exact and normalized names."""
+    folders = _discover_live_imap_folders()
+    if not folders:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not retrieve IMAP folders from mail server",
+        )
+    _set_app_setting(
+        db,
+        key=APP_SETTING_IMAP_FOLDERS_CACHE,
+        value={"folders": folders, "fetched_at": datetime.now(timezone.utc).isoformat()},
+    )
+    return {
+        "folders": folders,
+        "current_archive_folder": _resolve_archive_folder(
+            db, email=None, allow_live_discovery=False
+        )
+        or settings.archive_folder,
     }
 
 
@@ -1269,14 +1523,86 @@ async def list_actions(
         )
     actions = query.order_by(ActionQueue.created_at.desc()).all()
 
-    normalized_actions = []
+    action_rows = []
+    emails_by_id: Dict[int, ProcessedEmail] = {}
+    thread_ids = set()
     for action in actions:
         email = (
             db.query(ProcessedEmail)
             .filter(ProcessedEmail.id == action.email_id)
             .first()
         )
-        normalized_actions.append(_serialize_action_queue(db, action, email=email))
+        action_rows.append((action, email))
+        if email:
+            emails_by_id[email.id] = email
+        thread_id = action.thread_id or (email.thread_id if email else None)
+        if thread_id:
+            thread_ids.add(thread_id)
+
+    contexts_by_thread: Dict[str, dict] = {}
+    for thread_id in thread_ids:
+        thread_emails = (
+            db.query(ProcessedEmail)
+            .filter(ProcessedEmail.thread_id == thread_id)
+            .order_by(
+                ProcessedEmail.date.desc(),
+                ProcessedEmail.processed_at.desc(),
+                ProcessedEmail.created_at.desc(),
+                ProcessedEmail.id.desc(),
+            )
+            .all()
+        )
+        if not thread_emails:
+            continue
+        context = build_thread_context(
+            thread_id=thread_id,
+            emails=thread_emails,
+            user_address=getattr(settings, "imap_username", None),
+            open_actions_count=query_open_action_count(db, thread_id=thread_id),
+        )
+        for email in thread_emails:
+            email.thread_state = context.thread_state
+            email.thread_priority = context.thread_priority
+            email.thread_importance_score = context.thread_importance_score
+        contexts_by_thread[thread_id] = {
+            "thread_state": context.thread_state,
+            "thread_priority": context.thread_priority,
+            "thread_importance_score": context.thread_importance_score,
+            "thread_last_activity_at": context.thread_last_activity_at,
+            "sort_key": thread_sort_key(context),
+        }
+    db.flush()
+
+    action_rows.sort(
+        key=lambda row: (
+            contexts_by_thread.get(
+                row[0].thread_id or (row[1].thread_id if row[1] else None), {}
+            ).get("sort_key", (2, 0.0, 0.0))[0],
+            -contexts_by_thread.get(
+                row[0].thread_id or (row[1].thread_id if row[1] else None), {}
+            ).get("sort_key", (2, 0.0, 0.0))[1],
+            -contexts_by_thread.get(
+                row[0].thread_id or (row[1].thread_id if row[1] else None), {}
+            ).get("sort_key", (2, 0.0, 0.0))[2],
+            -(
+                row[0].created_at.timestamp()
+                if row[0].created_at
+                else 0.0
+            ),
+        )
+    )
+
+    normalized_actions = []
+    for action, email in action_rows:
+        thread_id = action.thread_id or (email.thread_id if email else None)
+        normalized_actions.append(
+            _serialize_action_queue(
+                db,
+                action,
+                email=email,
+                thread_context=contexts_by_thread.get(thread_id),
+            )
+        )
     return normalized_actions
 
 
@@ -1311,9 +1637,10 @@ async def queue_daily_report_suggested_action(
 
     if normalized_type == "archive":
         queue_action_type = "move"
-        payload["target_folder"] = (
-            payload.get("target_folder") or settings.archive_folder
+        payload["target_folder"] = payload.get("target_folder") or _resolve_archive_folder(
+            db, email=email, allow_live_discovery=True
         )
+        payload["target_folder"] = payload.get("target_folder") or settings.archive_folder
     elif normalized_type == "mark_spam":
         queue_action_type = "move"
         payload["target_folder"] = (
@@ -1321,9 +1648,10 @@ async def queue_daily_report_suggested_action(
         )
     elif normalized_type == "move":
         queue_action_type = "move"
-        payload["target_folder"] = (
-            payload.get("target_folder") or settings.archive_folder
+        payload["target_folder"] = payload.get("target_folder") or _resolve_archive_folder(
+            db, email=email, allow_live_discovery=True
         )
+        payload["target_folder"] = payload.get("target_folder") or settings.archive_folder
     elif normalized_type in ("mark_read", "delete", "mark_resolved", "reply_draft"):
         queue_action_type = normalized_type
 
@@ -1336,6 +1664,14 @@ async def queue_daily_report_suggested_action(
         payload.setdefault("draft_summary", reply_payload["draft_summary"])
         payload.setdefault("draft_text", reply_payload["draft_text"])
         payload["draft_state"] = payload.get("draft_state") or "proposed_manual_send"
+
+    if queue_action_type == "move":
+        _learn_folder_preference(
+            db,
+            action_type=normalized_type,
+            target_folder=payload.get("target_folder"),
+            email=email,
+        )
 
     payload_source = (request.source or "daily_report").strip().lower()
     payload["source"] = "daily_report_suggestion"
@@ -1403,6 +1739,17 @@ async def queue_daily_report_suggested_action(
         new_value=action.action_type,
         user_confirmed=True,
     )
+    if action.action_type == "move":
+        email_for_learning = (
+            db.query(ProcessedEmail).filter(ProcessedEmail.id == action.email_id).first()
+        )
+        move_payload = action.payload if isinstance(action.payload, dict) else {}
+        _learn_folder_preference(
+            db,
+            action_type="move",
+            target_folder=move_payload.get("target_folder"),
+            email=email_for_learning,
+        )
     logger.info(
         "Action %s queued from daily report: email=%s thread=%s type=%s",
         action.id,
@@ -1475,20 +1822,22 @@ async def approve_action(
             status_code=400, detail=f"Cannot approve action with status {action.status}"
         )
     previous_status = action.status
+    transition_time = datetime.now(timezone.utc)
     action.status = "approved"
-    action.approved_at = datetime.utcnow()
-    action.updated_at = datetime.utcnow()
-    if _is_report_suggested_action(action):
-        _record_decision_event(
-            db,
-            email_id=action.email_id,
-            thread_id=action.thread_id,
-            event_type="approve_suggestion",
-            source=source or "queue_ui",
-            old_value=previous_status,
-            new_value=action.action_type,
-            user_confirmed=True,
-        )
+    action.approved_at = transition_time
+    action.updated_at = transition_time
+    # Intentional broad capture: every user queue decision is now used
+    # as thread-level learning signal (not only daily-report suggestions).
+    _record_decision_event(
+        db,
+        email_id=action.email_id,
+        thread_id=action.thread_id,
+        event_type="approve_suggestion",
+        source=source or "queue_ui",
+        old_value=previous_status,
+        new_value=action.action_type,
+        user_confirmed=True,
+    )
     logger.info(
         "Action %s transition %s -> %s",
         action.id,
@@ -1520,20 +1869,20 @@ async def reject_action(
     if action.status in ("executed", "executed_action"):
         raise HTTPException(status_code=400, detail="Cannot reject an executed action")
     previous_status = action.status
+    transition_time = datetime.now(timezone.utc)
     action.status = "rejected"
     action.error_message = "Rejected by user"
-    action.updated_at = datetime.utcnow()
-    if _is_report_suggested_action(action):
-        _record_decision_event(
-            db,
-            email_id=action.email_id,
-            thread_id=action.thread_id,
-            event_type="reject_suggestion",
-            source=source or "queue_ui",
-            old_value=previous_status,
-            new_value=action.action_type,
-            user_confirmed=False,
-        )
+    action.updated_at = transition_time
+    _record_decision_event(
+        db,
+        email_id=action.email_id,
+        thread_id=action.thread_id,
+        event_type="reject_suggestion",
+        source=source or "queue_ui",
+        old_value=previous_status,
+        new_value=action.action_type,
+        user_confirmed=False,
+    )
     logger.info(
         "Action %s transition %s -> %s",
         action.id,
@@ -1598,7 +1947,8 @@ async def execute_action(
             db.add(action)
             if email:
                 db.add(email)
-            if _is_report_suggested_action(action) and action.status in (
+            # Intentional broad capture for thread-level learning hooks.
+            if action.status in (
                 "executed",
                 "executed_action",
             ):
@@ -1612,6 +1962,14 @@ async def execute_action(
                     new_value=action.action_type,
                     user_confirmed=True,
                 )
+                if action.action_type == "move":
+                    move_payload = action.payload if isinstance(action.payload, dict) else {}
+                    _learn_folder_preference(
+                        db,
+                        action_type="move",
+                        target_folder=move_payload.get("target_folder"),
+                        email=email,
+                    )
             logger.info(
                 "Action %s execution result action_type=%s status=%s",
                 action.id,
@@ -2432,14 +2790,70 @@ def _build_daily_report_response(
         1 for e in recent_emails if e.action_required and not e.is_resolved
     )
     thread_ids = {e.thread_id for e in recent_emails if e.thread_id}
+    thread_recent_emails_map: Dict[str, List[ProcessedEmail]] = defaultdict(list)
+    for email in recent_emails:
+        if email.thread_id:
+            thread_recent_emails_map[email.thread_id].append(email)
+
+    thread_contexts: Dict[str, dict] = {}
+    summary_service = ThreadSummaryService()
     for thread_id in thread_ids:
-        update_thread_state_for_thread(
+        thread_emails = (
+            db.query(ProcessedEmail)
+            .filter(ProcessedEmail.thread_id == thread_id)
+            .order_by(
+                ProcessedEmail.date.desc(),
+                ProcessedEmail.processed_at.desc(),
+                ProcessedEmail.created_at.desc(),
+                ProcessedEmail.id.desc(),
+            )
+            .all()
+        )
+        if not thread_emails:
+            continue
+        context = build_thread_context(
+            thread_id=thread_id,
+            emails=thread_emails,
+            user_address=getattr(settings, "imap_username", None),
+            open_actions_count=query_open_action_count(db, thread_id=thread_id),
+        )
+        for email in thread_emails:
+            email.thread_state = context.thread_state
+            email.thread_priority = context.thread_priority
+            email.thread_importance_score = context.thread_importance_score
+        thread_summary = summary_service.get_or_generate_summary(
             db,
             thread_id=thread_id,
-            user_address=getattr(settings, "imap_username", None),
+            emails=thread_emails,
+            thread_state=context.thread_state,
+            allow_generate=True,
         )
+        thread_contexts[thread_id] = {
+            "thread_state": context.thread_state,
+            "thread_priority": context.thread_priority,
+            "thread_importance_score": context.thread_importance_score,
+            "thread_last_activity_at": context.thread_last_activity_at,
+            "summary": (thread_summary or {}).get("summary"),
+            "key_topic": (thread_summary or {}).get("key_topic"),
+            "status": (thread_summary or {}).get("status"),
+        }
+    db.flush()
 
     def _to_item(e: ProcessedEmail) -> ReportEmailItem:
+        thread_context = thread_contexts.get(e.thread_id) if e.thread_id else None
+        item_thread_state = normalize_thread_state(
+            (thread_context or {}).get("thread_state", e.thread_state)
+        )
+        item_thread_priority = (thread_context or {}).get(
+            "thread_priority", e.thread_priority or "normal"
+        )
+        item_thread_importance_score = float(
+            (thread_context or {}).get(
+                "thread_importance_score",
+                e.thread_importance_score if e.thread_importance_score is not None else 0.0,
+            )
+            or 0.0
+        )
         return ReportEmailItem(
             email_id=e.id,
             thread_id=e.thread_id,
@@ -2448,7 +2862,9 @@ def _build_daily_report_response(
             summary=e.summary,
             priority=e.priority,
             category=e.category,
-            thread_state=normalize_thread_state(e.thread_state),
+            thread_state=item_thread_state,
+            thread_priority=item_thread_priority,
+            thread_importance_score=item_thread_importance_score,
         )
 
     important_items = [
@@ -2564,26 +2980,30 @@ def _build_daily_report_response(
         elif not e.is_archived and not e.is_spam:
             archive_key = _suggestion_queue_type_and_key("archive", e.id, e.thread_id)
             archive_existing = latest_action_by_key.get(archive_key)
-            suggested_actions.append(
-                ReportSuggestedAction(
-                    email_id=e.id,
-                    thread_id=e.thread_id,
-                    action_type="archive",
-                    payload={"target_folder": settings.archive_folder},
-                    target_folder=settings.archive_folder,
-                    description=f"Archivieren: {e.subject or '(kein Betreff)'}",
-                    safe_mode=safe_mode_active,
-                    queue_status=(
-                        _normalize_action_status(archive_existing.status)
-                        if archive_existing
-                        else None
-                    ),
-                    queue_action_id=archive_existing.id if archive_existing else None,
-                    queue_error=(
-                        archive_existing.error_message if archive_existing else None
-                    ),
-                )
+            archive_target = _resolve_archive_folder(
+                db, email=e, allow_live_discovery=False
             )
+            if archive_target:
+                suggested_actions.append(
+                    ReportSuggestedAction(
+                        email_id=e.id,
+                        thread_id=e.thread_id,
+                        action_type="archive",
+                        payload={"target_folder": archive_target},
+                        target_folder=archive_target,
+                        description=f"Archivieren: {e.subject or '(kein Betreff)'}",
+                        safe_mode=safe_mode_active,
+                        queue_status=(
+                            _normalize_action_status(archive_existing.status)
+                            if archive_existing
+                            else None
+                        ),
+                        queue_action_id=archive_existing.id if archive_existing else None,
+                        queue_error=(
+                            archive_existing.error_message if archive_existing else None
+                        ),
+                    )
+                )
         if len(suggested_actions) >= 20:
             break
 
@@ -2598,6 +3018,55 @@ def _build_daily_report_response(
             suggestion.thread_suggestion_count = thread_suggestion_counts.get(
                 suggestion.thread_id, 0
             )
+    suggested_actions.sort(
+        key=lambda suggestion: (
+            0
+            if suggestion.thread_id
+            and thread_contexts.get(suggestion.thread_id, {}).get("thread_state")
+            == "waiting_for_me"
+            else 1,
+            float(
+                thread_contexts.get(suggestion.thread_id, {}).get(
+                    "thread_importance_score", 0.0
+                )
+            )
+            if suggestion.thread_id
+            else 0.0,
+        ),
+        reverse=True,
+    )
+
+    thread_groups: List[DailyReportThreadGroup] = []
+    for thread_id, thread_emails in thread_recent_emails_map.items():
+        context = thread_contexts.get(thread_id, {})
+        items = [_to_item(email) for email in thread_emails]
+        items.sort(
+            key=lambda item: (
+                item.thread_importance_score or 0.0,
+                item.email_id or 0,
+            ),
+            reverse=True,
+        )
+        thread_groups.append(
+            DailyReportThreadGroup(
+                thread_id=thread_id,
+                thread_state=normalize_thread_state(
+                    context.get("thread_state", "informational")
+                ),
+                priority=context.get("thread_priority", "normal"),
+                importance_score=float(context.get("thread_importance_score") or 0.0),
+                thread_last_activity_at=(
+                    context.get("thread_last_activity_at").isoformat()
+                    if context.get("thread_last_activity_at")
+                    else None
+                ),
+                summary=context.get("summary"),
+                key_topic=context.get("key_topic"),
+                status=context.get("status"),
+                emails=items,
+            )
+        )
+    thread_groups.sort(key=lambda group: group.importance_score, reverse=True)
 
     email_summaries = []
     for e in recent_emails[:30]:  # include top 30 in prompt to stay concise
@@ -2657,6 +3126,7 @@ Halte den Bericht präzise und handlungsorientiert."""
         report_text = "\n".join(lines)
 
     return DailyReportResponse(
+        report_version=DAILY_REPORT_SCHEMA_VERSION,
         generated_at=datetime.utcnow().isoformat(),
         period_hours=24,
         totals=ReportTotals(
@@ -2673,6 +3143,7 @@ Halte den Bericht präzise und handlungsorientiert."""
         action_items=action_items,
         unresolved_items=unresolved_items,
         spam_items=spam_items,
+        threads=thread_groups,
         suggested_actions=suggested_actions,
         report_text=report_text,
     )
@@ -2742,13 +3213,22 @@ async def get_daily_report(
                 if isinstance(latest_report.report_json, dict)
                 else None
             )
-            if not cached_report:
-                cached_report = DailyReportResponse(
+            if not cached_report or not _is_daily_report_payload_compatible(cached_report):
+                latest_report.generation_status = "pending"
+                latest_report.error_message = "stale_or_incompatible_cached_report"
+                latest_report.report_json = None
+                latest_report.generated_at = now
+                db.add(latest_report)
+                db.commit()
+                db.refresh(latest_report)
+                if isinstance(latest_report.id, int):
+                    background_tasks.add_task(
+                        _generate_daily_report_in_background, latest_report.id
+                    )
+                return DailyReportEndpointResponse(
+                    status="pending",
                     generated_at=latest_report.generated_at.isoformat(),
-                    period_hours=24,
-                    report_text=latest_report.report_text
-                    or "Keine KI-Zusammenfassung verfügbar.",
-                ).model_dump()
+                )
             return DailyReportEndpointResponse(
                 status="ready",
                 report=cached_report,

@@ -22,8 +22,10 @@ VALID_THREAD_STATES = {
     "open",
     "waiting_for_me",
     "waiting_for_other",
+    "in_conversation",
     "resolved",
     "informational",
+    "auto_generated",
 }
 
 
@@ -83,6 +85,7 @@ def test_daily_report_sections_and_suggested_actions_present():
         )
         _create_email(db, message_id="m2@example.com", is_spam=True, is_archived=False)
         payload = {
+            "report_version": 2,
             "generated_at": datetime.utcnow().isoformat(),
             "period_hours": 24,
             "totals": {
@@ -99,6 +102,7 @@ def test_daily_report_sections_and_suggested_actions_present():
             "action_items": [],
             "unresolved_items": [],
             "spam_items": [],
+            "threads": [],
             "suggested_actions": [
                 {
                     "email_id": 1,
@@ -179,6 +183,7 @@ def test_daily_report_endpoint_uses_cached_ready_report_without_regeneration():
             period_start=datetime.utcnow() - timedelta(hours=24),
             period_end=datetime.utcnow(),
             report_json={
+                "report_version": 2,
                 "generated_at": datetime.utcnow().isoformat(),
                 "period_hours": 24,
                 "totals": {
@@ -195,6 +200,7 @@ def test_daily_report_endpoint_uses_cached_ready_report_without_regeneration():
                 "action_items": [],
                 "unresolved_items": [],
                 "spam_items": [],
+                "threads": [],
                 "suggested_actions": [],
                 "report_text": "Cached report",
             },
@@ -458,6 +464,7 @@ def test_daily_report_reflects_existing_queue_state_for_suggestions():
         db.add(action)
         db.commit()
         payload = {
+            "report_version": 2,
             "generated_at": datetime.utcnow().isoformat(),
             "period_hours": 24,
             "totals": {
@@ -474,6 +481,7 @@ def test_daily_report_reflects_existing_queue_state_for_suggestions():
             "action_items": [],
             "unresolved_items": [],
             "spam_items": [],
+            "threads": [],
             "suggested_actions": [
                 {
                     "email_id": email.id,

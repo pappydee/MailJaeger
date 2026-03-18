@@ -146,7 +146,11 @@ class ActionExecutor:
 
             previous_status = action.status
             action.status = "failed"
-            action.error_message = "IMAP operation failed"
+            imap_error = getattr(self.imap, "last_error", None)
+            if isinstance(imap_error, str) and imap_error.strip():
+                action.error_message = imap_error
+            else:
+                action.error_message = "IMAP operation failed"
             logger.warning(
                 "action_execution action_id=%s action_type=%s result=failure reason=imap_returned_false transition=%s->%s",
                 getattr(action, "id", None),

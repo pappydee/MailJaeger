@@ -40,6 +40,8 @@ class ProcessedEmail(Base):
         String(200), index=True
     )  # Derived from Message-ID/In-Reply-To/References
     thread_state = Column(String(30), default="informational", index=True)
+    thread_priority = Column(String(20), default="normal", index=True)
+    thread_importance_score = Column(Float, default=0.0, index=True)
 
     # Header information
     subject = Column(String(500))

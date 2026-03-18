@@ -32,6 +32,8 @@ _ACTION_QUEUE_REQUIRED_INDEXES = {
 
 _PROCESSED_EMAILS_REQUIRED_COLUMNS = {
     "thread_state": "VARCHAR(30) DEFAULT 'informational'",
+    "thread_priority": "VARCHAR(20) DEFAULT 'normal'",
+    "thread_importance_score": "FLOAT DEFAULT 0.0",
 }
 
 _SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

@@ -21,8 +21,10 @@ VALID_THREAD_STATES = {
     "open",
     "waiting_for_me",
     "waiting_for_other",
+    "in_conversation",
     "resolved",
     "informational",
+    "auto_generated",
 }
 
 
