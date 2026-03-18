@@ -2,7 +2,16 @@
 FastAPI application for MailJaeger
 """
 
-from fastapi import FastAPI, Depends, HTTPException, Query, Request, status, Body
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    status,
+    Body,
+    BackgroundTasks,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -17,13 +26,14 @@ import hashlib
 import json
 
 from src.config import get_settings
-from src.database.connection import init_db, get_db, get_engine
+from src.database.connection import init_db, get_db, get_engine, get_db_session
 from src.database.startup_checks import verify_pending_actions_table
 from src.models.schemas import (
     EmailResponse,
     EmailDetailResponse,
     DashboardResponse,
     DailyReportResponse,
+    DailyReportEndpointResponse,
     ReportTotals,
     ReportEmailItem,
     ReportSuggestedAction,
@@ -54,6 +64,7 @@ from src.models.database import (
     ClassificationOverride,
     ActionQueue,
     DecisionEvent,
+    DailyReport,
 )
 from src.services.scheduler import get_scheduler, get_run_status
 from src.services.imap_service import IMAPService
@@ -2366,251 +2377,183 @@ async def health_check():
     }
 
 
-@app.get(
-    "/api/reports/daily",
-    response_model=DailyReportResponse,
-    dependencies=[Depends(require_authentication)],
-)
-@limiter.limit("10/minute")
-async def get_daily_report(request: Request, db: Session = Depends(get_db)):
-    """
-    Generate and return a daily AI-powered email summary report.
+def _build_daily_report_response(
+    db: Session, *, period_start: datetime, period_end: datetime
+) -> DailyReportResponse:
+    recent_emails = (
+        db.query(ProcessedEmail)
+        .filter(ProcessedEmail.processed_at >= period_start)
+        .order_by(ProcessedEmail.processed_at.desc())
+        .limit(100)  # cap to keep the prompt manageable
+        .all()
+    )
 
-    Analyses emails processed in the last 24 hours and asks the local
-    Ollama AI model to produce a structured German-language summary covering:
-    - important emails
-    - emails requiring action
-    - spam filtered
-    - unresolved threads
-    - suggested actions
+    total_processed = len(recent_emails)
+    action_required_count = sum(1 for e in recent_emails if e.action_required)
+    spam_count = sum(1 for e in recent_emails if e.is_spam)
+    unresolved_count = sum(
+        1 for e in recent_emails if e.action_required and not e.is_resolved
+    )
 
-    In SAFE MODE the response also includes clickable ``suggested_actions`` so
-    the user can trigger individual IMAP actions via the approval queue.
-    """
-    try:
-        cutoff = datetime.utcnow() - timedelta(hours=24)
+    def _to_item(e: ProcessedEmail) -> ReportEmailItem:
+        return ReportEmailItem(
+            email_id=e.id,
+            thread_id=e.thread_id,
+            subject=e.subject,
+            sender=e.sender,
+            summary=e.summary,
+            priority=e.priority,
+            category=e.category,
+        )
 
-        recent_emails = (
-            db.query(ProcessedEmail)
-            .filter(ProcessedEmail.processed_at >= cutoff)
-            .order_by(ProcessedEmail.processed_at.desc())
-            .limit(100)  # cap to keep the prompt manageable
+    important_items = [
+        _to_item(e)
+        for e in recent_emails
+        if (e.priority == "HIGH" or e.is_flagged) and not e.is_spam
+    ][:10]
+    action_items = [
+        _to_item(e)
+        for e in recent_emails
+        if e.action_required and not e.is_resolved and not e.is_spam
+    ][:10]
+    unresolved_items = [
+        _to_item(e) for e in recent_emails if e.action_required and not e.is_resolved
+    ][:10]
+    spam_items = [_to_item(e) for e in recent_emails if e.is_spam][:10]
+
+    safe_mode_active = settings.safe_mode
+    suggested_actions: List[ReportSuggestedAction] = []
+    recent_email_ids = [e.id for e in recent_emails if e.id]
+    latest_action_by_key: Dict[tuple, ActionQueue] = {}
+
+    if recent_email_ids:
+        existing_actions = (
+            db.query(ActionQueue)
+            .filter(ActionQueue.email_id.in_(recent_email_ids))
+            .order_by(ActionQueue.created_at.desc())
             .all()
         )
+        for existing_action in existing_actions:
+            key = (
+                existing_action.email_id,
+                existing_action.thread_id or "",
+                existing_action.action_type,
+            )
+            latest_action_by_key.setdefault(key, existing_action)
 
-        total_processed = len(recent_emails)
-        action_required_count = sum(1 for e in recent_emails if e.action_required)
-        spam_count = sum(1 for e in recent_emails if e.is_spam)
-        unresolved_count = sum(
-            1 for e in recent_emails if e.action_required and not e.is_resolved
-        )
+    def _suggestion_queue_type_and_key(
+        action_type: str, email_id: int, thread_id: Optional[str]
+    ) -> tuple:
+        queue_type = "move" if action_type in ("archive", "mark_spam", "move") else action_type
+        return (email_id, thread_id or "", queue_type)
 
-        # ----------------------------------------------------------------
-        # Build structured item lists
-        # ----------------------------------------------------------------
-        def _to_item(e: ProcessedEmail) -> ReportEmailItem:
-            return ReportEmailItem(
-                email_id=e.id,
-                thread_id=e.thread_id,
-                subject=e.subject,
-                sender=e.sender,
-                summary=e.summary,
-                priority=e.priority,
-                category=e.category,
+    for e in recent_emails:
+        if not e.id:
+            continue
+        if e.is_spam and not e.is_archived:
+            key = _suggestion_queue_type_and_key("mark_spam", e.id, e.thread_id)
+            existing = latest_action_by_key.get(key)
+            suggested_actions.append(
+                ReportSuggestedAction(
+                    email_id=e.id,
+                    thread_id=e.thread_id,
+                    action_type="mark_spam",
+                    payload={"target_folder": settings.quarantine_folder},
+                    target_folder=settings.quarantine_folder,
+                    description=f"Spam verschieben: {e.subject or '(kein Betreff)'}",
+                    safe_mode=safe_mode_active,
+                    queue_status=_normalize_action_status(existing.status) if existing else None,
+                    queue_action_id=existing.id if existing else None,
+                    queue_error=existing.error_message if existing else None,
+                )
+            )
+        elif e.action_required and not e.is_resolved:
+            resolved_key = _suggestion_queue_type_and_key("mark_resolved", e.id, e.thread_id)
+            resolved_existing = latest_action_by_key.get(resolved_key)
+            suggested_actions.append(
+                ReportSuggestedAction(
+                    email_id=e.id,
+                    thread_id=e.thread_id,
+                    action_type="mark_resolved",
+                    payload={"reason": "daily_report_unresolved"},
+                    description=f"Als erledigt markieren: {e.subject or '(kein Betreff)'}",
+                    safe_mode=safe_mode_active,
+                    queue_status=(
+                        _normalize_action_status(resolved_existing.status)
+                        if resolved_existing
+                        else None
+                    ),
+                    queue_action_id=resolved_existing.id if resolved_existing else None,
+                    queue_error=(
+                        resolved_existing.error_message if resolved_existing else None
+                    ),
+                )
+            )
+            reply_key = _suggestion_queue_type_and_key("reply_draft", e.id, e.thread_id)
+            reply_existing = latest_action_by_key.get(reply_key)
+            suggested_actions.append(
+                ReportSuggestedAction(
+                    email_id=e.id,
+                    thread_id=e.thread_id,
+                    action_type="reply_draft",
+                    payload=_build_reply_draft_payload(e.subject),
+                    description=f"Antwort-Entwurf erstellen: {e.subject or '(kein Betreff)'}",
+                    safe_mode=safe_mode_active,
+                    queue_status=_normalize_action_status(reply_existing.status)
+                    if reply_existing
+                    else None,
+                    queue_action_id=reply_existing.id if reply_existing else None,
+                    queue_error=reply_existing.error_message if reply_existing else None,
+                )
+            )
+        elif not e.is_archived and not e.is_spam:
+            archive_key = _suggestion_queue_type_and_key("archive", e.id, e.thread_id)
+            archive_existing = latest_action_by_key.get(archive_key)
+            suggested_actions.append(
+                ReportSuggestedAction(
+                    email_id=e.id,
+                    thread_id=e.thread_id,
+                    action_type="archive",
+                    payload={"target_folder": settings.archive_folder},
+                    target_folder=settings.archive_folder,
+                    description=f"Archivieren: {e.subject or '(kein Betreff)'}",
+                    safe_mode=safe_mode_active,
+                    queue_status=_normalize_action_status(archive_existing.status)
+                    if archive_existing
+                    else None,
+                    queue_action_id=archive_existing.id if archive_existing else None,
+                    queue_error=archive_existing.error_message if archive_existing else None,
+                )
+            )
+        if len(suggested_actions) >= 20:
+            break
+
+    thread_suggestion_counts: Dict[str, int] = {}
+    for suggestion in suggested_actions:
+        if suggestion.thread_id:
+            thread_suggestion_counts[suggestion.thread_id] = (
+                thread_suggestion_counts.get(suggestion.thread_id, 0) + 1
+            )
+    for suggestion in suggested_actions:
+        if suggestion.thread_id:
+            suggestion.thread_suggestion_count = thread_suggestion_counts.get(
+                suggestion.thread_id, 0
             )
 
-        # Important: HIGH priority or flagged
-        important_items = [
-            _to_item(e)
-            for e in recent_emails
-            if (e.priority == "HIGH" or e.is_flagged) and not e.is_spam
-        ][:10]
+    email_summaries = []
+    for e in recent_emails[:30]:  # include top 30 in prompt to stay concise
+        parts = [f"- {e.sender or '?'}: {e.subject or '(kein Betreff)'}"]
+        if e.action_required:
+            parts.append("[Aktion erforderlich]")
+        if e.is_spam:
+            parts.append("[Spam]")
+        if e.summary:
+            parts.append(f"({e.summary[:120]})")
+        email_summaries.append(" ".join(parts))
 
-        # Action items: action_required and not yet resolved
-        action_items = [
-            _to_item(e)
-            for e in recent_emails
-            if e.action_required and not e.is_resolved and not e.is_spam
-        ][:10]
+    email_list_str = "\n".join(email_summaries) if email_summaries else "(keine)"
 
-        # Unresolved: action_required but not resolved (same set, capped differently)
-        unresolved_items = [
-            _to_item(e)
-            for e in recent_emails
-            if e.action_required and not e.is_resolved
-        ][:10]
-
-        # Spam
-        spam_items = [_to_item(e) for e in recent_emails if e.is_spam][:10]
-
-        # ----------------------------------------------------------------
-        # Suggested actions for safe-mode morning report
-        # ----------------------------------------------------------------
-        safe_mode_active = settings.safe_mode
-        suggested_actions: List[ReportSuggestedAction] = []
-        recent_email_ids = [e.id for e in recent_emails if e.id]
-        latest_action_by_key: Dict[tuple, ActionQueue] = {}
-
-        if recent_email_ids:
-            existing_actions = (
-                db.query(ActionQueue)
-                .filter(ActionQueue.email_id.in_(recent_email_ids))
-                .order_by(ActionQueue.created_at.desc())
-                .all()
-            )
-            for existing_action in existing_actions:
-                key = (
-                    existing_action.email_id,
-                    existing_action.thread_id or "",
-                    existing_action.action_type,
-                )
-                latest_action_by_key.setdefault(key, existing_action)
-
-        def _suggestion_queue_type_and_key(
-            action_type: str, email_id: int, thread_id: Optional[str]
-        ) -> tuple:
-            queue_type = (
-                "move"
-                if action_type in ("archive", "mark_spam", "move")
-                else action_type
-            )
-            return (email_id, thread_id or "", queue_type)
-
-        for e in recent_emails:
-            if not e.id:
-                continue
-            if e.is_spam and not e.is_archived:
-                key = _suggestion_queue_type_and_key("mark_spam", e.id, e.thread_id)
-                existing = latest_action_by_key.get(key)
-                suggested_actions.append(
-                    ReportSuggestedAction(
-                        email_id=e.id,
-                        thread_id=e.thread_id,
-                        action_type="mark_spam",
-                        payload={"target_folder": settings.quarantine_folder},
-                        target_folder=settings.quarantine_folder,
-                        description=f"Spam verschieben: {e.subject or '(kein Betreff)'}",
-                        safe_mode=safe_mode_active,
-                        queue_status=(
-                            _normalize_action_status(existing.status)
-                            if existing
-                            else None
-                        ),
-                        queue_action_id=existing.id if existing else None,
-                        queue_error=existing.error_message if existing else None,
-                    )
-                )
-            elif e.action_required and not e.is_resolved:
-                resolved_key = _suggestion_queue_type_and_key(
-                    "mark_resolved", e.id, e.thread_id
-                )
-                resolved_existing = latest_action_by_key.get(resolved_key)
-                suggested_actions.append(
-                    ReportSuggestedAction(
-                        email_id=e.id,
-                        thread_id=e.thread_id,
-                        action_type="mark_resolved",
-                        payload={"reason": "daily_report_unresolved"},
-                        description=f"Als erledigt markieren: {e.subject or '(kein Betreff)'}",
-                        safe_mode=safe_mode_active,
-                        queue_status=(
-                            _normalize_action_status(resolved_existing.status)
-                            if resolved_existing
-                            else None
-                        ),
-                        queue_action_id=(
-                            resolved_existing.id if resolved_existing else None
-                        ),
-                        queue_error=(
-                            resolved_existing.error_message
-                            if resolved_existing
-                            else None
-                        ),
-                    )
-                )
-                reply_key = _suggestion_queue_type_and_key(
-                    "reply_draft", e.id, e.thread_id
-                )
-                reply_existing = latest_action_by_key.get(reply_key)
-                suggested_actions.append(
-                    ReportSuggestedAction(
-                        email_id=e.id,
-                        thread_id=e.thread_id,
-                        action_type="reply_draft",
-                        payload=_build_reply_draft_payload(e.subject),
-                        description=f"Antwort-Entwurf erstellen: {e.subject or '(kein Betreff)'}",
-                        safe_mode=safe_mode_active,
-                        queue_status=(
-                            _normalize_action_status(reply_existing.status)
-                            if reply_existing
-                            else None
-                        ),
-                        queue_action_id=reply_existing.id if reply_existing else None,
-                        queue_error=(
-                            reply_existing.error_message if reply_existing else None
-                        ),
-                    )
-                )
-            elif not e.is_archived and not e.is_spam:
-                archive_key = _suggestion_queue_type_and_key(
-                    "archive", e.id, e.thread_id
-                )
-                archive_existing = latest_action_by_key.get(archive_key)
-                suggested_actions.append(
-                    ReportSuggestedAction(
-                        email_id=e.id,
-                        thread_id=e.thread_id,
-                        action_type="archive",
-                        payload={"target_folder": settings.archive_folder},
-                        target_folder=settings.archive_folder,
-                        description=f"Archivieren: {e.subject or '(kein Betreff)'}",
-                        safe_mode=safe_mode_active,
-                        queue_status=(
-                            _normalize_action_status(archive_existing.status)
-                            if archive_existing
-                            else None
-                        ),
-                        queue_action_id=(
-                            archive_existing.id if archive_existing else None
-                        ),
-                        queue_error=(
-                            archive_existing.error_message if archive_existing else None
-                        ),
-                    )
-                )
-            # Cap total suggestions to keep the response manageable
-            if len(suggested_actions) >= 20:
-                break
-
-        thread_suggestion_counts: Dict[str, int] = {}
-        for suggestion in suggested_actions:
-            if suggestion.thread_id:
-                thread_suggestion_counts[suggestion.thread_id] = (
-                    thread_suggestion_counts.get(suggestion.thread_id, 0) + 1
-                )
-        for suggestion in suggested_actions:
-            if suggestion.thread_id:
-                suggestion.thread_suggestion_count = thread_suggestion_counts.get(
-                    suggestion.thread_id, 0
-                )
-
-        # ----------------------------------------------------------------
-        # Build AI prompt
-        # ----------------------------------------------------------------
-        email_summaries = []
-        for e in recent_emails[:30]:  # include top 30 in prompt to stay concise
-            parts = [f"- {e.sender or '?'}: {e.subject or '(kein Betreff)'}"]
-            if e.action_required:
-                parts.append("[Aktion erforderlich]")
-            if e.is_spam:
-                parts.append("[Spam]")
-            if e.summary:
-                parts.append(f"({e.summary[:120]})")
-            email_summaries.append(" ".join(parts))
-
-        email_list_str = "\n".join(email_summaries) if email_summaries else "(keine)"
-
-        prompt = f"""Erstelle einen täglichen E-Mail-Bericht auf Deutsch basierend auf den folgenden verarbeiteten E-Mails der letzten 24 Stunden.
+    prompt = f"""Erstelle einen täglichen E-Mail-Bericht auf Deutsch basierend auf den folgenden verarbeiteten E-Mails der letzten 24 Stunden.
 
 Statistiken:
 - Verarbeitete E-Mails: {total_processed}
@@ -2630,57 +2573,154 @@ Erstelle einen strukturierten Bericht mit den folgenden Abschnitten:
 
 Halte den Bericht präzise und handlungsorientiert."""
 
-        ai_service = AIService()
-        raw_response = ai_service.generate_report(prompt)
+    ai_service = AIService()
+    raw_response = ai_service.generate_report(prompt)
+    if raw_response and raw_response.strip():
+        report_text = raw_response.strip()
+    else:
+        lines = [
+            f"Täglicher E-Mail-Bericht ({datetime.utcnow().strftime('%d.%m.%Y')})",
+            "",
+            "Zusammenfassung",
+            f"• {total_processed} E-Mails verarbeitet",
+            f"• {action_required_count} erfordern eine Aktion",
+            f"• {spam_count} Spam erkannt",
+            f"• {unresolved_count} ungelöst",
+            "",
+            "(KI-Zusammenfassung nicht verfügbar — Ollama nicht erreichbar)",
+        ]
+        if action_items:
+            lines += ["", "Offene Aktionen:"]
+            for item in action_items[:5]:
+                lines.append(
+                    f"  • [{item.priority or 'LOW'}] {item.sender or '?'}: {item.subject or '(kein Betreff)'}"
+                )
+        report_text = "\n".join(lines)
 
-        if raw_response and raw_response.strip():
-            report_text = raw_response.strip()
-        else:
-            # Fallback: generate a plain-text summary without AI
-            lines = [
-                f"Täglicher E-Mail-Bericht ({datetime.utcnow().strftime('%d.%m.%Y')})",
-                "",
-                "Zusammenfassung",
-                f"• {total_processed} E-Mails verarbeitet",
-                f"• {action_required_count} erfordern eine Aktion",
-                f"• {spam_count} Spam erkannt",
-                f"• {unresolved_count} ungelöst",
-                "",
-                "(KI-Zusammenfassung nicht verfügbar — Ollama nicht erreichbar)",
-            ]
-            if action_items:
-                lines += ["", "Offene Aktionen:"]
-                for item in action_items[:5]:
-                    lines.append(
-                        f"  • [{item.priority or 'LOW'}] {item.sender or '?'}: {item.subject or '(kein Betreff)'}"
-                    )
-            report_text = "\n".join(lines)
-
-        return DailyReportResponse(
-            generated_at=datetime.utcnow().isoformat(),
-            period_hours=24,
-            totals=ReportTotals(
-                total_processed=total_processed,
-                action_required=action_required_count,
-                unresolved=unresolved_count,
-                spam_detected=spam_count,
-            ),
+    return DailyReportResponse(
+        generated_at=datetime.utcnow().isoformat(),
+        period_hours=24,
+        totals=ReportTotals(
             total_processed=total_processed,
             action_required=action_required_count,
-            spam_detected=spam_count,
             unresolved=unresolved_count,
-            important_items=important_items,
-            action_items=action_items,
-            unresolved_items=unresolved_items,
-            spam_items=spam_items,
-            suggested_actions=suggested_actions,
-            report_text=report_text,
-        )
+            spam_detected=spam_count,
+        ),
+        total_processed=total_processed,
+        action_required=action_required_count,
+        spam_detected=spam_count,
+        unresolved=unresolved_count,
+        important_items=important_items,
+        action_items=action_items,
+        unresolved_items=unresolved_items,
+        spam_items=spam_items,
+        suggested_actions=suggested_actions,
+        report_text=report_text,
+    )
 
+
+def _generate_daily_report_in_background(report_id: int) -> None:
+    try:
+        with get_db_session() as background_db:
+            report_row = background_db.get(DailyReport, report_id)
+            if not report_row:
+                return
+            report_row.generation_status = "running"
+            report_row.error_message = None
+            period_start = report_row.period_start
+            period_end = report_row.period_end
+            report_payload = _build_daily_report_response(
+                background_db, period_start=period_start, period_end=period_end
+            )
+            report_row.report_json = report_payload.model_dump()
+            report_row.report_text = report_payload.report_text
+            report_row.generated_at = datetime.utcnow()
+            report_row.generation_status = "ready"
+            report_row.error_message = None
     except Exception as e:
         sanitized_error = sanitize_error(e, debug=settings.debug)
-        logger.error(f"Daily report generation failed: {sanitized_error}")
-        raise HTTPException(status_code=500, detail="Report generation failed")
+        logger.error("Daily report background generation failed: %s", sanitized_error)
+        try:
+            with get_db_session() as background_db:
+                report_row = background_db.get(DailyReport, report_id)
+                if report_row:
+                    report_row.generation_status = "failed"
+                    report_row.error_message = sanitized_error
+        except Exception:
+            logger.error("Failed to persist daily report generation error", exc_info=True)
+
+
+@app.get(
+    "/api/reports/daily",
+    response_model=DailyReportEndpointResponse,
+    dependencies=[Depends(require_authentication)],
+)
+@limiter.limit("10/minute")
+async def get_daily_report(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    Return cached daily report state quickly and generate reports asynchronously.
+    """
+    now = datetime.utcnow()
+    cutoff = now - timedelta(hours=24)
+    latest_report = (
+        db.query(DailyReport)
+        .filter(DailyReport.generated_at >= cutoff)
+        .order_by(DailyReport.generated_at.desc())
+        .first()
+    )
+
+    if latest_report and latest_report.generated_at:
+        status_value = (latest_report.generation_status or "failed").lower()
+        if status_value == "ready":
+            cached_report = (
+                latest_report.report_json
+                if isinstance(latest_report.report_json, dict)
+                else None
+            )
+            if not cached_report:
+                cached_report = DailyReportResponse(
+                    generated_at=latest_report.generated_at.isoformat(),
+                    period_hours=24,
+                    report_text=latest_report.report_text
+                    or "Keine KI-Zusammenfassung verfügbar.",
+                ).model_dump()
+            return DailyReportEndpointResponse(
+                status="ready",
+                report=cached_report,
+                generated_at=latest_report.generated_at.isoformat(),
+            )
+        if status_value in {"pending", "running"}:
+            return DailyReportEndpointResponse(
+                status=status_value,
+                generated_at=latest_report.generated_at.isoformat(),
+            )
+
+    queued_report = DailyReport(
+        generated_at=now,
+        period_start=cutoff,
+        period_end=now,
+        generation_status="pending",
+        error_message=None,
+    )
+    db.add(queued_report)
+    db.commit()
+    db.refresh(queued_report)
+    # Defensive guard: mocked DB sessions in tests may not populate PKs.
+    if isinstance(queued_report.id, int):
+        background_tasks.add_task(_generate_daily_report_in_background, queued_report.id)
+    else:
+        logger.warning(
+            "Daily report queued without integer id; background generation not scheduled"
+        )
+
+    return DailyReportEndpointResponse(
+        status="pending",
+        generated_at=queued_report.generated_at.isoformat(),
+    )
 
 
 if __name__ == "__main__":

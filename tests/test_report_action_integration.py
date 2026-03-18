@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
@@ -8,7 +8,13 @@ from sqlalchemy.pool import StaticPool
 
 from src.main import app
 from src.database.connection import get_db as _get_db
-from src.models.database import Base, ProcessedEmail, ActionQueue, DecisionEvent
+from src.models.database import (
+    Base,
+    ProcessedEmail,
+    ActionQueue,
+    DecisionEvent,
+    DailyReport,
+)
 
 
 AUTH = {"Authorization": "Bearer test_key_abc123"}
@@ -64,13 +70,53 @@ def test_daily_report_sections_and_suggested_actions_present():
             db, message_id="m1@example.com", action_required=True, is_resolved=False
         )
         _create_email(db, message_id="m2@example.com", is_spam=True, is_archived=False)
+        payload = {
+            "generated_at": datetime.utcnow().isoformat(),
+            "period_hours": 24,
+            "totals": {
+                "total_processed": 2,
+                "action_required": 1,
+                "unresolved": 1,
+                "spam_detected": 1,
+            },
+            "total_processed": 2,
+            "action_required": 1,
+            "spam_detected": 1,
+            "unresolved": 1,
+            "important_items": [],
+            "action_items": [],
+            "unresolved_items": [],
+            "spam_items": [],
+            "suggested_actions": [
+                {
+                    "email_id": 1,
+                    "thread_id": "thread-1",
+                    "action_type": "reply_draft",
+                    "payload": {"draft_summary": "x", "draft_text": "y"},
+                    "description": "Antwort-Entwurf erstellen",
+                    "safe_mode": True,
+                    "queue_status": None,
+                }
+            ],
+            "report_text": "Report",
+        }
+        db.add(
+            DailyReport(
+                generated_at=datetime.utcnow(),
+                period_start=datetime.utcnow() - timedelta(hours=24),
+                period_end=datetime.utcnow(),
+                report_json=payload,
+                report_text=payload["report_text"],
+                generation_status="ready",
+            )
+        )
+        db.commit()
         client = _mk_client(db)
-        with patch("src.main.AIService") as mock_ai_cls:
-            mock_ai = mock_ai_cls.return_value
-            mock_ai.generate_report.return_value = "Report"
-            resp = client.get("/api/reports/daily", headers=AUTH)
+        resp = client.get("/api/reports/daily", headers=AUTH)
         assert resp.status_code == 200, resp.text
         data = resp.json()
+        assert data["status"] == "ready"
+        report = data["report"]
         for key in (
             "generated_at",
             "period_hours",
@@ -82,11 +128,75 @@ def test_daily_report_sections_and_suggested_actions_present():
             "suggested_actions",
             "report_text",
         ):
-            assert key in data
-        assert isinstance(data["totals"], dict)
-        assert data["totals"]["action_required"] >= 1
-        assert any(a["action_type"] == "reply_draft" for a in data["suggested_actions"])
-        assert "queue_status" in data["suggested_actions"][0]
+            assert key in report
+        assert isinstance(report["totals"], dict)
+        assert report["totals"]["action_required"] >= 1
+        assert any(a["action_type"] == "reply_draft" for a in report["suggested_actions"])
+        assert "queue_status" in report["suggested_actions"][0]
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_daily_report_endpoint_returns_pending_and_queues_background_generation():
+    db = _make_session()
+    try:
+        _create_email(db, message_id="m-pending@example.com", action_required=True)
+        client = _mk_client(db)
+        with patch("src.main._generate_daily_report_in_background") as bg_mock:
+            resp = client.get("/api/reports/daily", headers=AUTH)
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "pending"
+        bg_mock.assert_called_once()
+        queued = db.query(DailyReport).order_by(DailyReport.id.desc()).first()
+        assert queued is not None
+        assert queued.generation_status == "pending"
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_daily_report_endpoint_uses_cached_ready_report_without_regeneration():
+    db = _make_session()
+    try:
+        cached = DailyReport(
+            generated_at=datetime.utcnow(),
+            period_start=datetime.utcnow() - timedelta(hours=24),
+            period_end=datetime.utcnow(),
+            report_json={
+                "generated_at": datetime.utcnow().isoformat(),
+                "period_hours": 24,
+                "totals": {
+                    "total_processed": 1,
+                    "action_required": 0,
+                    "unresolved": 0,
+                    "spam_detected": 0,
+                },
+                "total_processed": 1,
+                "action_required": 0,
+                "spam_detected": 0,
+                "unresolved": 0,
+                "important_items": [],
+                "action_items": [],
+                "unresolved_items": [],
+                "spam_items": [],
+                "suggested_actions": [],
+                "report_text": "Cached report",
+            },
+            report_text="Cached report",
+            generation_status="ready",
+        )
+        db.add(cached)
+        db.commit()
+        client = _mk_client(db)
+        with patch("src.main._generate_daily_report_in_background") as bg_mock:
+            resp = client.get("/api/reports/daily", headers=AUTH)
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "ready"
+        assert data["report"]["report_text"] == "Cached report"
+        bg_mock.assert_not_called()
     finally:
         app.dependency_overrides.clear()
         db.close()
@@ -328,16 +438,58 @@ def test_daily_report_reflects_existing_queue_state_for_suggestions():
         )
         db.add(action)
         db.commit()
+        payload = {
+            "generated_at": datetime.utcnow().isoformat(),
+            "period_hours": 24,
+            "totals": {
+                "total_processed": 1,
+                "action_required": 1,
+                "unresolved": 1,
+                "spam_detected": 0,
+            },
+            "total_processed": 1,
+            "action_required": 1,
+            "spam_detected": 0,
+            "unresolved": 1,
+            "important_items": [],
+            "action_items": [],
+            "unresolved_items": [],
+            "spam_items": [],
+            "suggested_actions": [
+                {
+                    "email_id": email.id,
+                    "thread_id": email.thread_id,
+                    "action_type": "mark_resolved",
+                    "payload": {"reason": "daily_report_unresolved"},
+                    "description": "Als erledigt markieren",
+                    "safe_mode": True,
+                    "queue_status": "approved",
+                    "queue_action_id": action.id,
+                }
+            ],
+            "report_text": "Report",
+        }
+        db.add(
+            DailyReport(
+                generated_at=datetime.utcnow(),
+                period_start=datetime.utcnow() - timedelta(hours=24),
+                period_end=datetime.utcnow(),
+                report_json=payload,
+                report_text=payload["report_text"],
+                generation_status="ready",
+            )
+        )
+        db.commit()
 
         client = _mk_client(db)
-        with patch("src.main.AIService") as mock_ai_cls:
-            mock_ai_cls.return_value.generate_report.return_value = "Report"
-            resp = client.get("/api/reports/daily", headers=AUTH)
+        resp = client.get("/api/reports/daily", headers=AUTH)
         assert resp.status_code == 200
         data = resp.json()
+        assert data["status"] == "ready"
+        report = data["report"]
         resolved = next(
             a
-            for a in data["suggested_actions"]
+            for a in report["suggested_actions"]
             if a["email_id"] == email.id and a["action_type"] == "mark_resolved"
         )
         assert resolved["queue_status"] == "approved"

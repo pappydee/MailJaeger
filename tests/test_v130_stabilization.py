@@ -191,22 +191,31 @@ class TestDailyReportStructured:
             with patch("src.main.AIService") as mock_ai_cls:
                 mock_ai = mock_ai_cls.return_value
                 mock_ai.generate_report.return_value = "Test report"
-                resp = client.get("/api/reports/daily", headers=AUTH)
+                first = client.get("/api/reports/daily", headers=AUTH)
+                assert first.status_code == 200, first.text
+                first_data = first.json()
+                resp = (
+                    client.get("/api/reports/daily", headers=AUTH)
+                    if first_data.get("status") != "ready"
+                    else first
+                )
 
             assert resp.status_code == 200, resp.text
             data = resp.json()
-            assert "important_items" in data
-            assert "action_items" in data
-            assert "unresolved_items" in data
-            assert "spam_items" in data
-            assert "suggested_actions" in data
-            assert "totals" in data
-            assert isinstance(data["important_items"], list)
-            assert isinstance(data["action_items"], list)
-            assert isinstance(data["unresolved_items"], list)
-            assert isinstance(data["spam_items"], list)
-            assert isinstance(data["suggested_actions"], list)
-            assert isinstance(data["totals"], dict)
+            assert data["status"] == "ready"
+            report = data["report"]
+            assert "important_items" in report
+            assert "action_items" in report
+            assert "unresolved_items" in report
+            assert "spam_items" in report
+            assert "suggested_actions" in report
+            assert "totals" in report
+            assert isinstance(report["important_items"], list)
+            assert isinstance(report["action_items"], list)
+            assert isinstance(report["unresolved_items"], list)
+            assert isinstance(report["spam_items"], list)
+            assert isinstance(report["suggested_actions"], list)
+            assert isinstance(report["totals"], dict)
 
     def test_daily_report_backward_compat_fields_present(self):
         """Backward-compatible fields (total_processed, action_required, etc.) must still exist."""
@@ -215,17 +224,26 @@ class TestDailyReportStructured:
             with patch("src.main.AIService") as mock_ai_cls:
                 mock_ai = mock_ai_cls.return_value
                 mock_ai.generate_report.return_value = "Test"
-                resp = client.get("/api/reports/daily", headers=AUTH)
+                first = client.get("/api/reports/daily", headers=AUTH)
+                assert first.status_code == 200, first.text
+                first_data = first.json()
+                resp = (
+                    client.get("/api/reports/daily", headers=AUTH)
+                    if first_data.get("status") != "ready"
+                    else first
+                )
 
             assert resp.status_code == 200
             data = resp.json()
-            assert "total_processed" in data
-            assert "action_required" in data
-            assert "spam_detected" in data
-            assert "unresolved" in data
-            assert "report_text" in data
-            assert "generated_at" in data
-            assert "period_hours" in data
+            assert data["status"] == "ready"
+            report = data["report"]
+            assert "total_processed" in report
+            assert "action_required" in report
+            assert "spam_detected" in report
+            assert "unresolved" in report
+            assert "report_text" in report
+            assert "generated_at" in report
+            assert "period_hours" in report
 
     def test_daily_report_fallback_still_useful(self):
         """When AI is unavailable, fallback report_text must still be non-empty."""
@@ -234,13 +252,22 @@ class TestDailyReportStructured:
             with patch("src.main.AIService") as mock_ai_cls:
                 mock_ai = mock_ai_cls.return_value
                 mock_ai.generate_report.return_value = None
-                resp = client.get("/api/reports/daily", headers=AUTH)
+                first = client.get("/api/reports/daily", headers=AUTH)
+                assert first.status_code == 200, first.text
+                first_data = first.json()
+                resp = (
+                    client.get("/api/reports/daily", headers=AUTH)
+                    if first_data.get("status") != "ready"
+                    else first
+                )
 
             assert resp.status_code == 200
             data = resp.json()
-            assert data["report_text"]
+            assert data["status"] == "ready"
+            report = data["report"]
+            assert report["report_text"]
             # Fallback text must mention emails processed or be a report header
-            assert len(data["report_text"]) > 10
+            assert len(report["report_text"]) > 10
 
 
 # ===========================================================================
@@ -313,13 +340,21 @@ class TestSafeModeSuggestedActions:
             with patch("src.main.AIService") as mock_ai_cls:
                 mock_ai = mock_ai_cls.return_value
                 mock_ai.generate_report.return_value = "Report"
-                resp = client.get("/api/reports/daily", headers=AUTH)
+                first = client.get("/api/reports/daily", headers=AUTH)
+                assert first.status_code == 200, first.text
+                first_data = first.json()
+                resp = (
+                    client.get("/api/reports/daily", headers=AUTH)
+                    if first_data.get("status") != "ready"
+                    else first
+                )
 
             assert resp.status_code == 200
             data = resp.json()
-            assert "suggested_actions" in data
+            assert data["status"] == "ready"
+            assert "suggested_actions" in data["report"]
             # In safe mode with no emails, list should be empty (not raise an error)
-            assert isinstance(data["suggested_actions"], list)
+            assert isinstance(data["report"]["suggested_actions"], list)
 
     def test_report_ui_supports_queueing_suggested_actions(self):
         """Frontend should post suggested-action clicks to report queue endpoint."""

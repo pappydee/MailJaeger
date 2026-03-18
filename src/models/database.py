@@ -417,6 +417,26 @@ class ActionQueue(Base):
     )
 
 
+class DailyReport(Base):
+    """Cached daily report snapshots and async generation status."""
+
+    __tablename__ = "daily_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    generated_at = Column(DateTime, default=datetime.utcnow, index=True)
+    period_start = Column(DateTime, nullable=False)
+    period_end = Column(DateTime, nullable=False)
+    report_json = Column(JSON)
+    report_text = Column(Text)
+    generation_status = Column(String(20), default="pending", nullable=False, index=True)
+    error_message = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("idx_daily_reports_generated_at", "generated_at"),
+        Index("idx_daily_reports_status_generated", "generation_status", "generated_at"),
+    )
+
+
 class AnalysisProgress(Base):
     """Analysis progress tracking for pausable large-scale processing (Priority 7)"""
 
