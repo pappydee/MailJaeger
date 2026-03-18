@@ -344,7 +344,7 @@ function renderSafeModeState(isEnabled) {
 }
 
 async function toggleSafeMode() {
-    if (_safeModeEnabled == null) return;
+    if (_safeModeEnabled === null) return;
 
     const btn = document.getElementById('safeModeToggle');
     if (btn) btn.disabled = true;

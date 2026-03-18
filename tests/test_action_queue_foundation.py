@@ -464,6 +464,26 @@ def test_persisted_safe_mode_is_applied_after_settings_reload(db_session):
     assert src.main.settings.safe_mode is True
 
 
+def test_apply_persisted_safe_mode_initializes_from_current_settings_when_missing(db_session):
+    import src.main
+
+    src.main.settings.safe_mode = False
+    db_session.query(AppSetting).filter(AppSetting.key == "safe_mode").delete()
+    db_session.commit()
+
+    effective = src.main._apply_persisted_safe_mode(db_session)
+    db_session.commit()
+
+    persisted = (
+        db_session.query(AppSetting)
+        .filter(AppSetting.key == "safe_mode")
+        .first()
+    )
+    assert effective is False
+    assert persisted is not None
+    assert persisted.value is False
+
+
 def test_process_run_does_not_retry_failed_actions(db_session):
     email_failed = _create_email(db_session, uid="901", thread_id="thread-failed")
     email_approved = _create_email(db_session, uid="902", thread_id="thread-failed")
