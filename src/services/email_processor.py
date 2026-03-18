@@ -24,8 +24,10 @@ from src.models.database import (
     ProcessingRun,
     AuditLog,
     PendingAction,
+    ActionQueue,
     ClassificationOverride,
 )
+from src.services.action_executor import ActionExecutor
 from src.services.imap_service import IMAPService
 from src.services.ai_service import AIService
 from src.utils.logging import get_logger
@@ -78,6 +80,63 @@ class EmailProcessor:
         """Return True when a cancellation has been requested for this run."""
         return self._status is not None and self._status.cancel_requested
 
+    def _execute_approved_actions(self) -> Dict[str, int]:
+        """Execute all approved action_queue items before normal processing."""
+        approved_actions = (
+            self.db.query(ActionQueue)
+            .filter(ActionQueue.status.in_(("approved", "approved_action")))
+            .order_by(ActionQueue.approved_at.asc(), ActionQueue.created_at.asc())
+            .all()
+        )
+        if not approved_actions:
+            return {"total": 0, "executed": 0, "failed": 0}
+
+        imap = IMAPService()
+        requires_imap = any(
+            action.action_type in ("move", "mark_read", "delete")
+            for action in approved_actions
+        )
+        if requires_imap and not imap.connect():
+            logger.warning(
+                "Could not connect to IMAP for approved action execution; "
+                "IMAP-based approved actions may fail this run"
+            )
+
+        executor = ActionExecutor(imap)
+        executed = 0
+        failed = 0
+
+        try:
+            for action in approved_actions:
+                email = (
+                    self.db.query(ProcessedEmail)
+                    .filter(ProcessedEmail.id == action.email_id)
+                    .first()
+                )
+                if executor.execute(action, email):
+                    executed += 1
+                else:
+                    failed += 1
+                action.updated_at = datetime.utcnow()
+                self.db.add(action)
+                if email:
+                    self.db.add(email)
+
+            self.db.commit()
+        finally:
+            try:
+                imap.disconnect()
+            except Exception:
+                pass
+
+        logger.info(
+            "Approved action auto-execution complete: total=%s executed=%s failed=%s",
+            len(approved_actions),
+            executed,
+            failed,
+        )
+        return {"total": len(approved_actions), "executed": executed, "failed": failed}
+
     # ------------------------------------------------------------------
     # Primary processing workflow (two-phase index-based)
     # ------------------------------------------------------------------
@@ -114,6 +173,19 @@ class EmailProcessor:
         )
 
         try:
+            # Execute approved queue actions first (manual + scheduled runs).
+            self._update_status(
+                phase="ingestion",
+                current_step="Führe freigegebene Aktionen aus…",
+                progress_percent=2,
+            )
+            approved_stats = self._execute_approved_actions()
+            if approved_stats["total"] > 0:
+                logger.info(
+                    "Processed approved actions before ingestion: %s",
+                    approved_stats,
+                )
+
             # ----------------------------------------------------------------
             # Phase 1: Ingest — import all emails from IMAP into local index
             # ----------------------------------------------------------------

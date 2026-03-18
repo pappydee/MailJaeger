@@ -848,6 +848,7 @@ function renderActionQueue(actions = []) {
                     <span>Erstellt: ${fmtDt(action.created_at)}</span>
                     <span>Quelle: ${escHtml(action.source || payload.source_context || payload.source || 'unbekannt')}</span>
                 </div>
+                ${action.action_type === 'move' && payload.target_folder ? `<div class="report-action-context"><strong>Zielordner:</strong> ${escHtml(payload.target_folder)}</div>` : ''}
                 ${payload.description ? `<div class="action-queue-description">${escHtml(payload.description)}</div>` : ''}
                 ${action.action_type === 'reply_draft' ? `<div class="report-draft-snippet">${escHtml((payload.draft_text || '').slice(0, 180))}${payload.draft_text && payload.draft_text.length > 180 ? '…' : ''}</div>` : ''}
                 ${action.error_message ? `<div class="action-queue-error">${escHtml(action.error_message)}</div>` : ''}
