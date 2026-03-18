@@ -8,6 +8,8 @@ let _isProcessing = false;
 let _dashboardTimer = null;
 let _actionQueueCache = [];
 let _safeModeEnabled = null;
+let _archiveFolder = '';
+let _foldersCache = [];
 const _reportQueueingKeys = new Set();
 let currentFilters = { category: null, priority: null, action_required: null };
 
@@ -31,6 +33,7 @@ async function checkAuthenticated() {
 async function boot() {
     await loadVersion();
     await loadDashboard();
+    await loadFolderSettings();
     await loadEmails();
     wireListeners();
     startStatusPolling();
@@ -313,6 +316,10 @@ async function loadDashboard() {
 
         _safeModeEnabled = Boolean(d.safe_mode);
         renderSafeModeState(_safeModeEnabled);
+        if (typeof d.archive_folder === 'string' && d.archive_folder.trim()) {
+            _archiveFolder = d.archive_folder.trim();
+            renderArchiveFolderCurrent();
+        }
 
         // Daily report button
         const reportBtn = document.getElementById('viewDailyReport');
@@ -321,6 +328,82 @@ async function loadDashboard() {
 
     } catch (ex) {
         showToast('Dashboard konnte nicht geladen werden', 'error');
+    }
+}
+
+async function loadFolderSettings() {
+    await Promise.all([loadSettingsSnapshot(), loadFolders()]);
+}
+
+async function loadSettingsSnapshot() {
+    try {
+        const r = await fetch(`${API_BASE}/api/settings`);
+        if (!r.ok) return;
+        const body = await r.json();
+        if (typeof body.archive_folder === 'string' && body.archive_folder.trim()) {
+            _archiveFolder = body.archive_folder.trim();
+        }
+        renderArchiveFolderCurrent();
+    } catch {}
+}
+
+function renderArchiveFolderCurrent() {
+    const current = document.getElementById('archiveFolderCurrent');
+    if (current) current.textContent = `Archivordner: ${_archiveFolder || '–'}`;
+}
+
+async function loadFolders() {
+    const select = document.getElementById('archiveFolderSelect');
+    if (select) {
+        select.innerHTML = '<option value="">Ordner laden…</option>';
+    }
+    try {
+        const r = await fetch(`${API_BASE}/api/folders`);
+        if (!r.ok) {
+            const body = await r.json().catch(() => ({}));
+            throw new Error(body.detail || 'Ordner konnten nicht geladen werden');
+        }
+        const body = await r.json();
+        _foldersCache = Array.isArray(body.folders) ? body.folders : [];
+        if (typeof body.current_archive_folder === 'string' && body.current_archive_folder.trim()) {
+            _archiveFolder = body.current_archive_folder.trim();
+        }
+        renderArchiveFolderCurrent();
+        if (select) {
+            const options = _foldersCache.map(folder => {
+                const name = folder?.name || '';
+                return `<option value="${escHtml(name)}">${escHtml(name)}</option>`;
+            }).join('');
+            select.innerHTML = `<option value="">Bitte wählen</option>${options}`;
+            if (_archiveFolder) select.value = _archiveFolder;
+        }
+    } catch (error) {
+        showToast(error?.message || 'Ordner konnten nicht geladen werden', 'error');
+    }
+}
+
+async function saveArchiveFolderSelection() {
+    const select = document.getElementById('archiveFolderSelect');
+    if (!select) return;
+    const selected = (select.value || '').trim();
+    if (!selected) {
+        showToast('Bitte zuerst einen Archivordner auswählen', 'info');
+        return;
+    }
+    try {
+        const r = await fetch(`${API_BASE}/api/settings`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ archive_folder: selected }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.detail || 'Archivordner konnte nicht gespeichert werden');
+        _archiveFolder = body.archive_folder || selected;
+        renderArchiveFolderCurrent();
+        showToast(`Archivordner gespeichert: ${_archiveFolder}`, 'success', 2800);
+        await loadActionQueue();
+    } catch (error) {
+        showToast(error?.message || 'Archivordner konnte nicht gespeichert werden', 'error');
     }
 }
 
@@ -1030,6 +1113,8 @@ function wireListeners() {
     document.getElementById('viewDailyReport')?.addEventListener('click', openDailyReport);
     document.getElementById('closeReportModal')?.addEventListener('click', () => document.getElementById('reportModal').classList.remove('active'));
     document.getElementById('refreshActionQueue')?.addEventListener('click', loadActionQueue);
+    document.getElementById('refreshFoldersBtn')?.addEventListener('click', loadFolders);
+    document.getElementById('saveArchiveFolderBtn')?.addEventListener('click', saveArchiveFolderSelection);
     document.getElementById('applyFilters')?.addEventListener('click', applyFilters);
     document.getElementById('logoutBtn')?.addEventListener('click', handleLogout);
     document.getElementById('versionBadge')?.addEventListener('click', openVersionModal);

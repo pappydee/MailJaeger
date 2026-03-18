@@ -204,6 +204,7 @@ class DailyReportThreadGroup(BaseModel):
 
 
 class DailyReportResponse(BaseModel):
+    report_version: int = 2
     generated_at: str
     period_hours: int = 24
     totals: ReportTotals = ReportTotals()
@@ -278,6 +279,7 @@ class SettingsUpdate(BaseModel):
     store_email_body: Optional[bool] = None
     store_attachments: Optional[bool] = None
     safe_mode: Optional[bool] = None
+    archive_folder: Optional[str] = None
 
 
 class PendingActionStatus(str, Enum):

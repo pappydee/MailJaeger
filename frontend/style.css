@@ -277,6 +277,12 @@ body {
 .info-header h2 { font-size: 16px; font-weight: 600; }
 .info-time { font-size: 13px; color: var(--text-light); }
 .info-details { display: flex; flex-wrap: wrap; gap: 16px; }
+.folder-settings-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
 .info-item { display: flex; align-items: center; gap: 6px; font-size: 13px; }
 .info-label { color: var(--text-light); }
 .info-badge {
