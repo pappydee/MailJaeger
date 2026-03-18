@@ -336,7 +336,7 @@ def test_report_suggestion_rejection_records_signal():
         db.close()
 
 
-def test_safe_mode_blocks_execution_for_report_suggestion():
+def test_safe_mode_allows_manual_execution_for_report_suggestion():
     db = _make_session()
     try:
         email = _create_email(db, message_id="m7@example.com", uid="701")
@@ -357,8 +357,13 @@ def test_safe_mode_blocks_execution_for_report_suggestion():
             import src.main
 
             src.main.settings = get_settings()
-            blocked = client.post(f"/api/actions/{action_id}/execute", headers=AUTH)
-            assert blocked.status_code == 409
+            with patch("src.main.IMAPService") as mock_imap_cls:
+                imap = Mock()
+                imap.mark_as_read.return_value = True
+                mock_imap_cls.return_value.__enter__.return_value = imap
+                executed = client.post(f"/api/actions/{action_id}/execute", headers=AUTH)
+            assert executed.status_code == 200
+            assert executed.json()["status"] == "executed"
     finally:
         app.dependency_overrides.clear()
         db.close()

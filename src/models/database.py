@@ -428,6 +428,16 @@ class ActionQueue(Base):
     )
 
 
+class AppSetting(Base):
+    """Persistent runtime settings."""
+
+    __tablename__ = "app_settings"
+
+    key = Column(String(100), primary_key=True, index=True)
+    value = Column(JSON, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class DailyReport(Base):
     """Cached daily report snapshots and async generation status."""
 

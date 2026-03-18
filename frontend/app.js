@@ -7,6 +7,7 @@ let _statusPollTimer = null;
 let _isProcessing = false;
 let _dashboardTimer = null;
 let _actionQueueCache = [];
+let _safeModeEnabled = null;
 const _reportQueueingKeys = new Set();
 let currentFilters = { category: null, priority: null, action_required: null };
 
@@ -310,9 +311,8 @@ async function loadDashboard() {
             if (txt) txt.textContent = ok ? 'System OK' : 'Problem';
         }
 
-        // Safe mode badge
-        const smb = document.getElementById('safeModeBadge');
-        if (smb) smb.style.display = d.safe_mode ? 'inline-block' : 'none';
+        _safeModeEnabled = Boolean(d.safe_mode);
+        renderSafeModeState(_safeModeEnabled);
 
         // Daily report button
         const reportBtn = document.getElementById('viewDailyReport');
@@ -321,6 +321,58 @@ async function loadDashboard() {
 
     } catch (ex) {
         showToast('Dashboard konnte nicht geladen werden', 'error');
+    }
+}
+
+function renderSafeModeState(isEnabled) {
+    const smb = document.getElementById('safeModeBadge');
+    if (smb) smb.style.display = isEnabled ? 'inline-block' : 'none';
+
+    const safeModeToggle = document.getElementById('safeModeToggle');
+    if (safeModeToggle) {
+        safeModeToggle.textContent = isEnabled ? 'Safe Mode: AN' : 'Safe Mode: AUS';
+        safeModeToggle.classList.toggle('btn-primary', isEnabled);
+        safeModeToggle.classList.toggle('btn-secondary', !isEnabled);
+        safeModeToggle.setAttribute('aria-pressed', isEnabled ? 'true' : 'false');
+        safeModeToggle.title = isEnabled
+            ? 'Safe Mode aktiv: automatische Ausführung deaktiviert'
+            : 'Safe Mode aus: freigegebene Aktionen können automatisch ausgeführt werden';
+    }
+
+    const safeModeHint = document.getElementById('actionQueueSafeMode');
+    if (safeModeHint) safeModeHint.style.display = isEnabled ? 'block' : 'none';
+}
+
+async function toggleSafeMode() {
+    if (_safeModeEnabled == null) return;
+
+    const btn = document.getElementById('safeModeToggle');
+    if (btn) btn.disabled = true;
+
+    const target = !_safeModeEnabled;
+    try {
+        const r = await fetch(`${API_BASE}/api/settings`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ safe_mode: target }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.detail || 'Safe Mode konnte nicht aktualisiert werden');
+
+        _safeModeEnabled = typeof body.safe_mode === 'boolean' ? body.safe_mode : target;
+        renderSafeModeState(_safeModeEnabled);
+        showToast(
+            _safeModeEnabled
+                ? 'Safe Mode aktiv: keine automatische Ausführung'
+                : 'Safe Mode deaktiviert: automatische Ausführung freigegebener Aktionen aktiv',
+            'info',
+            3200
+        );
+        await loadActionQueue();
+    } catch (e) {
+        showToast(e?.message || 'Safe Mode konnte nicht umgeschaltet werden', 'error');
+    } finally {
+        if (btn) btn.disabled = false;
     }
 }
 
@@ -811,12 +863,7 @@ async function loadActionQueue() {
 function renderActionQueue(actions = []) {
     const list = document.getElementById('actionQueueList');
     const summary = document.getElementById('actionQueueSummary');
-    const safeModeHint = document.getElementById('actionQueueSafeMode');
     if (!list) return;
-    if (safeModeHint) {
-        const visible = document.getElementById('safeModeBadge')?.style.display !== 'none';
-        safeModeHint.style.display = visible ? 'block' : 'none';
-    }
     if (!actions.length) {
         if (summary) summary.textContent = 'Keine wartenden Aktionen';
         list.innerHTML = '<div class="report-empty-state">Keine Aktionen in der Warteschlange.</div>';
@@ -921,6 +968,7 @@ function applyFilters() {
 
 // ── Event wiring ────────────────────────────────────────────────────────
 function wireListeners() {
+    document.getElementById('safeModeToggle')?.addEventListener('click', toggleSafeMode);
     document.getElementById('triggerProcessing')?.addEventListener('click', triggerProcessing);
     document.getElementById('cancelRunBtn')?.addEventListener('click', cancelProcessing);
     document.getElementById('viewDailyReport')?.addEventListener('click', openDailyReport);

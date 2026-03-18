@@ -258,18 +258,25 @@ class EmailProcessor:
         )
 
         try:
-            # Execute approved queue actions first (manual + scheduled runs).
-            self._update_status(
-                phase="ingestion",
-                current_step="Führe freigegebene Aktionen aus…",
-                progress_percent=2,
-            )
-            approved_stats = self._execute_approved_actions()
-            if approved_stats["total"] > 0:
+            # Execute approved queue actions first (manual + scheduled runs),
+            # but only when SAFE_MODE is disabled.
+            approved_stats = {"total": 0, "executed": 0, "failed": 0}
+            if self.settings.safe_mode:
                 logger.info(
-                    "Processed approved actions before ingestion: %s",
-                    approved_stats,
+                    "SAFE_MODE active; skipping approved action auto-execution for this run"
                 )
+            else:
+                self._update_status(
+                    phase="ingestion",
+                    current_step="Führe freigegebene Aktionen aus…",
+                    progress_percent=2,
+                )
+                approved_stats = self._execute_approved_actions()
+                if approved_stats["total"] > 0:
+                    logger.info(
+                        "Processed approved actions before ingestion: %s",
+                        approved_stats,
+                    )
 
             # ----------------------------------------------------------------
             # Phase 1: Ingest — import all emails from IMAP into local index
