@@ -69,8 +69,10 @@ def _settings_for_processor():
     settings.safe_mode = True
     settings.require_approval = False
     settings.spam_threshold = 0.7
+    settings.ai_batch_size = 10
     settings.max_emails_per_run = 200
     settings.store_email_body = False
+    settings.inbox_folder = "INBOX"
     settings.quarantine_folder = "Quarantine"
     settings.archive_folder = "Archive"
     settings.spam_folder = "Spam"
@@ -266,3 +268,82 @@ def test_reply_draft_execution_is_safe_and_keeps_draft_payload(
     assert body["payload"]["draft_state"] == "proposed_manual_send"
     mock_imap_cls.assert_called_once()
     mock_imap_cls.return_value.__enter__.return_value.delete_message.assert_not_called()
+
+
+def test_process_run_auto_executes_only_approved_actions_even_in_safe_mode(db_session):
+    email_approved = _create_email(db_session, uid="801")
+    email_proposed = _create_email(db_session, uid="802")
+    approved = ActionQueue(
+        email_id=email_approved.id,
+        action_type="mark_read",
+        payload={"source": "test"},
+        status="approved",
+    )
+    proposed = ActionQueue(
+        email_id=email_proposed.id,
+        action_type="mark_read",
+        payload={"source": "test"},
+        status="proposed",
+    )
+    db_session.add_all([approved, proposed])
+    db_session.commit()
+
+    settings = _settings_for_processor()
+    settings.safe_mode = True
+    settings.require_approval = True
+
+    with patch("src.services.email_processor.get_settings", return_value=settings):
+        with patch("src.services.email_processor.IMAPService") as mock_imap_cls:
+            imap = Mock()
+            imap.connect.return_value = True
+            imap.mark_as_read.return_value = True
+            mock_imap_cls.return_value = imap
+
+            processor = EmailProcessor(db_session)
+            with patch.object(
+                processor, "_run_ingestion", return_value={"new": 0, "skipped": 0, "failed": 0}
+            ):
+                run = processor.process_emails(trigger_type="MANUAL")
+
+    db_session.refresh(approved)
+    db_session.refresh(proposed)
+    assert run.status == "SUCCESS"
+    assert approved.status == "executed"
+    assert approved.executed_at is not None
+    assert proposed.status == "proposed"
+    imap.mark_as_read.assert_called_once_with(801)
+
+
+def test_process_run_marks_failed_when_approved_action_execution_fails(db_session):
+    email = _create_email(db_session, uid="803")
+    approved = ActionQueue(
+        email_id=email.id,
+        action_type="move",
+        payload={"target_folder": "Archive"},
+        status="approved",
+    )
+    db_session.add(approved)
+    db_session.commit()
+
+    settings = _settings_for_processor()
+    settings.safe_mode = True
+    settings.require_approval = True
+
+    with patch("src.services.email_processor.get_settings", return_value=settings):
+        with patch("src.services.email_processor.IMAPService") as mock_imap_cls:
+            imap = Mock()
+            imap.connect.return_value = True
+            imap.move_to_folder.return_value = False
+            mock_imap_cls.return_value = imap
+
+            processor = EmailProcessor(db_session)
+            with patch.object(
+                processor, "_run_ingestion", return_value={"new": 0, "skipped": 0, "failed": 0}
+            ):
+                run = processor.process_emails(trigger_type="SCHEDULED")
+
+    db_session.refresh(approved)
+    assert run.status == "SUCCESS"
+    assert approved.status == "failed"
+    assert approved.error_message == "IMAP operation failed"
+    imap.move_to_folder.assert_called_once_with(803, "Archive")
