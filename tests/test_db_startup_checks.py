@@ -6,8 +6,17 @@ and fails closed with appropriate error messages.
 """
 
 import pytest
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
-from sqlalchemy import inspect
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.orm import sessionmaker
+
+from src.config import reload_settings
+from src.main import app
+from src.database.connection import get_db as _get_db
+from src.models.database import Base, ProcessedEmail
 
 
 class TestPendingActionsTableCheck:
@@ -169,6 +178,142 @@ class TestStartupIntegration:
         
         # Verify sys.exit(1) on failure
         assert "sys.exit(1)" in source
+
+
+def _create_legacy_action_queue_database(db_file: Path):
+    engine = create_engine(f"sqlite:///{db_file}")
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE action_queue"))
+        connection.execute(
+            text(
+                """
+                CREATE TABLE action_queue (
+                    id INTEGER PRIMARY KEY,
+                    email_id INTEGER NOT NULL,
+                    action_type VARCHAR(50) NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO action_queue (id, email_id, action_type)
+                VALUES (1, 101, 'move')
+                """
+            )
+        )
+    return engine
+
+
+class TestActionQueueSchemaRepair:
+    def test_init_db_repairs_missing_action_queue_columns_and_preserves_rows(
+        self, tmp_path, monkeypatch
+    ):
+        from src.database import connection as db_connection
+
+        db_file = tmp_path / "legacy_action_queue.sqlite"
+        legacy_engine = _create_legacy_action_queue_database(db_file)
+        legacy_engine.dispose()
+
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file}")
+        reload_settings()
+
+        db_connection._engine = None
+        db_connection._SessionLocal = None
+        db_connection.init_db()
+        engine = db_connection.get_engine()
+        inspector = inspect(engine)
+
+        column_names = {column["name"] for column in inspector.get_columns("action_queue")}
+        for required_column in [
+            "thread_id",
+            "payload",
+            "status",
+            "created_at",
+            "updated_at",
+            "queued_at",
+            "approved_at",
+            "executed_at",
+            "error_message",
+        ]:
+            assert required_column in column_names
+
+        with engine.connect() as connection:
+            row_count = connection.execute(text("SELECT COUNT(*) FROM action_queue")).scalar()
+            first_row = connection.execute(
+                text("SELECT id, email_id, action_type FROM action_queue WHERE id = 1")
+            ).fetchone()
+
+        assert row_count == 1
+        assert first_row == (1, 101, "move")
+
+        index_names = {idx["name"] for idx in inspector.get_indexes("action_queue")}
+        assert "idx_action_queue_status" in index_names
+        assert "idx_action_queue_email" in index_names
+        assert "idx_action_queue_thread" in index_names
+
+    def test_actions_and_daily_report_endpoints_work_after_repair(self, tmp_path):
+        from src.database.startup_checks import ensure_action_queue_schema_compatibility
+
+        db_file = tmp_path / "legacy_action_queue_api.sqlite"
+        engine = _create_legacy_action_queue_database(db_file)
+        ensure_action_queue_schema_compatibility(engine, debug=False)
+
+        SessionLocal = sessionmaker(bind=engine)
+        db_session = SessionLocal()
+
+        email = ProcessedEmail(
+            id=101,
+            message_id="legacy-101@example.com",
+            uid="101",
+            thread_id="thread-legacy-101",
+            subject="Legacy schema test email",
+            sender="sender@example.com",
+            summary="summary",
+            priority="HIGH",
+            category="Klinik",
+            action_required=True,
+            is_spam=False,
+            is_resolved=False,
+            is_processed=True,
+            processed_at=datetime.utcnow(),
+        )
+        db_session.add(email)
+        db_session.execute(
+            text(
+                "UPDATE action_queue SET thread_id = :thread_id, status = :status, "
+                "created_at = :created_at WHERE id = 1"
+            ),
+            {
+                "thread_id": email.thread_id,
+                "status": "proposed",
+                "created_at": datetime.utcnow(),
+            },
+        )
+        db_session.commit()
+
+        app.dependency_overrides[_get_db] = lambda: db_session
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer test_key_abc123"}
+
+        actions_response = client.get("/api/actions", headers=headers)
+        assert actions_response.status_code == 200
+        actions_body = actions_response.json()
+        assert len(actions_body) == 1
+        assert actions_body[0]["id"] == 1
+        assert actions_body[0]["thread_id"] == "thread-legacy-101"
+
+        report_response = client.get("/api/reports/daily", headers=headers)
+        assert report_response.status_code == 200
+        report_body = report_response.json()
+        assert "totals" in report_body
+        assert report_body["totals"]["total_processed"] >= 1
+
+        client.close()
+        app.dependency_overrides.clear()
+        db_session.close()
 
 
 if __name__ == "__main__":

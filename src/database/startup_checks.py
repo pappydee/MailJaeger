@@ -6,10 +6,104 @@ preventing silent failures where features queue actions but the DB schema is mis
 """
 
 import logging
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 from src.utils.error_handling import sanitize_error
 
 logger = logging.getLogger(__name__)
+
+_ACTION_QUEUE_REQUIRED_COLUMNS = {
+    "thread_id": "VARCHAR(200)",
+    "payload": "JSON",
+    "status": "VARCHAR(30) DEFAULT 'proposed_action'",
+    "created_at": "DATETIME",
+    "updated_at": "DATETIME",
+    "queued_at": "DATETIME",
+    "approved_at": "DATETIME",
+    "executed_at": "DATETIME",
+    "error_message": "TEXT",
+}
+
+_ACTION_QUEUE_REQUIRED_INDEXES = {
+    "idx_action_queue_status": "status",
+    "idx_action_queue_email": "email_id",
+    "idx_action_queue_thread": "thread_id",
+}
+
+
+def ensure_action_queue_schema_compatibility(engine, debug: bool = False):
+    """
+    Repair legacy SQLite action_queue table schemas in place.
+
+    Adds missing columns and indexes expected by the current ActionQueue model,
+    preserving existing rows.
+    """
+    if engine.dialect.name != "sqlite":
+        return {"columns_added": [], "indexes_added": []}
+
+    try:
+        inspector = inspect(engine)
+        table_names = inspector.get_table_names()
+        if "action_queue" not in table_names:
+            return {"columns_added": [], "indexes_added": []}
+
+        existing_columns = {
+            column["name"] for column in inspector.get_columns("action_queue")
+        }
+        existing_indexes = {
+            index["name"] for index in inspector.get_indexes("action_queue")
+        }
+
+        columns_added = []
+        indexes_added = []
+
+        with engine.begin() as connection:
+            for column_name, column_type in _ACTION_QUEUE_REQUIRED_COLUMNS.items():
+                if column_name in existing_columns:
+                    continue
+                connection.execute(
+                    text(
+                        f"ALTER TABLE action_queue ADD COLUMN {column_name} {column_type}"
+                    )
+                )
+                columns_added.append(column_name)
+                logger.warning(
+                    "SQLite schema repair: added missing action_queue column '%s'",
+                    column_name,
+                )
+
+            for index_name, index_column in _ACTION_QUEUE_REQUIRED_INDEXES.items():
+                if index_name in existing_indexes:
+                    continue
+                if index_column not in existing_columns and index_column not in columns_added:
+                    continue
+                connection.execute(
+                    text(
+                        f"CREATE INDEX IF NOT EXISTS {index_name} "
+                        f"ON action_queue ({index_column})"
+                    )
+                )
+                indexes_added.append(index_name)
+                logger.warning(
+                    "SQLite schema repair: added missing action_queue index '%s'",
+                    index_name,
+                )
+
+        if columns_added or indexes_added:
+            logger.info(
+                "SQLite action_queue schema repair applied: columns=%s indexes=%s",
+                columns_added,
+                indexes_added,
+            )
+        else:
+            logger.debug("SQLite action_queue schema already compatible")
+
+        return {"columns_added": columns_added, "indexes_added": indexes_added}
+
+    except Exception as e:
+        sanitized = sanitize_error(e, debug=debug)
+        error_msg = f"Failed to repair SQLite action_queue schema: {sanitized}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg) from e
 
 
 def verify_pending_actions_table(engine, debug: bool = False):

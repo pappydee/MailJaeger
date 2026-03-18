@@ -10,6 +10,7 @@ import logging
 
 from src.config import get_settings
 from src.models.database import Base
+from src.database.startup_checks import ensure_action_queue_schema_compatibility
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ def init_db():
 
     # Create tables
     Base.metadata.create_all(bind=_engine)
+    ensure_action_queue_schema_compatibility(_engine, debug=settings.debug)
 
     logger.info("Database initialized successfully")
 
