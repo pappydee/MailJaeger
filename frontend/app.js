@@ -1014,9 +1014,9 @@ function renderActionQueue(actions = []) {
         const threadSummary = action.thread_summary || {};
         const threadSummaryLine = buildThreadSummaryLine(threadSummary);
         const waitingLabel = threadState === 'waiting_for_me'
-            ? 'You need to act'
+            ? 'Handlung erforderlich'
             : threadState === 'waiting_for_other'
-                ? 'Waiting for reply'
+                ? 'Warte auf Antwort'
                 : null;
         return `
             <article class="action-queue-card ${threadState === 'waiting_for_me' ? 'action-queue-card-waiting' : ''}">

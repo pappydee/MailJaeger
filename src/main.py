@@ -366,7 +366,10 @@ def _resolve_archive_folder(
             _set_app_setting(
                 db,
                 key=APP_SETTING_IMAP_FOLDERS_CACHE,
-                value={"folders": live_folders, "fetched_at": datetime.utcnow().isoformat()},
+                value={
+                    "folders": live_folders,
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                },
             )
             candidate = _choose_archive_folder_from_discovered(live_folders)
             if candidate:
@@ -1480,7 +1483,7 @@ async def list_imap_folders(db: Session = Depends(get_db)):
     _set_app_setting(
         db,
         key=APP_SETTING_IMAP_FOLDERS_CACHE,
-        value={"folders": folders, "fetched_at": datetime.utcnow().isoformat()},
+        value={"folders": folders, "fetched_at": datetime.now(timezone.utc).isoformat()},
     )
     return {
         "folders": folders,
@@ -1582,7 +1585,7 @@ async def list_actions(
                 row[0].thread_id or (row[1].thread_id if row[1] else None), {}
             ).get("sort_key", (2, 0.0, 0.0))[2],
             -(
-                (row[0].created_at or datetime.min).timestamp()
+                row[0].created_at.timestamp()
                 if row[0].created_at
                 else 0.0
             ),
@@ -1866,9 +1869,10 @@ async def reject_action(
     if action.status in ("executed", "executed_action"):
         raise HTTPException(status_code=400, detail="Cannot reject an executed action")
     previous_status = action.status
+    transition_time = datetime.now(timezone.utc)
     action.status = "rejected"
     action.error_message = "Rejected by user"
-    action.updated_at = datetime.now(timezone.utc)
+    action.updated_at = transition_time
     _record_decision_event(
         db,
         email_id=action.email_id,

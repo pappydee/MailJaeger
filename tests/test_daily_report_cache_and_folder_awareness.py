@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
@@ -51,7 +51,7 @@ def _create_email(
         is_archived=is_archived,
         category=category,
         is_processed=True,
-        processed_at=datetime.utcnow(),
+        processed_at=datetime.now(timezone.utc),
     )
     db_session.add(email)
     db_session.commit()
@@ -63,7 +63,7 @@ def test_stale_cached_daily_report_is_rejected_and_regenerated():
     db = _make_session()
     try:
         stale_payload = {
-            "generated_at": datetime.utcnow().isoformat(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
             "period_hours": 24,
             "totals": {
                 "total_processed": 1,
@@ -84,9 +84,9 @@ def test_stale_cached_daily_report_is_rejected_and_regenerated():
         }
         db.add(
             DailyReport(
-                generated_at=datetime.utcnow(),
-                period_start=datetime.utcnow() - timedelta(hours=24),
-                period_end=datetime.utcnow(),
+                generated_at=datetime.now(timezone.utc),
+                period_start=datetime.now(timezone.utc) - timedelta(hours=24),
+                period_end=datetime.now(timezone.utc),
                 report_json=stale_payload,
                 report_text="old",
                 generation_status="ready",
@@ -121,8 +121,8 @@ def test_regenerated_report_contains_populated_thread_intelligence_and_legacy_fi
         with patch("src.main.AIService.generate_report", return_value="Report"):
             report = _build_daily_report_response(
                 db,
-                period_start=datetime.utcnow() - timedelta(hours=24),
-                period_end=datetime.utcnow(),
+                period_start=datetime.now(timezone.utc) - timedelta(hours=24),
+                period_end=datetime.now(timezone.utc),
             )
         payload = report.model_dump()
         assert payload["report_version"] == 2
@@ -197,8 +197,8 @@ def test_archive_suggestions_use_configured_archive_folder():
         with patch("src.main.AIService.generate_report", return_value="Report"):
             report = _build_daily_report_response(
                 db,
-                period_start=datetime.utcnow() - timedelta(hours=24),
-                period_end=datetime.utcnow(),
+                period_start=datetime.now(timezone.utc) - timedelta(hours=24),
+                period_end=datetime.now(timezone.utc),
             )
         archive_suggestions = [
             action for action in report.suggested_actions if action.action_type == "archive"
@@ -279,8 +279,8 @@ def test_learned_folder_preference_is_reused_for_future_archive_suggestions():
         with patch("src.main.AIService.generate_report", return_value="Report"):
             report = _build_daily_report_response(
                 db,
-                period_start=datetime.utcnow() - timedelta(hours=24),
-                period_end=datetime.utcnow(),
+                period_start=datetime.now(timezone.utc) - timedelta(hours=24),
+                period_end=datetime.now(timezone.utc),
             )
         archive_suggestions = [
             action for action in report.suggested_actions if action.action_type == "archive"
@@ -315,7 +315,7 @@ def test_archive_suggestions_can_use_discovered_folder_cache_without_default_ass
                             "flags": [],
                         },
                     ],
-                    "fetched_at": datetime.utcnow().isoformat(),
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
         )
@@ -324,8 +324,8 @@ def test_archive_suggestions_can_use_discovered_folder_cache_without_default_ass
         with patch("src.main.AIService.generate_report", return_value="Report"):
             report = _build_daily_report_response(
                 db,
-                period_start=datetime.utcnow() - timedelta(hours=24),
-                period_end=datetime.utcnow(),
+                period_start=datetime.now(timezone.utc) - timedelta(hours=24),
+                period_end=datetime.now(timezone.utc),
             )
         archive_suggestions = [
             action for action in report.suggested_actions if action.action_type == "archive"
