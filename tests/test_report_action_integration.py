@@ -60,7 +60,9 @@ def _create_email(
 def test_daily_report_sections_and_suggested_actions_present():
     db = _make_session()
     try:
-        _create_email(db, message_id="m1@example.com", action_required=True, is_resolved=False)
+        _create_email(
+            db, message_id="m1@example.com", action_required=True, is_resolved=False
+        )
         _create_email(db, message_id="m2@example.com", is_spam=True, is_archived=False)
         client = _mk_client(db)
         with patch("src.main.AIService") as mock_ai_cls:
@@ -84,6 +86,7 @@ def test_daily_report_sections_and_suggested_actions_present():
         assert isinstance(data["totals"], dict)
         assert data["totals"]["action_required"] >= 1
         assert any(a["action_type"] == "reply_draft" for a in data["suggested_actions"])
+        assert "queue_status" in data["suggested_actions"][0]
     finally:
         app.dependency_overrides.clear()
         db.close()
@@ -136,6 +139,7 @@ def test_reply_draft_queue_payload_contains_draft_fields():
         assert body["action_type"] == "reply_draft"
         assert body["payload"]["draft_summary"]
         assert body["payload"]["draft_text"]
+        assert body["payload"]["draft_state"] == "proposed_manual_send"
     finally:
         app.dependency_overrides.clear()
         db.close()
@@ -160,13 +164,17 @@ def test_report_suggestion_approval_and_execution_record_learning_signals():
             imap = Mock()
             imap.mark_as_read.return_value = True
             mock_imap_cls.return_value.__enter__.return_value = imap
-            execute_resp = client.post(f"/api/actions/{action_id}/execute", headers=AUTH)
+            execute_resp = client.post(
+                f"/api/actions/{action_id}/execute", headers=AUTH
+            )
 
         assert execute_resp.status_code == 200, execute_resp.text
         assert execute_resp.json()["status"] == "executed"
         event_types = {
             e.event_type
-            for e in db.query(DecisionEvent).filter(DecisionEvent.email_id == email.id).all()
+            for e in db.query(DecisionEvent)
+            .filter(DecisionEvent.email_id == email.id)
+            .all()
         }
         assert "approve_suggestion" in event_types
         assert "execute_suggestion" in event_types
@@ -188,6 +196,7 @@ def test_report_suggestion_rejection_records_signal():
         action_id = queue_resp.json()["id"]
         reject_resp = client.post(f"/api/actions/{action_id}/reject", headers=AUTH)
         assert reject_resp.status_code == 200
+        assert reject_resp.json()["status"] == "rejected"
         reject_event = (
             db.query(DecisionEvent)
             .filter(
@@ -219,6 +228,7 @@ def test_safe_mode_blocks_execution_for_report_suggestion():
 
         with patch.dict("os.environ", {"SAFE_MODE": "true"}):
             from src.config import reload_settings, get_settings
+
             reload_settings()
             import src.main
 
@@ -238,9 +248,143 @@ def test_queue_endpoint_rejects_invalid_action_type():
         resp = client.post(
             "/api/reports/daily/suggested-actions",
             headers=AUTH,
-            json={"email_id": email.id, "action_type": "not_a_real_action", "safe_mode": True},
+            json={
+                "email_id": email.id,
+                "action_type": "not_a_real_action",
+                "safe_mode": True,
+            },
         )
         assert resp.status_code == 400
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_queue_endpoint_validates_malformed_reply_draft_payload():
+    db = _make_session()
+    try:
+        email = _create_email(db, message_id="m8b@example.com")
+        client = _mk_client(db)
+        resp = client.post(
+            "/api/reports/daily/suggested-actions",
+            headers=AUTH,
+            json={
+                "email_id": email.id,
+                "action_type": "reply_draft",
+                "payload": {"draft_text": ""},
+                "safe_mode": True,
+            },
+        )
+        assert resp.status_code == 400
+        assert "draft_text" in resp.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_duplicate_report_suggestion_returns_conflict_and_does_not_duplicate_row():
+    db = _make_session()
+    try:
+        email = _create_email(db, message_id="m9@example.com")
+        client = _mk_client(db)
+        payload = {
+            "email_id": email.id,
+            "thread_id": email.thread_id,
+            "action_type": "mark_read",
+            "safe_mode": True,
+        }
+        first = client.post(
+            "/api/reports/daily/suggested-actions", headers=AUTH, json=payload
+        )
+        assert first.status_code == 200
+        second = client.post(
+            "/api/reports/daily/suggested-actions", headers=AUTH, json=payload
+        )
+        assert second.status_code == 409
+        assert "already queued" in second.json()["detail"]
+        assert (
+            db.query(ActionQueue).filter(ActionQueue.email_id == email.id).count() == 1
+        )
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_daily_report_reflects_existing_queue_state_for_suggestions():
+    db = _make_session()
+    try:
+        email = _create_email(
+            db,
+            message_id="m10@example.com",
+            action_required=True,
+            is_resolved=False,
+        )
+        action = ActionQueue(
+            email_id=email.id,
+            thread_id=email.thread_id,
+            action_type="mark_resolved",
+            payload={"source": "daily_report_suggestion"},
+            status="approved",
+        )
+        db.add(action)
+        db.commit()
+
+        client = _mk_client(db)
+        with patch("src.main.AIService") as mock_ai_cls:
+            mock_ai_cls.return_value.generate_report.return_value = "Report"
+            resp = client.get("/api/reports/daily", headers=AUTH)
+        assert resp.status_code == 200
+        data = resp.json()
+        resolved = next(
+            a
+            for a in data["suggested_actions"]
+            if a["email_id"] == email.id and a["action_type"] == "mark_resolved"
+        )
+        assert resolved["queue_status"] == "approved"
+        assert resolved["queue_action_id"] == action.id
+    finally:
+        app.dependency_overrides.clear()
+        db.close()
+
+
+def test_report_event_endpoint_records_preview_and_open_events():
+    db = _make_session()
+    try:
+        email = _create_email(db, message_id="m11@example.com", action_required=True)
+        client = _mk_client(db)
+        preview_resp = client.post(
+            "/api/reports/daily/events",
+            headers=AUTH,
+            json={
+                "event_type": "preview_reply_draft",
+                "email_id": email.id,
+                "thread_id": email.thread_id,
+                "source": "report_suggestion",
+            },
+        )
+        assert preview_resp.status_code == 200
+        open_resp = client.post(
+            "/api/reports/daily/events",
+            headers=AUTH,
+            json={
+                "event_type": "open_related_email_from_report",
+                "email_id": email.id,
+                "thread_id": email.thread_id,
+                "source": "report_suggestion",
+            },
+        )
+        assert open_resp.status_code == 200
+
+        events = (
+            db.query(DecisionEvent)
+            .filter(DecisionEvent.email_id == email.id)
+            .order_by(DecisionEvent.created_at.asc())
+            .all()
+        )
+        assert [e.event_type for e in events][-2:] == [
+            "preview_reply_draft",
+            "open_related_email_from_report",
+        ]
     finally:
         app.dependency_overrides.clear()
         db.close()
