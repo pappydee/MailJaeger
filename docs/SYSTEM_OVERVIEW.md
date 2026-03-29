@@ -154,12 +154,28 @@ IMAP Mailbox
 
 ### 4.2 Partially Implemented ⚠️
 
-| Feature | Status | Gap |
-|---------|--------|-----|
-| **Learning system** | Folder pattern learning from sender domains works; `LearningSignal` + `FolderPattern` models populated | `detect_folder_movements()` is a placeholder; no automatic folder-scan-based learning yet; learning only tracks sender domain patterns, not subject or content patterns |
-| **Classification override** | Users can override AI classification; override creates `ClassificationOverride` rule | Override rules exist but no automatic re-application to future emails from same sender/pattern |
-| **UI** | Functional dashboard with email list, search, health status | Lacks real-time progress visualization, polished UX, interactive action execution buttons in email view |
-| **Scheduling control** | Schedule time configurable via `POST /api/settings` | No enable/disable toggle exposed in UI; no recurring schedule editor |
+**Learning system**
+- ✅ Folder pattern learning from sender domains works
+- ✅ `LearningSignal` + `FolderPattern` models populated
+- ❌ `detect_folder_movements()` is a placeholder
+- ❌ No automatic folder-scan-based learning yet
+- ❌ Tracks only sender domain patterns, not subject or content patterns
+
+**Classification override**
+- ✅ Users can override AI classification via API
+- ✅ Override creates `ClassificationOverride` rule
+- ❌ Override rules are not automatically re-applied to future emails from same sender/pattern
+
+**UI**
+- ✅ Functional dashboard with email list, search, health status
+- ❌ No real-time progress visualization
+- ❌ No interactive action execution buttons in email detail view
+- ❌ Needs UX polish
+
+**Scheduling control**
+- ✅ Schedule time configurable via `POST /api/settings`
+- ❌ No enable/disable toggle exposed in UI
+- ❌ No recurring schedule editor
 
 ### 4.3 Not Yet Implemented ❌
 
