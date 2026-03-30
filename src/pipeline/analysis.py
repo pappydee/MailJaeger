@@ -187,6 +187,9 @@ def run_analysis(
 
         db.commit()
 
+        # Post-analysis enrichment: generate learned predictions for processed emails
+        _enrich_batch_with_predictions(db, batch, needs_llm)
+
     logger.info(
         "analysis_complete analysed=%s failed=%s llm_calls=%s",
         stats["analysed"],
@@ -194,3 +197,28 @@ def run_analysis(
         stats["llm_calls"],
     )
     return stats
+
+
+def _enrich_batch_with_predictions(
+    db: Session,
+    batch: List[ProcessedEmail],
+    needs_llm: List[ProcessedEmail],
+) -> None:
+    """Generate and persist learned-behavior predictions for successfully analysed emails.
+
+    Called after each analysis batch.  Predictions are internal — they do not
+    change external behavior — but make learned signals available for later
+    consumption (e.g. importance scoring, folder routing hints).
+    """
+    try:
+        from src.services.prediction_engine import generate_predictions
+
+        all_emails = set(batch) | set(needs_llm)
+        for email_record in all_emails:
+            # Only enrich emails that were actually classified (not failed)
+            if email_record.analysis_state in ("failed", "pending"):
+                continue
+            generate_predictions(db, email_record)
+        db.commit()
+    except Exception as exc:
+        logger.warning("Failed to enrich batch with predictions: %s", exc)

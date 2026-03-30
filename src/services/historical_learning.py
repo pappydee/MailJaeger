@@ -275,33 +275,67 @@ def record_user_action(
     )
     db.add(event)
 
-    # Also update sender profile with action info
-    if domain and action_type in ("archived", "deleted", "kept_in_inbox", "marked_important", "marked_spam"):
-        _update_sender_profile_for_action(db, domain, action_type)
+    # Update sender profiles at both address-level and domain-level
+    address = extract_sender_address(sender)
+    learnable_actions = ("archived", "deleted", "kept_in_inbox", "marked_important", "marked_spam")
+    if action_type in learnable_actions:
+        if domain:
+            _update_sender_profile_for_action(db, domain=domain, address=None, action_type=action_type)
+        if address:
+            _update_sender_profile_for_action(db, domain=None, address=address, action_type=action_type)
 
     return event
 
 
-def _update_sender_profile_for_action(db: Session, domain: str, action_type: str) -> None:
-    """Update SenderProfile counters based on a user action."""
-    profile = (
-        db.query(SenderProfile)
-        .filter(
-            SenderProfile.sender_domain == domain,
-            SenderProfile.sender_address.is_(None),
-        )
-        .first()
-    )
-    if not profile:
-        profile = SenderProfile(
-            sender_domain=domain,
-            total_emails=0,
-            folder_distribution={},
-            first_seen=datetime.now(timezone.utc),
-            last_seen=datetime.now(timezone.utc),
-        )
-        db.add(profile)
+def _get_or_create_sender_profile(
+    db: Session, *, domain: Optional[str] = None, address: Optional[str] = None
+) -> SenderProfile:
+    """Get or create a SenderProfile for a given domain or address.
 
+    Exactly one of domain/address should be provided.
+    - When domain is set (address is None): returns the domain-level profile.
+    - When address is set: returns the address-level profile.
+    """
+    now = datetime.now(timezone.utc)
+    if address:
+        profile = (
+            db.query(SenderProfile)
+            .filter(SenderProfile.sender_address == address)
+            .first()
+        )
+        if not profile:
+            profile = SenderProfile(
+                sender_domain=extract_sender_domain(address),
+                sender_address=address,
+                total_emails=0,
+                folder_distribution={},
+                first_seen=now,
+                last_seen=now,
+            )
+            db.add(profile)
+    else:
+        profile = (
+            db.query(SenderProfile)
+            .filter(
+                SenderProfile.sender_domain == domain,
+                SenderProfile.sender_address.is_(None),
+            )
+            .first()
+        )
+        if not profile:
+            profile = SenderProfile(
+                sender_domain=domain,
+                total_emails=0,
+                folder_distribution={},
+                first_seen=now,
+                last_seen=now,
+            )
+            db.add(profile)
+    return profile
+
+
+def _apply_action_to_profile(profile: SenderProfile, action_type: str) -> None:
+    """Apply action-type counter increments to a SenderProfile."""
     profile.last_seen = datetime.now(timezone.utc)
 
     if action_type == "archived":
@@ -319,6 +353,16 @@ def _update_sender_profile_for_action(db: Session, domain: str, action_type: str
         total = profile.total_emails or 1
         profile.spam_tendency = (profile.marked_spam_count or 0) / total
 
+
+def _update_sender_profile_for_action(
+    db: Session, *, domain: Optional[str] = None, address: Optional[str] = None, action_type: str
+) -> None:
+    """Update SenderProfile counters based on a user action.
+
+    Exactly one of domain/address should be set.
+    """
+    profile = _get_or_create_sender_profile(db, domain=domain, address=address)
+    _apply_action_to_profile(profile, action_type)
     db.add(profile)
 
 
