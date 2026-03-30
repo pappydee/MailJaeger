@@ -18,7 +18,7 @@ Decision events + classification context form the training data.
 """
 
 from typing import Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
@@ -54,7 +54,7 @@ def record_classification_context(
             new_value=analysis.get("category"),
             confidence=analysis.get("spam_probability", 0.5),
             model_version=analysis.get("analysis_version", "1.0.0"),
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
         db.add(event)
         logger.debug(
@@ -91,7 +91,7 @@ def record_user_feedback(
             new_value=new_value,
             confidence=1.0 if user_confirmed else 0.5,
             user_confirmed=user_confirmed,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
         db.add(event)
         db.flush()
@@ -120,7 +120,7 @@ def aggregate_sender_stats(db: Session, sender_domain: str) -> Dict[str, Any]:
         domain_filter = ProcessedEmail.sender.ilike(f"%@{sender_domain}")
         total = (
             db.query(func.count(ProcessedEmail.id))
-            .filter(domain_filter, ProcessedEmail.is_processed == True)
+            .filter(domain_filter, ProcessedEmail.is_processed.is_(True))
             .scalar()
             or 0
         )
@@ -129,13 +129,13 @@ def aggregate_sender_stats(db: Session, sender_domain: str) -> Dict[str, Any]:
 
         spam_count = (
             db.query(func.count(ProcessedEmail.id))
-            .filter(domain_filter, ProcessedEmail.is_spam == True)
+            .filter(domain_filter, ProcessedEmail.is_spam.is_(True))
             .scalar()
             or 0
         )
         action_count = (
             db.query(func.count(ProcessedEmail.id))
-            .filter(domain_filter, ProcessedEmail.action_required == True)
+            .filter(domain_filter, ProcessedEmail.action_required.is_(True))
             .scalar()
             or 0
         )
@@ -143,7 +143,7 @@ def aggregate_sender_stats(db: Session, sender_domain: str) -> Dict[str, Any]:
         # Category distribution
         categories = (
             db.query(ProcessedEmail.category, func.count(ProcessedEmail.id))
-            .filter(domain_filter, ProcessedEmail.is_processed == True)
+            .filter(domain_filter, ProcessedEmail.is_processed.is_(True))
             .group_by(ProcessedEmail.category)
             .all()
         )
@@ -197,7 +197,7 @@ def get_learning_summary(db: Session) -> Dict[str, Any]:
             db.query(func.count(LearningSignal.id))
             .filter(
                 LearningSignal.detected_at
-                >= datetime.utcnow() - timedelta(days=30)
+                >= datetime.now(timezone.utc) - timedelta(days=30)
             )
             .scalar()
             or 0

@@ -11,7 +11,7 @@ Entry point: ``run_actions(db)``
 """
 
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from src.config import get_settings
@@ -86,7 +86,7 @@ def run_actions(db: Session) -> Dict[str, Any]:
                 if not action.error_message:
                     action.error_message = "Execution failed"
 
-            action.updated_at = datetime.utcnow()
+            action.updated_at = datetime.now(timezone.utc)
             db.add(action)
             if email:
                 db.add(email)

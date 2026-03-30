@@ -12,7 +12,7 @@ be resumed after interruption.  Progress is tracked via
 """
 
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from src.config import get_settings
@@ -39,7 +39,7 @@ def _start_job(db: Session, job_type: str, run_id: Optional[str] = None) -> Proc
     )
     if existing:
         existing.status = "running"
-        existing.resumed_at = datetime.utcnow()
+        existing.resumed_at = datetime.now(timezone.utc)
         db.add(existing)
         db.commit()
         logger.info("job_resumed job_id=%s job_type=%s", existing.id, job_type)
@@ -49,7 +49,7 @@ def _start_job(db: Session, job_type: str, run_id: Optional[str] = None) -> Proc
         job_type=job_type,
         run_id=run_id,
         status="running",
-        started_at=datetime.utcnow(),
+        started_at=datetime.now(timezone.utc),
     )
     db.add(job)
     db.commit()
@@ -66,7 +66,7 @@ def _finish_job(
 ) -> None:
     """Mark a ProcessingJob as completed or failed."""
     job.status = status
-    job.completed_at = datetime.utcnow()
+    job.completed_at = datetime.now(timezone.utc)
     job.result_stats = stats
     if error_message:
         job.error_message = error_message

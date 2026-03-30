@@ -11,7 +11,7 @@ Entry point: ``run_analysis(db, max_count, run_id)``
 """
 
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import nullslast, desc as sa_desc
 from sqlalchemy.orm import Session
 
@@ -32,7 +32,7 @@ def _compute_pending_importance_scores(db: Session) -> None:
             db.query(ProcessedEmail)
             .filter(
                 ProcessedEmail.analysis_state == "pending",
-                ProcessedEmail.importance_score == None,  # noqa: E711
+                ProcessedEmail.importance_score.is_(None),
             )
             .all()
         )

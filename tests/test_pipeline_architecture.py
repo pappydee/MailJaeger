@@ -12,7 +12,7 @@ Covers:
 
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 import pytest
 from sqlalchemy import create_engine
@@ -58,7 +58,7 @@ class TestProcessingJobModel:
         job = ProcessingJob(
             job_type="ingestion",
             status="running",
-            started_at=datetime.utcnow(),
+            started_at=datetime.now(timezone.utc),
         )
         db.add(job)
         db.commit()
@@ -92,7 +92,7 @@ class TestProcessingJobModel:
         job = ProcessingJob(
             job_type="analysis",
             status="running",
-            started_at=datetime.utcnow(),
+            started_at=datetime.now(timezone.utc),
         )
         db.add(job)
         db.commit()
@@ -100,7 +100,7 @@ class TestProcessingJobModel:
 
         # Simulate completion
         job.status = "completed"
-        job.completed_at = datetime.utcnow()
+        job.completed_at = datetime.now(timezone.utc)
         job.processed_count = 10
         job.result_stats = {"analysed": 10, "failed": 0}
         db.commit()
@@ -119,7 +119,7 @@ class TestProcessingJobModel:
         job = ProcessingJob(
             job_type="analysis",
             status="paused",
-            started_at=datetime.utcnow(),
+            started_at=datetime.now(timezone.utc),
             last_processed_email_id=42,
             processed_count=5,
         )
@@ -128,7 +128,7 @@ class TestProcessingJobModel:
 
         # Resume
         job.status = "running"
-        job.resumed_at = datetime.utcnow()
+        job.resumed_at = datetime.now(timezone.utc)
         db.commit()
 
         reloaded = db.query(ProcessingJob).filter(ProcessingJob.id == job.id).first()
@@ -507,7 +507,7 @@ class TestProcessingJobs:
         existing = ProcessingJob(
             job_type="ingestion",
             status="running",
-            started_at=datetime.utcnow(),
+            started_at=datetime.now(timezone.utc),
         )
         db.add(existing)
         db.commit()
