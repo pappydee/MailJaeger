@@ -111,37 +111,14 @@ def _update_sender_profile_for_email(
     Exactly one of domain/address should be set.  When address is set a
     per-address profile is maintained; when domain is set a per-domain
     profile is maintained.
-    """
-    if address:
-        profile = (
-            db.query(SenderProfile)
-            .filter(SenderProfile.sender_address == address)
-            .first()
-        )
-    else:
-        profile = (
-            db.query(SenderProfile)
-            .filter(
-                SenderProfile.sender_domain == domain,
-                SenderProfile.sender_address.is_(None),
-            )
-            .first()
-        )
-    now = datetime.now(timezone.utc)
 
-    if not profile:
-        profile = SenderProfile(
-            sender_domain=domain if domain else extract_sender_domain(address or ""),
-            sender_address=address,
-            total_emails=0,
-            folder_distribution={},
-            first_seen=now,
-            last_seen=now,
-        )
-        db.add(profile)
+    Uses the shared ``_get_or_create_sender_profile`` helper for
+    get-or-create logic (centralized address/domain isolation).
+    """
+    profile = _get_or_create_sender_profile(db, domain=domain, address=address)
 
     profile.total_emails = (profile.total_emails or 0) + 1
-    profile.last_seen = now
+    profile.last_seen = datetime.now(timezone.utc)
 
     # Update folder distribution
     dist = dict(profile.folder_distribution or {})

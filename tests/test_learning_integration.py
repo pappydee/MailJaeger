@@ -706,3 +706,372 @@ class TestSourceInspectionWiring:
         import src.main as main_module
         source = inspect.getsource(main_module.execute_action)
         assert "_record_user_action_for_execution" in source
+
+
+# ===========================================================================
+# 10. Centralized sender precedence helper
+# ===========================================================================
+
+class TestSenderPrecedenceHelper:
+    """Verify the shared sender_precedence module works correctly."""
+
+    def test_resolve_sender_profile_address_wins(self, db):
+        """resolve_sender_profile returns address-level when available."""
+        from src.services.sender_precedence import resolve_sender_profile
+
+        db.add(SenderProfile(
+            sender_domain="sp.com", sender_address=None,
+            total_emails=50, folder_distribution={},
+            first_seen=datetime.now(timezone.utc), last_seen=datetime.now(timezone.utc),
+        ))
+        db.add(SenderProfile(
+            sender_domain="sp.com", sender_address="alice@sp.com",
+            total_emails=10, folder_distribution={},
+            first_seen=datetime.now(timezone.utc), last_seen=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        profile = resolve_sender_profile(db, "alice@sp.com", min_support=3)
+        assert profile is not None
+        assert profile.sender_address == "alice@sp.com"
+
+    def test_resolve_sender_profile_falls_back_to_domain(self, db):
+        """Falls back to domain-level when address profile has insufficient support."""
+        from src.services.sender_precedence import resolve_sender_profile
+
+        db.add(SenderProfile(
+            sender_domain="sp2.com", sender_address=None,
+            total_emails=50, folder_distribution={},
+            first_seen=datetime.now(timezone.utc), last_seen=datetime.now(timezone.utc),
+        ))
+        db.add(SenderProfile(
+            sender_domain="sp2.com", sender_address="bob@sp2.com",
+            total_emails=1, folder_distribution={},
+            first_seen=datetime.now(timezone.utc), last_seen=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        profile = resolve_sender_profile(db, "bob@sp2.com", min_support=3)
+        assert profile is not None
+        assert profile.sender_address is None
+        assert profile.sender_domain == "sp2.com"
+
+    def test_resolve_sender_profile_returns_none(self, db):
+        """Returns None when nothing meets min_support."""
+        from src.services.sender_precedence import resolve_sender_profile
+
+        profile = resolve_sender_profile(db, "nobody@ghost.com", min_support=3)
+        assert profile is None
+
+    def test_build_folder_tiers_order(self):
+        """build_folder_tiers returns correct precedence order."""
+        from src.services.sender_precedence import build_folder_tiers
+
+        tiers = build_folder_tiers("alice@example.com", "Klinik", ["urgent", "patient"])
+        types = [t[0] for t in tiers]
+        assert types == ["sender_address", "sender_domain", "category", "subject_keyword", "subject_keyword"]
+
+    def test_build_folder_tiers_without_address(self):
+        """build_folder_tiers with malformed sender still includes domain."""
+        from src.services.sender_precedence import build_folder_tiers
+
+        tiers = build_folder_tiers("noreply", "Allgemein", [])
+        # No address extractable, domain may also be empty
+        types = [t[0] for t in tiers]
+        assert "category" in types
+
+    def test_build_reply_tiers_order(self):
+        """build_reply_tiers returns correct precedence order."""
+        from src.services.sender_precedence import build_reply_tiers
+
+        tiers = build_reply_tiers("alice@example.com", "Forschung")
+        types = [t[0] for t in tiers]
+        assert types == ["sender_address", "sender_domain", "category"]
+
+    def test_resolve_sender_profile_label_returns_label(self, db):
+        """resolve_sender_profile_label returns the matching label."""
+        from src.services.sender_precedence import resolve_sender_profile_label
+
+        db.add(SenderProfile(
+            sender_domain="label.com", sender_address="ceo@label.com",
+            total_emails=20, folder_distribution={},
+            first_seen=datetime.now(timezone.utc), last_seen=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        profile, label = resolve_sender_profile_label(db, "ceo@label.com", min_support=3)
+        assert profile is not None
+        assert label == "ceo@label.com"
+
+
+# ===========================================================================
+# 11. Prediction consumption — _apply_prediction_hints
+# ===========================================================================
+
+class TestPredictionConsumption:
+    """Verify that _apply_prediction_hints actually consumes stored predictions."""
+
+    def test_target_folder_backfills_suggested_folder(self, db):
+        """When analysis didn't set suggested_folder, prediction fills it."""
+        from src.pipeline.analysis import _apply_prediction_hints
+
+        email = _make_email(db, sender="alice@hospital.org", analysis_state="classified",
+                            suggested_folder=None, action_required=False)
+        # Create a target_folder prediction
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="target_folder",
+            predicted_value="Klinik/Eingehend",
+            confidence=0.8,
+            explanation="test explanation",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        _apply_prediction_hints(db, [email], [])
+
+        db.refresh(email)
+        assert email.suggested_folder == "Klinik/Eingehend"
+
+    def test_target_folder_does_not_override_existing(self, db):
+        """When analysis already set suggested_folder, prediction does NOT override."""
+        from src.pipeline.analysis import _apply_prediction_hints
+
+        email = _make_email(db, sender="bob@lab.com", analysis_state="deep_analyzed",
+                            suggested_folder="Archive")
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="target_folder",
+            predicted_value="Research/New",
+            confidence=0.9,
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        _apply_prediction_hints(db, [email], [])
+
+        db.refresh(email)
+        assert email.suggested_folder == "Archive"  # unchanged
+
+    def test_reply_needed_sets_action_required(self, db):
+        """When reply_needed prediction is high and action_required unset, it becomes True."""
+        from src.pipeline.analysis import _apply_prediction_hints
+
+        email = _make_email(db, sender="urgent@dept.org", analysis_state="classified",
+                            action_required=False)
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="reply_needed",
+            predicted_value="0.80",
+            confidence=0.8,
+            explanation="Emails from urgent@dept.org were replied to in 8/10 cases",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        _apply_prediction_hints(db, [email], [])
+
+        db.refresh(email)
+        assert email.action_required is True
+        assert "[learned]" in (email.reasoning or "")
+
+    def test_reply_needed_does_not_override_existing_action_required(self, db):
+        """When action_required is already True, prediction doesn't change it."""
+        from src.pipeline.analysis import _apply_prediction_hints
+
+        email = _make_email(db, sender="ok@test.com", analysis_state="classified",
+                            action_required=True, reasoning="LLM said so")
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="reply_needed",
+            predicted_value="0.90",
+            confidence=0.9,
+            explanation="test",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        _apply_prediction_hints(db, [email], [])
+
+        db.refresh(email)
+        assert email.action_required is True
+        assert email.reasoning == "LLM said so"  # unchanged
+
+    def test_reply_needed_below_threshold_no_change(self, db):
+        """reply_needed with low confidence doesn't set action_required."""
+        from src.pipeline.analysis import _apply_prediction_hints
+
+        email = _make_email(db, sender="low@test.com", analysis_state="classified",
+                            action_required=False)
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="reply_needed",
+            predicted_value="0.30",
+            confidence=0.3,
+            explanation="test",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        _apply_prediction_hints(db, [email], [])
+
+        db.refresh(email)
+        assert email.action_required is False  # unchanged
+
+    def test_importance_boost_backfills_when_none(self, db):
+        """importance_boost fills importance_score when it was None."""
+        from src.pipeline.analysis import _apply_prediction_hints
+
+        email = _make_email(db, sender="vip@company.com", analysis_state="classified",
+                            importance_score=None)
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="importance_boost",
+            predicted_value="0.60",
+            confidence=0.6,
+            explanation="reply rate high",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        _apply_prediction_hints(db, [email], [])
+
+        db.refresh(email)
+        assert email.importance_score is not None
+        assert email.importance_score == pytest.approx(36.0, abs=0.1)  # 30.0 + 0.6*10
+
+    def test_importance_boost_skips_when_already_scored(self, db):
+        """importance_boost does NOT apply when importance_score already set."""
+        from src.pipeline.analysis import _apply_prediction_hints
+
+        email = _make_email(db, sender="known@org.com", analysis_state="classified",
+                            importance_score=55.0)
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="importance_boost",
+            predicted_value="0.80",
+            confidence=0.8,
+            explanation="test",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        _apply_prediction_hints(db, [email], [])
+
+        db.refresh(email)
+        assert email.importance_score == pytest.approx(55.0, abs=0.1)  # unchanged
+
+    def test_skips_failed_emails(self, db):
+        """Predictions for failed emails are not consumed."""
+        from src.pipeline.analysis import _apply_prediction_hints
+
+        email = _make_email(db, sender="fail@test.com", analysis_state="failed",
+                            suggested_folder=None)
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="target_folder",
+            predicted_value="Should/Not/Apply",
+            confidence=0.9,
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        _apply_prediction_hints(db, [email], [])
+
+        db.refresh(email)
+        assert email.suggested_folder is None  # not applied
+
+
+# ===========================================================================
+# 12. Anti-drift: centralized modules actually used
+# ===========================================================================
+
+class TestAntiDrift:
+    """Source-inspection tests to catch drift if modules stop using shared helpers."""
+
+    def test_prediction_engine_uses_build_folder_tiers(self):
+        """prediction_engine._predict_folder must use build_folder_tiers."""
+        import inspect
+        from src.services import prediction_engine
+        source = inspect.getsource(prediction_engine._predict_folder)
+        assert "build_folder_tiers" in source
+
+    def test_prediction_engine_uses_build_reply_tiers(self):
+        """prediction_engine._predict_reply_needed must use build_reply_tiers."""
+        import inspect
+        from src.services import prediction_engine
+        source = inspect.getsource(prediction_engine._predict_reply_needed)
+        assert "build_reply_tiers" in source
+
+    def test_prediction_engine_uses_resolve_sender_profile_label(self):
+        """prediction_engine._predict_importance_boost must use resolve_sender_profile_label."""
+        import inspect
+        from src.services import prediction_engine
+        source = inspect.getsource(prediction_engine._predict_importance_boost)
+        assert "resolve_sender_profile_label" in source
+
+    def test_importance_scorer_uses_resolve_sender_profile(self):
+        """importance_scorer._learned_behavior_boost must use resolve_sender_profile."""
+        import inspect
+        from src.services import importance_scorer
+        source = inspect.getsource(importance_scorer._learned_behavior_boost)
+        assert "resolve_sender_profile" in source
+
+    def test_historical_learning_uses_shared_get_or_create(self):
+        """historical_learning._update_sender_profile_for_email must use _get_or_create_sender_profile."""
+        import inspect
+        from src.services import historical_learning
+        source = inspect.getsource(historical_learning._update_sender_profile_for_email)
+        assert "_get_or_create_sender_profile" in source
+
+    def test_analysis_pipeline_calls_apply_prediction_hints(self):
+        """The analysis module must call _apply_prediction_hints after enrichment."""
+        import inspect
+        from src.pipeline import analysis
+        source = inspect.getsource(analysis.run_analysis)
+        assert "_apply_prediction_hints" in source
+
+    def test_analysis_pipeline_calls_enrich_batch(self):
+        """The analysis module must call _enrich_batch_with_predictions."""
+        import inspect
+        from src.pipeline import analysis
+        source = inspect.getsource(analysis.run_analysis)
+        assert "_enrich_batch_with_predictions" in source
+
+
+# ===========================================================================
+# 13. Full integration: importance scoring consistently uses learned signals
+# ===========================================================================
+
+class TestImportanceScorerConsistency:
+    """Verify importance scoring path uses centralized learned-behavior signals."""
+
+    def test_importance_scorer_incorporates_learned_behavior(self, db):
+        """compute_importance_score includes _learned_behavior_boost from SenderProfile."""
+        from src.services.importance_scorer import compute_importance_score
+
+        # Create address-level profile with strong importance signals
+        db.add(SenderProfile(
+            sender_domain="imp.com", sender_address="boss@imp.com",
+            total_emails=50, folder_distribution={"INBOX": 45},
+            marked_important_count=15, importance_tendency=0.3,
+            reply_rate=0.8, total_replies=40,
+            kept_in_inbox_count=40,
+            first_seen=datetime.now(timezone.utc), last_seen=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        email = _make_email(db, sender="boss@imp.com", analysis_state="classified")
+
+        score = compute_importance_score(db, email)
+        # Score should be noticeably higher than baseline (30) because of learned signals
+        assert score > 35.0  # baseline + at least some learned behavior boost
+
+    def test_importance_scorer_without_learned_profile(self, db):
+        """compute_importance_score still works when no learned profile exists."""
+        from src.services.importance_scorer import compute_importance_score
+
+        email = _make_email(db, sender="unknown@newdomain.xyz", analysis_state="classified")
+
+        score = compute_importance_score(db, email)
+        assert 0.0 <= score <= 100.0  # valid range, no crash
