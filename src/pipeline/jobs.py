@@ -117,30 +117,33 @@ def run_analysis_job(
     """
     Run an analysis job with progress tracking.
 
+    Resume semantics:
+      If a previous analysis job was interrupted (status "running" or
+      "paused") with a ``last_processed_email_id``, the new run continues
+      from that point — only emails with ``id > last_processed_email_id``
+      and ``analysis_state == 'pending'`` are considered.
+
     Returns: {job_id, stats, status}
     """
     job = _start_job(db, "analysis", run_id)
     try:
-        stats = run_analysis(db, max_count=max_count, run_id=run_id or str(job.id))
+        # Use the persisted cursor for real resume
+        resume_after = job.last_processed_email_id  # may be None for fresh jobs
 
-        job.processed_count = stats.get("analysed", 0)
-        job.failed_count = stats.get("failed", 0)
-        if stats.get("analysed", 0) > 0:
-            # Record last processed email for resume capability
-            from src.models.database import ProcessedEmail
+        stats = run_analysis(
+            db,
+            max_count=max_count,
+            run_id=run_id or str(job.id),
+            resume_after_id=resume_after,
+        )
 
-            last = (
-                db.query(ProcessedEmail)
-                .filter(
-                    ProcessedEmail.analysis_state.in_(
-                        ("pre_classified", "classified", "deep_analyzed")
-                    )
-                )
-                .order_by(ProcessedEmail.processed_at.desc())
-                .first()
-            )
-            if last:
-                job.last_processed_email_id = last.id
+        job.processed_count = (job.processed_count or 0) + stats.get("analysed", 0)
+        job.failed_count = (job.failed_count or 0) + stats.get("failed", 0)
+
+        # Persist the cursor from the analysis run
+        last_id = stats.get("last_email_id")
+        if last_id is not None:
+            job.last_processed_email_id = last_id
 
         status = "completed" if stats.get("failed", 0) == 0 else "partial"
         _finish_job(db, job, stats, status=status)

@@ -234,3 +234,119 @@ def get_learning_summary(db: Session) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("Failed to get learning summary: %s", e)
         return {"total_decision_events": 0, "learning_ready": False}
+
+
+# =====================================================================
+# Override re-application — deterministic reclassification
+# =====================================================================
+
+
+def apply_override_to_matching_emails(
+    db: Session,
+    rule_id: int,
+    *,
+    limit: int = 500,
+) -> Dict[str, Any]:
+    """
+    Re-apply a ClassificationOverride rule to all *pending* or previously
+    classified emails that match its sender/subject pattern but were not
+    yet classified by this rule.
+
+    This enables simple deterministic learning: when a user creates an
+    override, the system retroactively applies it without ML.
+
+    Only emails that have NOT been manually overridden (``overridden=False``)
+    are affected, to respect user decisions.
+
+    Returns: {matched, updated, skipped}
+    """
+    from src.models.database import ClassificationOverride
+
+    rule = db.query(ClassificationOverride).filter(ClassificationOverride.id == rule_id).first()
+    if not rule:
+        logger.warning("Override rule %s not found", rule_id)
+        return {"matched": 0, "updated": 0, "skipped": 0}
+
+    # Build candidate query
+    query = db.query(ProcessedEmail).filter(
+        ProcessedEmail.overridden.isnot(True),
+    )
+
+    # Apply sender pattern filter
+    if rule.sender_pattern:
+        pattern = rule.sender_pattern.lower()
+        if not pattern.startswith("@"):
+            pattern = "@" + pattern
+        query = query.filter(ProcessedEmail.sender.ilike(f"%{pattern}"))
+
+    # Apply subject pattern filter
+    if rule.subject_pattern:
+        query = query.filter(
+            ProcessedEmail.subject.ilike(f"%{rule.subject_pattern}%")
+        )
+
+    # Exclude emails already classified by this exact rule
+    query = query.filter(
+        (ProcessedEmail.override_rule_id != rule.id)
+        | (ProcessedEmail.override_rule_id.is_(None))
+    )
+
+    candidates = query.limit(limit).all()
+
+    if not candidates:
+        return {"matched": 0, "updated": 0, "skipped": 0}
+
+    updated = 0
+    skipped = 0
+    for email in candidates:
+        # Double-check subject match if both patterns are set
+        if rule.subject_pattern and rule.sender_pattern:
+            subject = (email.subject or "").lower()
+            if rule.subject_pattern.lower() not in subject:
+                skipped += 1
+                continue
+
+        # Apply the override values
+        if rule.category is not None:
+            email.category = rule.category
+        if rule.priority is not None:
+            email.priority = rule.priority
+        if rule.spam is not None:
+            email.is_spam = rule.spam
+            email.spam_probability = 0.95 if rule.spam else 0.05
+        if rule.action_required is not None:
+            email.action_required = rule.action_required
+        if rule.suggested_folder is not None:
+            email.suggested_folder = rule.suggested_folder
+
+        email.override_rule_id = rule.id
+        email.reasoning = f"Re-applied override rule ID={rule.id}"
+
+        # Record a decision event for audit
+        try:
+            event = DecisionEvent(
+                email_id=email.id,
+                thread_id=email.thread_id,
+                event_type="override_reapplication",
+                source=f"override_rule:{rule.id}",
+                new_value=rule.category,
+                confidence=0.95,
+                user_confirmed=False,
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(event)
+        except Exception:
+            pass  # decision recording must not break the re-application
+
+        db.add(email)
+        updated += 1
+
+    db.commit()
+    logger.info(
+        "override_reapplication rule_id=%s matched=%s updated=%s skipped=%s",
+        rule_id,
+        len(candidates),
+        updated,
+        skipped,
+    )
+    return {"matched": len(candidates), "updated": updated, "skipped": skipped}

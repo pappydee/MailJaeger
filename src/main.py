@@ -1340,6 +1340,17 @@ async def override_email_classification(
     except Exception:
         pass  # learning hooks must never break the override flow
 
+    # Re-apply the new rule to matching emails that haven't been manually
+    # overridden yet.  This is the simple deterministic re-application loop.
+    reapply_stats: Optional[Dict] = None
+    if rule_created and rule_id is not None:
+        try:
+            from src.pipeline.learning import apply_override_to_matching_emails
+
+            reapply_stats = apply_override_to_matching_emails(db, rule_id)
+        except Exception:
+            pass  # re-application must never break the override flow
+
     return ClassificationOverrideResponse(
         success=True,
         email_id=email_id,

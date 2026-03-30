@@ -25,38 +25,15 @@ logger = get_logger(__name__)
 
 def _compute_pending_importance_scores(db: Session) -> None:
     """Compute and persist importance_score for all 'pending' emails that lack one."""
-    from src.services.email_processor import EmailProcessor
-
-    try:
-        unscored = (
-            db.query(ProcessedEmail)
-            .filter(
-                ProcessedEmail.analysis_state == "pending",
-                ProcessedEmail.importance_score.is_(None),
-            )
-            .all()
-        )
-        if not unscored:
-            return
-        logger.info("Computing importance scores for %d emails", len(unscored))
-        # Use a temporary processor instance for scoring (no side effects)
-        processor = EmailProcessor(db_session=db)
-        for email_record in unscored:
-            email_record.importance_score = processor.compute_importance_score(
-                email_record
-            )
-            db.add(email_record)
-        db.commit()
-    except Exception as e:
-        settings = get_settings()
-        sanitized = sanitize_error(e, debug=settings.debug)
-        logger.warning("Failed to compute importance scores: %s", sanitized)
+    from src.services.importance_scorer import compute_pending_importance_scores
+    compute_pending_importance_scores(db)
 
 
 def run_analysis(
     db: Session,
     max_count: Optional[int] = None,
     run_id: Optional[str] = None,
+    resume_after_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Analyse pending emails from the local index.
@@ -64,7 +41,11 @@ def run_analysis(
     This is a pure analysis phase — no IMAP side effects.
     Classification results and DecisionEvents are persisted to the DB.
 
-    Returns stats: {analysed, skipped, failed, llm_calls}.
+    Args:
+        resume_after_id: If set, only emails with ``id > resume_after_id``
+            are considered.  Used by the job layer for real resumability.
+
+    Returns stats: {analysed, skipped, failed, llm_calls, last_email_id}.
     """
     settings = get_settings()
     effective_max = max_count or settings.max_emails_per_run
@@ -73,9 +54,13 @@ def run_analysis(
     _compute_pending_importance_scores(db)
 
     # Fetch pending emails ordered by importance (highest first)
+    query = db.query(ProcessedEmail).filter(
+        ProcessedEmail.analysis_state == "pending"
+    )
+    if resume_after_id is not None:
+        query = query.filter(ProcessedEmail.id > resume_after_id)
     pending = (
-        db.query(ProcessedEmail)
-        .filter(ProcessedEmail.analysis_state == "pending")
+        query
         .order_by(nullslast(sa_desc(ProcessedEmail.importance_score)))
         .limit(effective_max)
         .all()
@@ -83,9 +68,9 @@ def run_analysis(
 
     if not pending:
         logger.info("No pending emails to analyse")
-        return {"analysed": 0, "skipped": 0, "failed": 0, "llm_calls": 0}
+        return {"analysed": 0, "skipped": 0, "failed": 0, "llm_calls": 0, "last_email_id": resume_after_id}
 
-    logger.info("Analysing %d pending email(s)", len(pending))
+    logger.info("Analysing %s pending email(s)", len(pending))
 
     from src.services.analysis_pipeline import AnalysisPipeline
 
@@ -94,7 +79,7 @@ def run_analysis(
 
     ai_service = AIService()
 
-    stats: Dict[str, int] = {"analysed": 0, "skipped": 0, "failed": 0, "llm_calls": 0}
+    stats: Dict[str, Any] = {"analysed": 0, "skipped": 0, "failed": 0, "llm_calls": 0, "last_email_id": resume_after_id}
     batch_size = max(1, settings.ai_batch_size)
 
     for batch_start in range(0, len(pending), batch_size):
@@ -104,29 +89,31 @@ def run_analysis(
         for email_record in batch:
             try:
                 # Stage 1: Fast pre-classification
-                stage1 = pipeline._stage1_pre_classify(email_record)
+                stage1 = pipeline.stage1_pre_classify(email_record)
                 if stage1["confident"]:
-                    pipeline._record_decision(
+                    pipeline.record_decision(
                         email_record, "stage1_pre_classified", stage1
                     )
-                    pipeline._update_analysis_state(email_record, "pre_classified")
-                    pipeline._apply_analysis_to_record(
+                    pipeline.update_analysis_state(email_record, "pre_classified")
+                    pipeline.apply_analysis_to_record(
                         email_record, stage1["analysis"]
                     )
                     stats["analysed"] += 1
+                    stats["last_email_id"] = email_record.id
                     continue
 
                 # Stage 2: Rule-based classification
-                stage2 = pipeline._stage2_rule_classify(email_record)
+                stage2 = pipeline.stage2_rule_classify(email_record)
                 if stage2["confident"]:
-                    pipeline._record_decision(
+                    pipeline.record_decision(
                         email_record, "stage2_classified", stage2
                     )
-                    pipeline._update_analysis_state(email_record, "classified")
-                    pipeline._apply_analysis_to_record(
+                    pipeline.update_analysis_state(email_record, "classified")
+                    pipeline.apply_analysis_to_record(
                         email_record, stage2["analysis"]
                     )
                     stats["analysed"] += 1
+                    stats["last_email_id"] = email_record.id
                     continue
 
                 # Needs LLM — collect for batch
@@ -166,23 +153,24 @@ def run_analysis(
                 sanitized = sanitize_error(e, debug=settings.debug)
                 logger.error("Batch LLM analysis failed: %s", sanitized)
                 results = [
-                    ai_service._fallback_classification(ed) for ed in email_data_list
+                    ai_service.fallback_classification(ed) for ed in email_data_list
                 ]
 
             stats["llm_calls"] += 1
 
             for email_record, analysis in zip(needs_llm, results):
                 try:
-                    pipeline._update_analysis_state(email_record, "deep_analyzed")
-                    pipeline._record_decision(
+                    pipeline.update_analysis_state(email_record, "deep_analyzed")
+                    pipeline.record_decision(
                         email_record,
                         "stage3_deep_analyzed",
                         {"stage": 3, "source": "llm_batch", "analysis": analysis},
                     )
-                    pipeline._apply_analysis_to_record(email_record, analysis)
+                    pipeline.apply_analysis_to_record(email_record, analysis)
                     email_record.analysis_version = PIPELINE_VERSION
                     db.add(email_record)
                     stats["analysed"] += 1
+                    stats["last_email_id"] = email_record.id
                 except Exception as e:
                     sanitized = sanitize_error(e, debug=settings.debug)
                     logger.error(
@@ -200,7 +188,7 @@ def run_analysis(
         db.commit()
 
     logger.info(
-        "analysis_complete analysed=%d failed=%d llm_calls=%d",
+        "analysis_complete analysed=%s failed=%s llm_calls=%s",
         stats["analysed"],
         stats["failed"],
         stats["llm_calls"],

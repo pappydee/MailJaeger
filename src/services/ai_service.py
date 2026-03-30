@@ -361,6 +361,10 @@ Antworte NUR mit dem JSON-Objekt, keine zusätzlichen Erklärungen."""
 
     def _fallback_classification(self, email_data: Dict[str, Any]) -> Dict[str, Any]:
         """Fallback classification when AI fails"""
+        return self.fallback_classification(email_data)
+
+    def fallback_classification(self, email_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Fallback classification when AI fails (public API)."""
         logger.warning("Using fallback classification")
 
         subject = email_data.get("subject", "").lower()

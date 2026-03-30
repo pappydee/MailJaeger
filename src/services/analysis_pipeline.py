@@ -85,24 +85,24 @@ class AnalysisPipeline:
         """
         try:
             # Stage 1: Fast pre-classification
-            stage1_result = self._stage1_pre_classify(email_record)
+            stage1_result = self.stage1_pre_classify(email_record)
             if stage1_result["confident"]:
-                self._record_decision(email_record, "stage1_pre_classified", stage1_result)
-                self._update_analysis_state(email_record, "pre_classified")
+                self.record_decision(email_record, "stage1_pre_classified", stage1_result)
+                self.update_analysis_state(email_record, "pre_classified")
                 return stage1_result["analysis"]
 
             # Stage 2: Rule-based classification
-            stage2_result = self._stage2_rule_classify(email_record)
+            stage2_result = self.stage2_rule_classify(email_record)
             if stage2_result["confident"]:
-                self._record_decision(email_record, "stage2_classified", stage2_result)
-                self._update_analysis_state(email_record, "classified")
+                self.record_decision(email_record, "stage2_classified", stage2_result)
+                self.update_analysis_state(email_record, "classified")
                 return stage2_result["analysis"]
 
             # Stage 3: Deep LLM analysis
             if self._llm_budget_available():
-                stage3_result = self._stage3_llm_analyse(email_record)
-                self._record_decision(email_record, "stage3_deep_analyzed", stage3_result)
-                self._update_analysis_state(email_record, "deep_analyzed")
+                stage3_result = self.stage3_llm_analyse(email_record)
+                self.record_decision(email_record, "stage3_deep_analyzed", stage3_result)
+                self.update_analysis_state(email_record, "deep_analyzed")
                 self._llm_calls_this_run += 1
                 return stage3_result["analysis"]
             else:
@@ -111,13 +111,13 @@ class AnalysisPipeline:
                     f"LLM budget exhausted ({self._llm_calls_this_run} calls). "
                     f"Using rule-based result for {email_record.message_id}"
                 )
-                self._update_analysis_state(email_record, "classified")
+                self.update_analysis_state(email_record, "classified")
                 return stage2_result["analysis"]
 
         except Exception as e:
             sanitized = sanitize_error(e, debug=self.settings.debug)
             logger.error(f"Pipeline analysis failed for {email_record.message_id}: {sanitized}")
-            self._update_analysis_state(email_record, "failed")
+            self.update_analysis_state(email_record, "failed")
             return self._fallback_analysis(email_record)
 
     def analyse_pending_batch(
@@ -172,7 +172,7 @@ class AnalysisPipeline:
 
             try:
                 analysis = self.analyse(email_record)
-                self._apply_analysis_to_record(email_record, analysis)
+                self.apply_analysis_to_record(email_record, analysis)
                 stats["analysed"] += 1
                 progress.last_email_id = email_record.id
                 progress.last_message_id = email_record.message_id
@@ -193,7 +193,7 @@ class AnalysisPipeline:
     # Stage 1: Fast pre-classification (no LLM)
     # ------------------------------------------------------------------
 
-    def _stage1_pre_classify(self, email: ProcessedEmail) -> Dict[str, Any]:
+    def stage1_pre_classify(self, email: ProcessedEmail) -> Dict[str, Any]:
         """
         Fast pattern-based pre-classification.
 
@@ -259,7 +259,7 @@ class AnalysisPipeline:
     # Stage 2: Rule-based classification
     # ------------------------------------------------------------------
 
-    def _stage2_rule_classify(self, email: ProcessedEmail) -> Dict[str, Any]:
+    def stage2_rule_classify(self, email: ProcessedEmail) -> Dict[str, Any]:
         """
         Rule-based classification using ClassificationOverride rules.
 
@@ -320,7 +320,7 @@ class AnalysisPipeline:
     # Stage 3: Deep LLM analysis
     # ------------------------------------------------------------------
 
-    def _stage3_llm_analyse(self, email: ProcessedEmail) -> Dict[str, Any]:
+    def stage3_llm_analyse(self, email: ProcessedEmail) -> Dict[str, Any]:
         """
         Deep LLM analysis via Ollama.
 
@@ -371,7 +371,7 @@ class AnalysisPipeline:
             "reasoning": "Automatische Fallback-Klassifizierung",
         }
 
-    def _apply_analysis_to_record(
+    def apply_analysis_to_record(
         self, email_record: ProcessedEmail, analysis: Dict[str, Any]
     ) -> None:
         """Apply analysis results back to the email record."""
@@ -388,12 +388,12 @@ class AnalysisPipeline:
         email_record.analysis_version = PIPELINE_VERSION
         self.db.add(email_record)
 
-    def _update_analysis_state(self, email: ProcessedEmail, state: str) -> None:
+    def update_analysis_state(self, email: ProcessedEmail, state: str) -> None:
         """Update the analysis_state of an email record."""
         email.analysis_state = state
         self.db.add(email)
 
-    def _record_decision(
+    def record_decision(
         self,
         email: ProcessedEmail,
         event_type: str,
@@ -484,3 +484,13 @@ class AnalysisPipeline:
         progress.failed_count = stats.get("failed", 0)
         progress.llm_calls_used = stats.get("llm_calls", 0)
         self.db.commit()
+
+    # ------------------------------------------------------------------
+    # Backward-compatible aliases (deprecated — use the public names)
+    # ------------------------------------------------------------------
+    _stage1_pre_classify = stage1_pre_classify
+    _stage2_rule_classify = stage2_rule_classify
+    _stage3_llm_analyse = stage3_llm_analyse
+    _record_decision = record_decision
+    _update_analysis_state = update_analysis_state
+    _apply_analysis_to_record = apply_analysis_to_record
