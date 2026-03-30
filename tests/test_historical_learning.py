@@ -764,12 +764,20 @@ class TestUserActionRecording:
 
         assert event.action_type == "marked_spam"
 
-        # Check that sender profile was updated
-        profile = db.query(SenderProfile).filter(
-            SenderProfile.sender_domain == "spam.net"
+        # Domain-level profile must be updated
+        domain_profile = db.query(SenderProfile).filter(
+            SenderProfile.sender_domain == "spam.net",
+            SenderProfile.sender_address.is_(None),
         ).first()
-        assert profile is not None
-        assert profile.marked_spam_count >= 1
+        assert domain_profile is not None
+        assert domain_profile.marked_spam_count >= 1
+
+        # Address-level profile must also be updated
+        addr_profile = db.query(SenderProfile).filter(
+            SenderProfile.sender_address == "promo@spam.net",
+        ).first()
+        assert addr_profile is not None
+        assert addr_profile.marked_spam_count >= 1
 
     def test_record_marked_important(self, db):
         from src.services.historical_learning import record_user_action
@@ -778,11 +786,20 @@ class TestUserActionRecording:
         event = record_user_action(db, email, "marked_important")
         db.commit()
 
-        profile = db.query(SenderProfile).filter(
-            SenderProfile.sender_domain == "important.com"
+        # Domain-level profile must be updated
+        domain_profile = db.query(SenderProfile).filter(
+            SenderProfile.sender_domain == "important.com",
+            SenderProfile.sender_address.is_(None),
         ).first()
-        assert profile is not None
-        assert profile.marked_important_count >= 1
+        assert domain_profile is not None
+        assert domain_profile.marked_important_count >= 1
+
+        # Address-level profile must also be updated
+        addr_profile = db.query(SenderProfile).filter(
+            SenderProfile.sender_address == "vip@important.com",
+        ).first()
+        assert addr_profile is not None
+        assert addr_profile.marked_important_count >= 1
 
     def test_all_action_types_storable(self, db):
         from src.services.historical_learning import record_user_action
