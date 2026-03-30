@@ -539,15 +539,25 @@ MailJaeger/
 └── README.md             # This file
 ```
 
+## Documentation
+
+For in-depth technical documentation see:
+
+- **[System Overview](docs/SYSTEM_OVERVIEW.md)** — consolidated handover document covering vision, current state, limitations, and roadmap
+- **[Architecture Reference](docs/ARCHITECTURE.md)** — technical architecture, processing pipeline, data model, and safety design
+- **[Approval Workflow](docs/approval-workflow.md)** — action approval system details
+- **[Reverse Proxy Examples](docs/reverse-proxy-examples.md)** — deployment behind a reverse proxy
+- **[Security Guide](SECURITY_GUIDE.md)** — hardening and security configuration
+
 ## Roadmap
 
-Version 1.0 includes all core features as specified. Future enhancements:
-- [ ] Web UI dashboard
-- [ ] Mobile app support
-- [ ] Calendar integration
-- [ ] Attachment analysis
-- [ ] Multi-language support beyond German
-- [ ] Export/import functionality
+See [System Overview § High-Priority Next Steps](docs/SYSTEM_OVERVIEW.md#10-high-priority-next-steps) for the detailed roadmap. Key upcoming work:
+
+- [ ] Full learning system (folder scanning, sender profiling, content patterns)
+- [ ] Thread summaries in daily reports and UI
+- [ ] Real-time UI progress visualization
+- [ ] Guided one-command installer
+- [ ] macOS menu bar app / iOS client
 
 ## Contributing
 

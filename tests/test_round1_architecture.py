@@ -650,7 +650,7 @@ class TestMultiStageAnalysisPipeline:
         """Newsletters must be classified at Stage 1 (no LLM needed)."""
         pipeline = self._make_pipeline()
         email = self._make_email(sender="noreply@newsletter.com")
-        result = pipeline._stage1_pre_classify(email)
+        result = pipeline.stage1_pre_classify(email)
         assert result["confident"] is True
         assert result["stage"] == 1
 
@@ -658,7 +658,7 @@ class TestMultiStageAnalysisPipeline:
         """Spam subjects must be detected at Stage 1."""
         pipeline = self._make_pipeline()
         email = self._make_email(subject="unsubscribe from this newsletter")
-        result = pipeline._stage1_pre_classify(email)
+        result = pipeline.stage1_pre_classify(email)
         assert result["confident"] is True
 
     def test_regular_email_not_classified_at_stage1(self):
@@ -668,7 +668,7 @@ class TestMultiStageAnalysisPipeline:
             sender="colleague@hospital.com",
             subject="Meeting tomorrow at 9am",
         )
-        result = pipeline._stage1_pre_classify(email)
+        result = pipeline.stage1_pre_classify(email)
         assert result["confident"] is False
 
     def test_stage2_uses_override_rules(self):
@@ -688,7 +688,7 @@ class TestMultiStageAnalysisPipeline:
         pipeline.db.query.return_value.all.return_value = [rule]
 
         email = self._make_email(sender="doctor@hospital.com")
-        result = pipeline._stage2_rule_classify(email)
+        result = pipeline.stage2_rule_classify(email)
         assert result["confident"] is True
         assert result["analysis"]["category"] == "Klinik"
 
@@ -697,7 +697,7 @@ class TestMultiStageAnalysisPipeline:
         pipeline = self._make_pipeline()
         pipeline.db.query.return_value.all.return_value = []
         email = self._make_email()
-        result = pipeline._stage2_rule_classify(email)
+        result = pipeline.stage2_rule_classify(email)
         assert result["confident"] is False
 
     def test_pipeline_respects_llm_budget(self):

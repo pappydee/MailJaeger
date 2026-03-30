@@ -1320,6 +1320,37 @@ async def override_email_classification(
 
     db.commit()
 
+    # Record a decision event for the classification override — this is
+    # a high-value learning signal because the user is explicitly correcting
+    # the system's classification.
+    try:
+        from src.pipeline.learning import record_user_feedback
+
+        record_user_feedback(
+            db,
+            email_id=email_id,
+            event_type="classification_override",
+            old_value=str(email.original_classification.get("category"))
+            if email.original_classification
+            else None,
+            new_value=override.category,
+            user_confirmed=True,
+        )
+        db.commit()
+    except Exception:
+        pass  # learning hooks must never break the override flow
+
+    # Re-apply the new rule to matching emails that haven't been manually
+    # overridden yet.  This is the simple deterministic re-application loop.
+    reapply_stats: Optional[Dict] = None
+    if rule_created and rule_id is not None:
+        try:
+            from src.pipeline.learning import apply_override_to_matching_emails
+
+            reapply_stats = apply_override_to_matching_emails(db, rule_id)
+        except Exception:
+            pass  # re-application must never break the override flow
+
     return ClassificationOverrideResponse(
         success=True,
         email_id=email_id,

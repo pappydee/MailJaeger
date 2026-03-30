@@ -691,94 +691,11 @@ class EmailProcessor:
         """
         Compute an importance score in the range 0–100 for a single email.
 
-        Inputs:
-        - sender history (previous action_required emails from same domain)
-        - action-required keyword heuristics in subject
-        - thread participation (has In-Reply-To / References?)
-        - email recency
-        - newsletter/bulk indicator penalty (prevents recency bias for bulk mail)
-
-        Higher score → higher priority → processed first.
+        Delegates to ``src.services.importance_scorer.compute_importance_score``
+        so the logic is reusable without instantiating EmailProcessor.
         """
-        score = 30.0  # neutral baseline
-
-        subject = (email_record.subject or "").lower()
-        sender = (email_record.sender or "").lower()
-
-        # Newsletter / bulk mail penalty applied early to avoid recency bias
-        # If the email looks like bulk/newsletter it is de-prioritised regardless
-        # of how recent it is.
-        if any(ind in sender for ind in self._BULK_INDICATORS) or any(
-            ind in subject for ind in self._BULK_INDICATORS
-        ):
-            score -= 20
-
-        # Recency bonus: emails received in the last 48 h score higher
-        try:
-            if email_record.received_at or email_record.date:
-                ts = email_record.received_at or email_record.date
-                age_hours = (datetime.utcnow() - ts).total_seconds() / 3600
-                if age_hours <= 24:
-                    score += 20
-                elif age_hours <= 48:
-                    score += 10
-        except Exception:
-            pass
-
-        # Thread participation: email is a reply → likely involves the user
-        if email_record.thread_id:
-            score += 10
-
-        # Subject keyword heuristics (German + English)
-        urgent_keywords = [
-            "dringend",
-            "urgent",
-            "sofort",
-            "immediately",
-            "frist",
-            "deadline",
-            "termin",
-            "notfall",
-            "emergency",
-            "bitte antworten",
-            "please reply",
-            "antwort erforderlich",
-            "response required",
-        ]
-        if any(kw in subject for kw in urgent_keywords):
-            score += 20
-
-        # Sender domain reputation: check historical action_required rate
-        try:
-            domain = sender.split("@")[-1] if "@" in sender else ""
-            if domain:
-                total_from_domain = (
-                    self.db.query(ProcessedEmail)
-                    .filter(
-                        ProcessedEmail.sender.ilike(f"%@{domain}"),
-                        ProcessedEmail.is_processed == True,
-                    )
-                    .count()
-                )
-                if total_from_domain > 0:
-                    action_from_domain = (
-                        self.db.query(ProcessedEmail)
-                        .filter(
-                            ProcessedEmail.sender.ilike(f"%@{domain}"),
-                            ProcessedEmail.action_required == True,
-                            ProcessedEmail.is_processed == True,
-                        )
-                        .count()
-                    )
-                    action_rate = action_from_domain / total_from_domain
-                    score += (
-                        action_rate * 20
-                    )  # up to +20 for 100% action-required domain
-        except Exception:
-            pass
-
-        # Cap to 0–100
-        return max(0.0, min(100.0, score))
+        from src.services.importance_scorer import compute_importance_score as _score
+        return _score(self.db, email_record)
 
     def _compute_pending_importance_scores(self) -> None:
         """Compute and persist importance_score for all 'pending' emails that lack one."""
@@ -822,18 +739,18 @@ class EmailProcessor:
         pipeline = AnalysisPipeline(self.db)
 
         # Stage 1
-        stage1 = pipeline._stage1_pre_classify(email_record)
+        stage1 = pipeline.stage1_pre_classify(email_record)
         if stage1["confident"]:
-            pipeline._record_decision(email_record, "stage1_pre_classified", stage1)
-            pipeline._update_analysis_state(email_record, "pre_classified")
+            pipeline.record_decision(email_record, "stage1_pre_classified", stage1)
+            pipeline.update_analysis_state(email_record, "pre_classified")
             self._apply_analysis_and_act(email_record, stage1["analysis"], imap)
             return False
 
         # Stage 2
-        stage2 = pipeline._stage2_rule_classify(email_record)
+        stage2 = pipeline.stage2_rule_classify(email_record)
         if stage2["confident"]:
-            pipeline._record_decision(email_record, "stage2_classified", stage2)
-            pipeline._update_analysis_state(email_record, "classified")
+            pipeline.record_decision(email_record, "stage2_classified", stage2)
+            pipeline.update_analysis_state(email_record, "classified")
             self._apply_analysis_and_act(email_record, stage2["analysis"], imap)
             return False
 
@@ -872,13 +789,13 @@ class EmailProcessor:
             sanitized = sanitize_error(e, debug=self.settings.debug)
             logger.error(f"Batch LLM analysis failed: {sanitized}")
             results = [
-                self.ai_service._fallback_classification(ed) for ed in email_data_list
+                self.ai_service.fallback_classification(ed) for ed in email_data_list
             ]
 
         for email_record, analysis in zip(email_records, results):
             try:
-                pipeline._update_analysis_state(email_record, "deep_analyzed")
-                pipeline._record_decision(
+                pipeline.update_analysis_state(email_record, "deep_analyzed")
+                pipeline.record_decision(
                     email_record,
                     "stage3_deep_analyzed",
                     {"stage": 3, "source": "llm_batch", "analysis": analysis},
@@ -1169,7 +1086,7 @@ class EmailProcessor:
             except Exception as e:
                 sanitized_error = sanitize_error(e, debug=self.settings.debug)
                 logger.error(f"AI analysis failed for {message_id}: {sanitized_error}")
-                analysis = self.ai_service._fallback_classification(email_data)
+                analysis = self.ai_service.fallback_classification(email_data)
 
         is_spam = self._classify_spam(email_data, analysis)
         action_required = analysis["action_required"]
@@ -1372,7 +1289,7 @@ class EmailProcessor:
         email_data: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Build an AI-style analysis dict from a ClassificationOverride rule."""
-        fallback = self.ai_service._fallback_classification(email_data)
+        fallback = self.ai_service.fallback_classification(email_data)
         return {
             "summary": fallback.get("summary", ""),
             "category": rule.category if rule.category else fallback["category"],
