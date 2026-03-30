@@ -358,16 +358,13 @@ def learn_reply_linkage(
         import re
         clean_subject = re.sub(r'^(Re|Fwd|Fw|AW|WG|Antwort|Weiterleitung)\s*:\s*', '', sent_email.subject, flags=re.IGNORECASE).strip()
         if clean_subject:
-            linked_email = (
-                db.query(ProcessedEmail)
-                .filter(
-                    ProcessedEmail.subject.ilike(f"%{clean_subject}%"),
-                    ProcessedEmail.id != sent_email.id,
-                    ProcessedEmail.date < sent_email.date if sent_email.date else True,
-                )
-                .order_by(ProcessedEmail.date.desc())
-                .first()
+            query_subj = db.query(ProcessedEmail).filter(
+                ProcessedEmail.subject.ilike(f"%{clean_subject}%"),
+                ProcessedEmail.id != sent_email.id,
             )
+            if sent_email.date:
+                query_subj = query_subj.filter(ProcessedEmail.date < sent_email.date)
+            linked_email = query_subj.order_by(ProcessedEmail.date.desc()).first()
             if linked_email:
                 linkage_method = "subject_heuristic"
 

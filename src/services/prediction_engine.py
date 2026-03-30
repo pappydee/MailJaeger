@@ -246,7 +246,7 @@ def _predict_reply_needed(db: Session, email: ProcessedEmail) -> Optional[EmailP
     return EmailPrediction(
         email_id=email.id,
         prediction_type="reply_needed",
-        predicted_value=str(best_probability >= 0.5),  # "True" or "False"
+        predicted_value=f"{best_probability:.2f}",
         confidence=best_probability,
         explanation=best_explanation,
         source_aggregate=pattern_source,
