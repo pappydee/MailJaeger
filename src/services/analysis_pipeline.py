@@ -421,6 +421,19 @@ class AnalysisPipeline:
                 created_at=datetime.utcnow(),
             )
             self.db.add(event)
+
+            # Learning hook: store classification context for future training
+            try:
+                from src.pipeline.learning import record_classification_context
+
+                record_classification_context(
+                    self.db,
+                    email,
+                    analysis,
+                    source=result.get("source", f"pipeline_stage{stage}"),
+                )
+            except Exception:
+                pass  # learning hooks must never break the pipeline
         except Exception as e:
             # Decision recording must never break the pipeline
             sanitized = sanitize_error(e, debug=self.settings.debug)

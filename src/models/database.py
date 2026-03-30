@@ -507,3 +507,43 @@ class AnalysisProgress(Base):
         Index("idx_progress_stage_status", "stage", "status"),
         Index("idx_progress_run", "run_id"),
     )
+
+
+class ProcessingJob(Base):
+    """Resumable processing job tracking for the pipeline.
+
+    Each job represents one invocation of a pipeline phase
+    (ingestion, analysis, or action execution) and persists
+    its progress so it can be resumed after interruption.
+    """
+
+    __tablename__ = "processing_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Job type: ingestion | analysis | action
+    job_type = Column(String(30), nullable=False, index=True)
+    run_id = Column(String(100), index=True)  # Optional link to ProcessingRun
+
+    # Status: running | paused | completed | partial | failed
+    status = Column(String(20), default="running", nullable=False, index=True)
+
+    # Progress tracking
+    last_processed_email_id = Column(Integer, nullable=True)
+    processed_count = Column(Integer, default=0)
+    failed_count = Column(Integer, default=0)
+
+    # Result statistics (JSON)
+    result_stats = Column(JSON, nullable=True)
+
+    # Error tracking
+    error_message = Column(Text, nullable=True)
+
+    # Timestamps
+    started_at = Column(DateTime, default=datetime.utcnow, index=True)
+    resumed_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("idx_job_type_status", "job_type", "status"),
+    )
