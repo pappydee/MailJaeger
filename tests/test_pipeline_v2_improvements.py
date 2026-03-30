@@ -106,15 +106,40 @@ class TestNoPrivateMethodAccess:
         assert hasattr(AnalysisPipeline, "apply_analysis_to_record")
         assert callable(getattr(AnalysisPipeline, "apply_analysis_to_record"))
 
-    def test_backward_compat_aliases_still_exist(self):
-        """Private aliases must still exist for backward compat."""
+    def test_transitional_aliases_removed(self):
+        """Transitional private aliases have been removed from AnalysisPipeline."""
         from src.services.analysis_pipeline import AnalysisPipeline
 
-        assert hasattr(AnalysisPipeline, "_stage1_pre_classify")
-        assert hasattr(AnalysisPipeline, "_stage2_rule_classify")
-        assert hasattr(AnalysisPipeline, "_record_decision")
-        assert hasattr(AnalysisPipeline, "_update_analysis_state")
-        assert hasattr(AnalysisPipeline, "_apply_analysis_to_record")
+        for name in (
+            "_stage1_pre_classify",
+            "_stage2_rule_classify",
+            "_stage3_llm_analyse",
+            "_record_decision",
+            "_update_analysis_state",
+            "_apply_analysis_to_record",
+        ):
+            assert not hasattr(AnalysisPipeline, name), (
+                f"Transitional alias {name} should have been removed"
+            )
+
+    def test_email_processor_uses_only_public_pipeline_api(self):
+        """EmailProcessor must not call any AnalysisPipeline private/transitional names."""
+        import inspect
+        from src.services.email_processor import EmailProcessor
+
+        source = inspect.getsource(EmailProcessor)
+        transitional_names = [
+            "._stage1_pre_classify",
+            "._stage2_rule_classify",
+            "._stage3_llm_analyse",
+            "._record_decision",
+            "._update_analysis_state",
+            "._apply_analysis_to_record",
+        ]
+        for name in transitional_names:
+            assert name not in source, (
+                f"EmailProcessor still references transitional alias {name}"
+            )
 
     def test_ai_service_has_public_fallback(self):
         """AIService must have a public fallback_classification method."""
@@ -590,14 +615,15 @@ class TestNoRemainingPrivateCoupling:
         assert "action_required" in result
         db.close()
 
-    def test_backward_compat_aliases_are_documented(self):
-        """Backward-compat aliases must have transitional documentation."""
+    def test_no_backward_compat_aliases_remain(self):
+        """All transitional backward-compat aliases have been removed."""
         from src.services import analysis_pipeline
 
         source = inspect.getsource(analysis_pipeline)
-        assert "transitional" in source.lower(), (
-            "Backward-compat alias section should document transitional status"
-        )
+        # The transitional alias block has been fully removed
+        assert "_stage1_pre_classify = stage1_pre_classify" not in source
+        assert "_record_decision = record_decision" not in source
+        assert "_update_analysis_state = update_analysis_state" not in source
 
 
 # =====================================================================

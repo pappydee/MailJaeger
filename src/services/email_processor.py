@@ -739,18 +739,18 @@ class EmailProcessor:
         pipeline = AnalysisPipeline(self.db)
 
         # Stage 1
-        stage1 = pipeline._stage1_pre_classify(email_record)
+        stage1 = pipeline.stage1_pre_classify(email_record)
         if stage1["confident"]:
-            pipeline._record_decision(email_record, "stage1_pre_classified", stage1)
-            pipeline._update_analysis_state(email_record, "pre_classified")
+            pipeline.record_decision(email_record, "stage1_pre_classified", stage1)
+            pipeline.update_analysis_state(email_record, "pre_classified")
             self._apply_analysis_and_act(email_record, stage1["analysis"], imap)
             return False
 
         # Stage 2
-        stage2 = pipeline._stage2_rule_classify(email_record)
+        stage2 = pipeline.stage2_rule_classify(email_record)
         if stage2["confident"]:
-            pipeline._record_decision(email_record, "stage2_classified", stage2)
-            pipeline._update_analysis_state(email_record, "classified")
+            pipeline.record_decision(email_record, "stage2_classified", stage2)
+            pipeline.update_analysis_state(email_record, "classified")
             self._apply_analysis_and_act(email_record, stage2["analysis"], imap)
             return False
 
@@ -794,8 +794,8 @@ class EmailProcessor:
 
         for email_record, analysis in zip(email_records, results):
             try:
-                pipeline._update_analysis_state(email_record, "deep_analyzed")
-                pipeline._record_decision(
+                pipeline.update_analysis_state(email_record, "deep_analyzed")
+                pipeline.record_decision(
                     email_record,
                     "stage3_deep_analyzed",
                     {"stage": 3, "source": "llm_batch", "analysis": analysis},

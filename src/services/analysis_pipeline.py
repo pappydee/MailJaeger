@@ -483,17 +483,3 @@ class AnalysisPipeline:
         progress.failed_count = stats.get("failed", 0)
         progress.llm_calls_used = stats.get("llm_calls", 0)
         self.db.commit()
-
-    # ------------------------------------------------------------------
-    # Backward-compatible aliases (transitional — will be removed)
-    #
-    # These exist solely so that legacy code (e.g. EmailProcessor,
-    # older tests) that references the private names still works.
-    # New code MUST use the public names above.
-    # ------------------------------------------------------------------
-    _stage1_pre_classify = stage1_pre_classify
-    _stage2_rule_classify = stage2_rule_classify
-    _stage3_llm_analyse = stage3_llm_analyse
-    _record_decision = record_decision
-    _update_analysis_state = update_analysis_state
-    _apply_analysis_to_record = apply_analysis_to_record
