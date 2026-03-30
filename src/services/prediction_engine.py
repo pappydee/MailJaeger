@@ -84,206 +84,133 @@ def generate_predictions(db: Session, email: ProcessedEmail) -> List[EmailPredic
 def _predict_folder(db: Session, email: ProcessedEmail) -> Optional[EmailPrediction]:
     """Predict the likely target folder for an email.
 
-    Uses FolderPlacementAggregate patterns in priority order:
-      1. sender_address (most specific)
+    Uses FolderPlacementAggregate patterns in strict priority order:
+      1. sender_address (most specific — always wins when sufficient)
       2. sender_domain
       3. category
       4. subject_keyword (least specific)
 
-    Returns the highest-confidence prediction that meets thresholds.
+    The first tier that meets thresholds wins.  More specific evidence
+    always takes precedence over less specific evidence regardless of
+    raw confidence scores.
     """
     sender = email.sender or ""
     domain = extract_sender_domain(sender)
     address = extract_sender_address(sender)
     category = email.category or ""
 
-    best_prediction = None
-    best_confidence = 0.0
-    best_explanation = ""
-    best_source_data = {}
-
-    # Try sender_address first (most specific)
+    # Strict precedence: try each tier in order, return the first that qualifies
+    tiers = []
     if address:
-        agg = _get_best_aggregate(db, "sender_address", address)
-        if agg and agg.confidence >= MIN_CONFIDENCE_FOLDER and agg.occurrence_count >= MIN_SAMPLES_FOLDER:
-            if agg.confidence > best_confidence:
-                best_confidence = agg.confidence
-                best_prediction = agg.target_folder
-                best_explanation = (
-                    f"Emails from {address} were placed in folder "
-                    f"'{agg.target_folder}' in {agg.occurrence_count}/{agg.total_for_pattern} cases "
-                    f"({agg.confidence:.0%} confidence)"
-                )
-                best_source_data = {
-                    "pattern_type": "sender_address",
-                    "pattern_value": address,
-                    "occurrence": agg.occurrence_count,
-                    "total": agg.total_for_pattern,
-                }
-
-    # Try sender_domain
+        tiers.append(("sender_address", address,
+                       lambda v: f"Emails from {v} were placed in folder"))
     if domain:
-        agg = _get_best_aggregate(db, "sender_domain", domain)
-        if agg and agg.confidence >= MIN_CONFIDENCE_FOLDER and agg.occurrence_count >= MIN_SAMPLES_FOLDER:
-            if agg.confidence > best_confidence:
-                best_confidence = agg.confidence
-                best_prediction = agg.target_folder
-                best_explanation = (
-                    f"Sender domain {domain} historically moved to folder "
-                    f"'{agg.target_folder}' in {agg.occurrence_count}/{agg.total_for_pattern} cases"
-                )
-                best_source_data = {
-                    "pattern_type": "sender_domain",
-                    "pattern_value": domain,
+        tiers.append(("sender_domain", domain,
+                       lambda v: f"Sender domain {v} historically moved to folder"))
+    if category:
+        tiers.append(("category", category,
+                       lambda v: f"Emails with category '{v}' were placed in folder"))
+    # Subject keywords (use first 3 significant keywords)
+    from src.services.folder_classifier import extract_subject_keywords
+    keywords = extract_subject_keywords(email.subject or "")
+    for kw in keywords[:3]:
+        tiers.append(("subject_keyword", kw,
+                       lambda v: f"Subject keyword '{v}' historically associated with folder"))
+
+    for pattern_type, pattern_value, explain_fn in tiers:
+        agg = _get_best_aggregate(db, pattern_type, pattern_value)
+        if (agg
+                and agg.confidence >= MIN_CONFIDENCE_FOLDER
+                and agg.occurrence_count >= MIN_SAMPLES_FOLDER):
+            explanation = (
+                f"{explain_fn(pattern_value)} "
+                f"'{agg.target_folder}' in {agg.occurrence_count}/{agg.total_for_pattern} cases "
+                f"({agg.confidence:.0%} confidence)"
+            )
+            return EmailPrediction(
+                email_id=email.id,
+                prediction_type="target_folder",
+                predicted_value=agg.target_folder,
+                confidence=agg.confidence,
+                explanation=explanation,
+                source_aggregate="folder_placement_aggregate",
+                source_data={
+                    "pattern_type": pattern_type,
+                    "pattern_value": pattern_value,
                     "occurrence": agg.occurrence_count,
                     "total": agg.total_for_pattern,
-                }
+                },
+                created_at=datetime.now(timezone.utc),
+            )
 
-    # Try category
-    if category and best_confidence < 0.8:  # only if we don't have a strong sender match
-        agg = _get_best_aggregate(db, "category", category)
-        if agg and agg.confidence >= MIN_CONFIDENCE_FOLDER and agg.occurrence_count >= MIN_SAMPLES_FOLDER:
-            if agg.confidence > best_confidence:
-                best_confidence = agg.confidence
-                best_prediction = agg.target_folder
-                best_explanation = (
-                    f"Emails with category '{category}' were placed in folder "
-                    f"'{agg.target_folder}' in {agg.occurrence_count}/{agg.total_for_pattern} cases"
-                )
-                best_source_data = {
-                    "pattern_type": "category",
-                    "pattern_value": category,
-                    "occurrence": agg.occurrence_count,
-                    "total": agg.total_for_pattern,
-                }
-
-    if not best_prediction:
-        return None
-
-    return EmailPrediction(
-        email_id=email.id,
-        prediction_type="target_folder",
-        predicted_value=best_prediction,
-        confidence=best_confidence,
-        explanation=best_explanation,
-        source_aggregate="folder_placement_aggregate",
-        source_data=best_source_data,
-        created_at=datetime.now(timezone.utc),
-    )
+    return None
 
 
 def _predict_reply_needed(db: Session, email: ProcessedEmail) -> Optional[EmailPrediction]:
     """Predict whether an email is likely to need a reply.
 
-    Uses ReplyPattern aggregates for sender_domain and category.
+    Uses ReplyPattern aggregates in strict priority order:
+      1. sender_address (most specific — always wins when sufficient)
+      2. sender_domain
+      3. category
+
+    The first tier that meets thresholds wins.
     """
     sender = email.sender or ""
     domain = extract_sender_domain(sender)
     address = extract_sender_address(sender)
     category = email.category or ""
 
-    best_probability = 0.0
-    best_explanation = ""
-    best_source_data = {}
-    pattern_source = ""
-
-    # Check sender_address reply pattern first (most specific)
+    # Build tiers in strict precedence order
+    tiers = []
     if address:
-        pattern = (
-            db.query(ReplyPattern)
-            .filter(ReplyPattern.pattern_type == "sender_address", ReplyPattern.pattern_value == address)
-            .first()
-        )
-        if pattern and (pattern.total_received or 0) >= MIN_SAMPLES_REPLY:
-            prob = pattern.reply_probability or 0.0
-            if prob > best_probability:
-                best_probability = prob
-                delay_info = ""
-                if pattern.avg_reply_delay_seconds:
-                    hours = pattern.avg_reply_delay_seconds / 3600
-                    delay_info = f", avg reply delay {hours:.1f}h"
-                best_explanation = (
-                    f"Emails from {address} were replied to in "
-                    f"{pattern.total_replied}/{pattern.total_received} historical cases "
-                    f"({prob:.0%}){delay_info}"
-                )
-                best_source_data = {
-                    "pattern_type": "sender_address",
-                    "pattern_value": address,
-                    "total_received": pattern.total_received,
-                    "total_replied": pattern.total_replied,
-                    "reply_probability": prob,
-                    "avg_delay_seconds": pattern.avg_reply_delay_seconds,
-                }
-                pattern_source = "reply_pattern"
-
-    # Check sender_domain reply pattern
+        tiers.append(("sender_address", address,
+                       lambda v: f"Emails from {v}"))
     if domain:
+        tiers.append(("sender_domain", domain,
+                       lambda v: f"Emails from domain {v}"))
+    if category:
+        tiers.append(("category", category,
+                       lambda v: f"Emails in category '{v}'"))
+
+    for pattern_type, pattern_value, explain_fn in tiers:
         pattern = (
             db.query(ReplyPattern)
-            .filter(ReplyPattern.pattern_type == "sender_domain", ReplyPattern.pattern_value == domain)
+            .filter(ReplyPattern.pattern_type == pattern_type,
+                    ReplyPattern.pattern_value == pattern_value)
             .first()
         )
         if pattern and (pattern.total_received or 0) >= MIN_SAMPLES_REPLY:
             prob = pattern.reply_probability or 0.0
-            if prob > best_probability:
-                best_probability = prob
+            if prob >= MIN_CONFIDENCE_REPLY:
                 delay_info = ""
                 if pattern.avg_reply_delay_seconds:
                     hours = pattern.avg_reply_delay_seconds / 3600
                     delay_info = f", avg reply delay {hours:.1f}h"
-                best_explanation = (
-                    f"Emails from domain {domain} were replied to in "
+                explanation = (
+                    f"{explain_fn(pattern_value)} were replied to in "
                     f"{pattern.total_replied}/{pattern.total_received} historical cases "
                     f"({prob:.0%}){delay_info}"
                 )
-                best_source_data = {
-                    "pattern_type": "sender_domain",
-                    "pattern_value": domain,
-                    "total_received": pattern.total_received,
-                    "total_replied": pattern.total_replied,
-                    "reply_probability": prob,
-                    "avg_delay_seconds": pattern.avg_reply_delay_seconds,
-                }
-                pattern_source = "reply_pattern"
-
-    # Check category reply pattern
-    if category:
-        pattern = (
-            db.query(ReplyPattern)
-            .filter(ReplyPattern.pattern_type == "category", ReplyPattern.pattern_value == category)
-            .first()
-        )
-        if pattern and (pattern.total_received or 0) >= MIN_SAMPLES_REPLY:
-            prob = pattern.reply_probability or 0.0
-            if prob > best_probability:
-                best_probability = prob
-                best_explanation = (
-                    f"Emails in category '{category}' were replied to in "
-                    f"{pattern.total_replied}/{pattern.total_received} historical cases ({prob:.0%})"
+                return EmailPrediction(
+                    email_id=email.id,
+                    prediction_type="reply_needed",
+                    predicted_value=f"{prob:.2f}",
+                    confidence=prob,
+                    explanation=explanation,
+                    source_aggregate="reply_pattern",
+                    source_data={
+                        "pattern_type": pattern_type,
+                        "pattern_value": pattern_value,
+                        "total_received": pattern.total_received,
+                        "total_replied": pattern.total_replied,
+                        "reply_probability": prob,
+                        "avg_delay_seconds": pattern.avg_reply_delay_seconds,
+                    },
+                    created_at=datetime.now(timezone.utc),
                 )
-                best_source_data = {
-                    "pattern_type": "category",
-                    "pattern_value": category,
-                    "total_received": pattern.total_received,
-                    "total_replied": pattern.total_replied,
-                    "reply_probability": prob,
-                }
-                pattern_source = "reply_pattern"
 
-    if best_probability < MIN_CONFIDENCE_REPLY:
-        return None
-
-    return EmailPrediction(
-        email_id=email.id,
-        prediction_type="reply_needed",
-        predicted_value=f"{best_probability:.2f}",
-        confidence=best_probability,
-        explanation=best_explanation,
-        source_aggregate=pattern_source,
-        source_data=best_source_data,
-        created_at=datetime.now(timezone.utc),
-    )
+    return None
 
 
 def _predict_importance_boost(db: Session, email: ProcessedEmail) -> Optional[EmailPrediction]:

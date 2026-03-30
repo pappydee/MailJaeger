@@ -1079,3 +1079,286 @@ class TestPredictionPrecedence:
         assert imp_pred is not None
         assert imp_pred.confidence > 0
         assert "reply rate" in imp_pred.explanation or "important" in imp_pred.explanation
+
+
+# ===========================================================================
+# 13. Strict Precedence Tests (address MUST beat domain even with lower confidence)
+# ===========================================================================
+
+class TestStrictPrecedence:
+    """Verify that more specific signals always win regardless of raw confidence."""
+
+    def test_folder_address_beats_domain_even_with_lower_confidence(self, db):
+        """sender_address with lower confidence must still beat sender_domain."""
+        # Domain aggregate: high confidence
+        db.add(FolderPlacementAggregate(
+            pattern_type="sender_domain", pattern_value="corp.com",
+            target_folder="Archive", occurrence_count=10, total_for_pattern=12,
+            confidence=0.83,
+        ))
+        # Address aggregate: lower confidence but meets thresholds
+        db.add(FolderPlacementAggregate(
+            pattern_type="sender_address", pattern_value="ceo@corp.com",
+            target_folder="VIP", occurrence_count=3, total_for_pattern=5,
+            confidence=0.6,
+        ))
+        db.commit()
+
+        email = _make_email(db, message_id="strict-fp@test.com",
+                            sender="ceo@corp.com", folder="INBOX")
+        from src.services.prediction_engine import generate_predictions
+        preds = generate_predictions(db, email)
+        db.commit()
+
+        fp = next((p for p in preds if p.prediction_type == "target_folder"), None)
+        assert fp is not None
+        assert fp.predicted_value == "VIP", "address must win over domain"
+        assert fp.source_data["pattern_type"] == "sender_address"
+
+    def test_folder_domain_beats_category(self, db):
+        """sender_domain must win over category even with lower confidence."""
+        db.add(FolderPlacementAggregate(
+            pattern_type="category", pattern_value="Finance",
+            target_folder="Bills", occurrence_count=20, total_for_pattern=25,
+            confidence=0.8,
+        ))
+        db.add(FolderPlacementAggregate(
+            pattern_type="sender_domain", pattern_value="bank.com",
+            target_folder="Banking", occurrence_count=3, total_for_pattern=5,
+            confidence=0.6,
+        ))
+        db.commit()
+
+        email = _make_email(db, message_id="strict-dc@test.com",
+                            sender="info@bank.com", folder="INBOX",
+                            category="Finance")
+        from src.services.prediction_engine import generate_predictions
+        preds = generate_predictions(db, email)
+        db.commit()
+
+        fp = next((p for p in preds if p.prediction_type == "target_folder"), None)
+        assert fp is not None
+        assert fp.predicted_value == "Banking", "domain must win over category"
+        assert fp.source_data["pattern_type"] == "sender_domain"
+
+    def test_folder_subject_keyword_used_as_fallback(self, db):
+        """subject_keyword is used when no sender/category data exists."""
+        db.add(FolderPlacementAggregate(
+            pattern_type="subject_keyword", pattern_value="invoice",
+            target_folder="Rechnungen", occurrence_count=8, total_for_pattern=10,
+            confidence=0.8,
+        ))
+        db.commit()
+
+        email = _make_email(db, message_id="strict-kw@test.com",
+                            sender="unknown@nowhere.org", folder="INBOX",
+                            subject="Your invoice #1234", category="")
+        from src.services.prediction_engine import generate_predictions
+        preds = generate_predictions(db, email)
+        db.commit()
+
+        fp = next((p for p in preds if p.prediction_type == "target_folder"), None)
+        assert fp is not None
+        assert fp.predicted_value == "Rechnungen"
+        assert fp.source_data["pattern_type"] == "subject_keyword"
+
+    def test_reply_needed_address_beats_domain(self, db):
+        """sender_address reply pattern must win over sender_domain."""
+        # Domain pattern: high probability
+        db.add(ReplyPattern(
+            pattern_type="sender_domain", pattern_value="team.io",
+            total_received=20, total_replied=18,
+            reply_probability=0.9,
+        ))
+        # Address pattern: lower probability but still meets threshold
+        db.add(ReplyPattern(
+            pattern_type="sender_address", pattern_value="noreply@team.io",
+            total_received=10, total_replied=4,
+            reply_probability=0.4,
+        ))
+        db.commit()
+
+        email = _make_email(db, message_id="strict-rn@test.com",
+                            sender="noreply@team.io", folder="INBOX")
+        from src.services.prediction_engine import generate_predictions
+        preds = generate_predictions(db, email)
+        db.commit()
+
+        rp = next((p for p in preds if p.prediction_type == "reply_needed"), None)
+        assert rp is not None
+        assert rp.source_data["pattern_type"] == "sender_address", \
+            "address reply pattern must win over domain"
+        assert rp.source_data["reply_probability"] == 0.4
+
+    def test_reply_needed_domain_beats_category(self, db):
+        """sender_domain reply pattern must win over category."""
+        db.add(ReplyPattern(
+            pattern_type="category", pattern_value="Support",
+            total_received=50, total_replied=45,
+            reply_probability=0.9,
+        ))
+        db.add(ReplyPattern(
+            pattern_type="sender_domain", pattern_value="help.io",
+            total_received=10, total_replied=4,
+            reply_probability=0.4,
+        ))
+        db.commit()
+
+        email = _make_email(db, message_id="strict-rn2@test.com",
+                            sender="bot@help.io", folder="INBOX",
+                            category="Support")
+        from src.services.prediction_engine import generate_predictions
+        preds = generate_predictions(db, email)
+        db.commit()
+
+        rp = next((p for p in preds if p.prediction_type == "reply_needed"), None)
+        assert rp is not None
+        assert rp.source_data["pattern_type"] == "sender_domain", \
+            "domain reply pattern must win over category"
+
+    def test_importance_boost_uses_address_profile_first(self, db):
+        """importance_boost must use address-level profile when available."""
+        # Domain profile: lower signals
+        db.add(SenderProfile(
+            sender_domain="mixed.org", sender_address=None,
+            total_emails=20, reply_rate=0.1, total_replies=2,
+            importance_tendency=0.05, marked_important_count=1,
+            spam_tendency=0.0, marked_spam_count=0,
+            kept_in_inbox_count=2,
+            folder_distribution={"INBOX": 20},
+            first_seen=datetime.now(timezone.utc),
+            last_seen=datetime.now(timezone.utc),
+        ))
+        # Address profile: strong signals
+        db.add(SenderProfile(
+            sender_domain="mixed.org", sender_address="boss@mixed.org",
+            total_emails=15, reply_rate=0.8, total_replies=12,
+            importance_tendency=0.4, marked_important_count=6,
+            spam_tendency=0.0, marked_spam_count=0,
+            kept_in_inbox_count=12,
+            folder_distribution={"INBOX": 15},
+            first_seen=datetime.now(timezone.utc),
+            last_seen=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        email = _make_email(db, message_id="strict-imp@test.com",
+                            sender="boss@mixed.org", folder="INBOX")
+        from src.services.prediction_engine import generate_predictions
+        preds = generate_predictions(db, email)
+        db.commit()
+
+        imp = next((p for p in preds if p.prediction_type == "importance_boost"), None)
+        assert imp is not None
+        assert "boss@mixed.org" in imp.explanation, \
+            "explanation must mention address profile, not domain"
+        assert imp.source_data["profile_key"] == "boss@mixed.org"
+
+
+# ===========================================================================
+# 14. Address/Domain Profile Isolation
+# ===========================================================================
+
+class TestProfileIsolation:
+    """Verify domain-only queries don't pick up address profiles."""
+
+    def test_domain_query_excludes_address_profiles(self, db):
+        """Querying for domain-level profile must not return address profiles."""
+        from src.services.historical_learning import learn_from_email
+
+        email = _make_email(db, sender="alice@example.com", folder="Work")
+        learn_from_email(db, email)
+        db.commit()
+
+        # Domain-only query must return exactly one row with sender_address IS NULL
+        domain_profiles = db.query(SenderProfile).filter(
+            SenderProfile.sender_domain == "example.com",
+            SenderProfile.sender_address.is_(None),
+        ).all()
+        assert len(domain_profiles) == 1
+        assert domain_profiles[0].sender_address is None
+
+        # Address query must return a separate row
+        addr_profiles = db.query(SenderProfile).filter(
+            SenderProfile.sender_address == "alice@example.com",
+        ).all()
+        assert len(addr_profiles) == 1
+        assert addr_profiles[0].sender_address == "alice@example.com"
+
+    def test_multiple_addresses_same_domain_separate_profiles(self, db):
+        """Different addresses at same domain get separate profiles."""
+        from src.services.historical_learning import learn_from_email
+
+        e1 = _make_email(db, message_id="iso1@test.com", sender="a@dom.com", folder="INBOX")
+        e2 = _make_email(db, message_id="iso2@test.com", sender="b@dom.com", folder="Work")
+        learn_from_email(db, e1)
+        learn_from_email(db, e2)
+        db.commit()
+
+        # Two address profiles
+        addr_count = db.query(SenderProfile).filter(
+            SenderProfile.sender_address.isnot(None),
+            SenderProfile.sender_domain == "dom.com",
+        ).count()
+        assert addr_count == 2
+
+        # One domain profile
+        domain_count = db.query(SenderProfile).filter(
+            SenderProfile.sender_domain == "dom.com",
+            SenderProfile.sender_address.is_(None),
+        ).count()
+        assert domain_count == 1
+
+        # Domain profile has total_emails == 2
+        dp = db.query(SenderProfile).filter(
+            SenderProfile.sender_domain == "dom.com",
+            SenderProfile.sender_address.is_(None),
+        ).first()
+        assert dp.total_emails == 2
+
+
+# ===========================================================================
+# 15. Reply Profile Update Propagation
+# ===========================================================================
+
+class TestReplyProfilePropagation:
+    """Verify reply learning updates address-level SenderProfile."""
+
+    def test_reply_updates_address_level_profile(self, db):
+        """learn_reply_linkage must update both domain and address profiles."""
+        from src.services.historical_learning import learn_from_email, learn_reply_linkage
+
+        now = datetime.now(timezone.utc)
+        incoming = _make_email(
+            db, message_id="rp-in@test.com",
+            sender="client@clientcorp.com", folder="INBOX",
+            thread_id="rp-thread", date=now - timedelta(hours=1),
+        )
+        # Pre-learn the incoming email to create profiles
+        learn_from_email(db, incoming)
+        db.commit()
+
+        sent = _make_email(
+            db, message_id="rp-out@test.com",
+            sender="me@mymail.com", folder="Sent",
+            thread_id="rp-thread", date=now,
+        )
+        learn_reply_linkage(db, sent)
+        db.commit()
+
+        # Domain profile should have reply stats
+        dp = db.query(SenderProfile).filter(
+            SenderProfile.sender_domain == "clientcorp.com",
+            SenderProfile.sender_address.is_(None),
+        ).first()
+        assert dp is not None
+        assert (dp.total_replies or 0) >= 1
+        assert (dp.reply_rate or 0) > 0
+
+        # Address profile should also have reply stats
+        ap = db.query(SenderProfile).filter(
+            SenderProfile.sender_address == "client@clientcorp.com",
+        ).first()
+        assert ap is not None
+        assert (ap.total_replies or 0) >= 1
+        assert (ap.reply_rate or 0) > 0

@@ -415,9 +415,10 @@ def learn_reply_linkage(
     if original_address:
         _update_reply_pattern(db, "sender_address", original_address, reply_delay_seconds)
 
-    # Update sender profile reply stats
+    # Update sender profile reply stats (both domain and address levels)
     if original_domain:
-        _update_sender_profile_reply(db, original_domain, reply_delay_seconds)
+        _update_sender_profile_reply(db, original_domain, reply_delay_seconds,
+                                     address=original_address)
 
     # Persist durable reply link (deduplicated by unique constraint)
     _confidence_map = {"thread_id": 0.9, "subject_heuristic": 0.4}
@@ -516,9 +517,11 @@ def _update_delay_stats(pattern: ReplyPattern, delay_seconds: float) -> None:
 
 
 def _update_sender_profile_reply(
-    db: Session, domain: str, reply_delay_seconds: Optional[float]
+    db: Session, domain: str, reply_delay_seconds: Optional[float],
+    address: Optional[str] = None,
 ) -> None:
-    """Update SenderProfile reply statistics."""
+    """Update SenderProfile reply statistics for both domain and address levels."""
+    # Update domain-level profile
     profile = (
         db.query(SenderProfile)
         .filter(
@@ -527,9 +530,24 @@ def _update_sender_profile_reply(
         )
         .first()
     )
-    if not profile:
-        return  # Profile should exist from email learning; skip if not
+    if profile:
+        _apply_reply_stats(profile, reply_delay_seconds)
+        db.add(profile)
 
+    # Update address-level profile if available
+    if address:
+        addr_profile = (
+            db.query(SenderProfile)
+            .filter(SenderProfile.sender_address == address)
+            .first()
+        )
+        if addr_profile:
+            _apply_reply_stats(addr_profile, reply_delay_seconds)
+            db.add(addr_profile)
+
+
+def _apply_reply_stats(profile: SenderProfile, reply_delay_seconds: Optional[float]) -> None:
+    """Apply reply statistics to a SenderProfile (domain or address level)."""
     profile.total_replies = (profile.total_replies or 0) + 1
     total = profile.total_emails or 1
     profile.reply_rate = (profile.total_replies or 0) / total
@@ -540,8 +558,6 @@ def _update_sender_profile_reply(
         profile.avg_reply_delay_seconds = old_avg + (reply_delay_seconds - old_avg) / n
         # Approximate median
         profile.median_reply_delay_seconds = profile.avg_reply_delay_seconds
-
-    db.add(profile)
 
 
 def _persist_reply_link(
@@ -588,7 +604,7 @@ def update_reply_pattern_totals(db: Session) -> int:
     """Update total_received counts in ReplyPattern from actual email counts.
 
     Should be called after a full historical scan to ensure reply_probability
-    is accurate.
+    is accurate.  Handles sender_domain, sender_address, and category tiers.
 
     Returns:
         Number of patterns updated.
@@ -613,6 +629,35 @@ def update_reply_pattern_totals(db: Session) -> int:
         pattern = (
             db.query(ReplyPattern)
             .filter(ReplyPattern.pattern_type == "sender_domain", ReplyPattern.pattern_value == domain_val)
+            .first()
+        )
+        if pattern:
+            pattern.total_received = count
+            if count > 0:
+                pattern.reply_probability = (pattern.total_replied or 0) / count
+            db.add(pattern)
+            updated += 1
+
+    # Update sender_address patterns
+    address_counts = (
+        db.query(
+            func.lower(ProcessedEmail.sender),
+            func.count(ProcessedEmail.id),
+        )
+        .filter(ProcessedEmail.sender.ilike("%@%"))
+        .group_by(func.lower(ProcessedEmail.sender))
+        .all()
+    )
+    for addr_val, count in address_counts:
+        if not addr_val:
+            continue
+        # Normalize: extract bare address from "Name <addr>" format
+        addr_clean = extract_sender_address(addr_val)
+        if not addr_clean:
+            continue
+        pattern = (
+            db.query(ReplyPattern)
+            .filter(ReplyPattern.pattern_type == "sender_address", ReplyPattern.pattern_value == addr_clean)
             .first()
         )
         if pattern:
