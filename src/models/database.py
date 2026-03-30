@@ -547,3 +547,236 @@ class ProcessingJob(Base):
     __table_args__ = (
         Index("idx_job_type_status", "job_type", "status"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Historical Learning Layer models
+# ---------------------------------------------------------------------------
+
+
+class UserActionEvent(Base):
+    """Structured user action events for behavioral learning.
+
+    Captures: moved_to_folder, archived, deleted, kept_in_inbox,
+    replied, forwarded, marked_important, marked_spam, unmarked_spam.
+    """
+
+    __tablename__ = "user_action_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email_id = Column(Integer, ForeignKey("processed_emails.id"), nullable=False)
+    thread_id = Column(String(200), index=True)
+
+    # Action details
+    action_type = Column(String(50), nullable=False, index=True)
+    old_folder = Column(String(200))
+    new_folder = Column(String(200))
+
+    # Context for learning
+    sender = Column(String(200), index=True)
+    sender_domain = Column(String(200), index=True)
+    category = Column(String(50))
+    subject_snippet = Column(String(200))  # first ~200 chars for pattern matching
+
+    # Source tracking
+    source = Column(
+        String(50), default="user", index=True
+    )  # user/manual/system/imported-history
+
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    # Relationships
+    email = relationship("ProcessedEmail", backref="user_action_events")
+
+    __table_args__ = (
+        Index("idx_uae_sender_domain_action", "sender_domain", "action_type"),
+        Index("idx_uae_action_created", "action_type", "created_at"),
+    )
+
+
+class SenderProfile(Base):
+    """Aggregated sender/domain profile for deterministic prediction.
+
+    Incrementally updated from historical placement + user actions.
+    """
+
+    __tablename__ = "sender_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Sender identification (one of these is set)
+    sender_address = Column(String(200), index=True, unique=True, nullable=True)
+    sender_domain = Column(String(200), index=True, nullable=True)
+
+    # Folder placement stats
+    total_emails = Column(Integer, default=0)
+    typical_folder = Column(String(200))  # most common folder
+    folder_distribution = Column(JSON)  # {"INBOX": 5, "Rechnungen": 18, ...}
+
+    # Reply behavior
+    total_replies = Column(Integer, default=0)
+    reply_rate = Column(Float, default=0.0)  # replied / total
+    avg_reply_delay_seconds = Column(Float)  # average delay before reply
+    median_reply_delay_seconds = Column(Float)
+
+    # Importance / spam signals
+    importance_tendency = Column(
+        Float, default=0.0
+    )  # 0.0 = neutral, >0 = important, <0 = unimportant
+    spam_tendency = Column(
+        Float, default=0.0
+    )  # 0.0 = not spam, 1.0 = always spam
+    marked_important_count = Column(Integer, default=0)
+    marked_spam_count = Column(Integer, default=0)
+
+    # Action statistics
+    archived_count = Column(Integer, default=0)
+    deleted_count = Column(Integer, default=0)
+    kept_in_inbox_count = Column(Integer, default=0)
+
+    # Timestamps
+    first_seen = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (Index("idx_sp_domain", "sender_domain"),)
+
+
+class FolderPlacementAggregate(Base):
+    """Aggregated folder placement patterns for prediction.
+
+    Tracks: sender/domain -> folder, subject_keyword -> folder,
+    category -> folder, recipient -> folder patterns with confidence.
+    """
+
+    __tablename__ = "folder_placement_aggregates"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Pattern type: sender_domain, sender_address, subject_keyword, category, recipient
+    pattern_type = Column(String(50), nullable=False, index=True)
+    pattern_value = Column(String(300), nullable=False, index=True)
+
+    # Target folder + stats
+    target_folder = Column(String(200), nullable=False)
+    occurrence_count = Column(Integer, default=1)
+    total_for_pattern = Column(
+        Integer, default=1
+    )  # total emails matching pattern across all folders
+    confidence = Column(Float, default=0.0)  # occurrence_count / total_for_pattern
+
+    # Timestamps
+    first_seen = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_fpa_pattern", "pattern_type", "pattern_value"),
+        Index("idx_fpa_confidence", "confidence"),
+    )
+
+
+class ReplyPattern(Base):
+    """Aggregated reply behavior for prediction.
+
+    Tracks reply probability and delay per sender/domain/category.
+    """
+
+    __tablename__ = "reply_patterns"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Pattern identification
+    pattern_type = Column(
+        String(50), nullable=False, index=True
+    )  # sender_domain, sender_address, category
+    pattern_value = Column(String(300), nullable=False, index=True)
+
+    # Reply statistics
+    total_received = Column(Integer, default=0)
+    total_replied = Column(Integer, default=0)
+    reply_probability = Column(Float, default=0.0)
+
+    # Delay statistics (seconds)
+    avg_reply_delay_seconds = Column(Float)
+    median_reply_delay_seconds = Column(Float)
+    min_reply_delay_seconds = Column(Float)
+    max_reply_delay_seconds = Column(Float)
+
+    # Timestamps
+    first_seen = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (Index("idx_rp_pattern", "pattern_type", "pattern_value"),)
+
+
+class EmailPrediction(Base):
+    """Internal predictions stored for each email.
+
+    Predictions are stored but NOT auto-executed.
+    Each prediction includes an explanation/reason.
+    """
+
+    __tablename__ = "email_predictions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email_id = Column(
+        Integer, ForeignKey("processed_emails.id"), nullable=False, index=True
+    )
+
+    # Prediction type: target_folder, reply_needed, importance_boost
+    prediction_type = Column(String(50), nullable=False, index=True)
+    predicted_value = Column(String(300))
+    confidence = Column(Float, default=0.0)
+
+    # Explanation (human-readable)
+    explanation = Column(Text)
+
+    # Source aggregates used
+    source_aggregate = Column(
+        String(100)
+    )  # e.g. "sender_profile", "folder_pattern", "reply_pattern"
+    source_data = Column(JSON)  # snapshot of data used for prediction
+
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    # Relationships
+    email = relationship("ProcessedEmail", backref="predictions")
+
+    __table_args__ = (Index("idx_ep_email_type", "email_id", "prediction_type"),)
+
+
+class HistoricalLearningProgress(Base):
+    """Track progress of the historical mailbox learning scan.
+
+    Supports pause/resume across folders. Each row tracks one folder's
+    learning progress.
+    """
+
+    __tablename__ = "historical_learning_progress"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Folder being scanned
+    folder_name = Column(String(200), nullable=False, index=True)
+    folder_type = Column(String(50))  # inbox/archive/spam/trash/sent/custom
+
+    # Progress
+    status = Column(
+        String(20), default="pending", index=True
+    )  # pending/running/paused/completed/failed
+    last_processed_email_id = Column(Integer)
+    processed_count = Column(Integer, default=0)
+    total_estimated = Column(Integer)
+    failed_count = Column(Integer, default=0)
+
+    # Timestamps
+    started_at = Column(DateTime)
+    paused_at = Column(DateTime)
+    resumed_at = Column(DateTime)
+    completed_at = Column(DateTime)
+
+    __table_args__ = (
+        Index("idx_hlp_folder_status", "folder_name", "status"),
+    )
