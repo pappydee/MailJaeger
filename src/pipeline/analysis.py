@@ -190,6 +190,9 @@ def run_analysis(
         # Post-analysis enrichment: generate learned predictions for processed emails
         _enrich_batch_with_predictions(db, batch, needs_llm)
 
+        # Consume persisted predictions as internal signals for processed emails
+        _apply_prediction_hints(db, batch, needs_llm)
+
     logger.info(
         "analysis_complete analysed=%s failed=%s llm_calls=%s",
         stats["analysed"],
@@ -222,3 +225,90 @@ def _enrich_batch_with_predictions(
         db.commit()
     except Exception as exc:
         logger.warning("Failed to enrich batch with predictions: %s", exc)
+
+
+def _apply_prediction_hints(
+    db: Session,
+    batch: List[ProcessedEmail],
+    needs_llm: List[ProcessedEmail],
+) -> None:
+    """Consume persisted EmailPrediction records as internal signals.
+
+    Called after ``_enrich_batch_with_predictions``.  Reads back stored
+    predictions and applies them as soft hints on the ProcessedEmail rows:
+
+      - **target_folder**: backfills ``suggested_folder`` when analysis did
+        not set one (does NOT override explicit analysis results).
+      - **reply_needed**: sets ``action_required = True`` when analysis left
+        it unset and the learned signal shows high reply likelihood.
+      - **importance_boost**: adjusts ``importance_score`` upward when
+        learned behavior indicates importance (does NOT replace the
+        existing score — only augments it).
+
+    This is the single downstream integration point where persisted
+    predictions are consumed in the operational pipeline.
+    """
+    try:
+        from src.models.database import EmailPrediction
+
+        all_emails = set(batch) | set(needs_llm)
+        for email_record in all_emails:
+            if email_record.analysis_state in ("failed", "pending"):
+                continue
+
+            predictions = (
+                db.query(EmailPrediction)
+                .filter(EmailPrediction.email_id == email_record.id)
+                .all()
+            )
+            for pred in predictions:
+                if pred.prediction_type == "target_folder" and pred.predicted_value:
+                    # Backfill suggested_folder only when analysis did not set one
+                    if not email_record.suggested_folder:
+                        email_record.suggested_folder = pred.predicted_value
+                        logger.debug(
+                            "hint_applied email_id=%s type=target_folder value=%s",
+                            email_record.id,
+                            pred.predicted_value,
+                        )
+
+                elif pred.prediction_type == "reply_needed":
+                    # If analysis did not flag action_required but learned
+                    # signal indicates high reply probability, set it.
+                    confidence = pred.confidence or 0.0
+                    if not email_record.action_required and confidence >= 0.5:
+                        email_record.action_required = True
+                        # Preserve explanation in reasoning (append, not overwrite)
+                        hint_reason = f"[learned] {pred.explanation or 'reply likely'}"
+                        if email_record.reasoning:
+                            email_record.reasoning += f"; {hint_reason}"
+                        else:
+                            email_record.reasoning = hint_reason
+                        logger.debug(
+                            "hint_applied email_id=%s type=reply_needed conf=%.2f",
+                            email_record.id,
+                            confidence,
+                        )
+
+                elif pred.prediction_type == "importance_boost":
+                    # Augment importance_score with learned signal only when
+                    # importance scoring has not already incorporated it
+                    # (importance_scorer._learned_behavior_boost reads
+                    # SenderProfile directly, so only backfill if score is
+                    # absent).
+                    boost_value = pred.confidence or 0.0
+                    if boost_value > 0 and email_record.importance_score is None:
+                        # Scale: prediction confidence 0-1 → up to +10 points
+                        adjustment = min(10.0, boost_value * 10.0)
+                        email_record.importance_score = 30.0 + adjustment  # neutral baseline + boost
+                        logger.debug(
+                            "hint_applied email_id=%s type=importance_boost adj=+%.1f",
+                            email_record.id,
+                            adjustment,
+                        )
+
+            db.add(email_record)
+
+        db.commit()
+    except Exception as exc:
+        logger.warning("Failed to apply prediction hints: %s", exc)
