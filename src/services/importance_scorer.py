@@ -13,7 +13,7 @@ Higher score → higher priority → processed first.
 This module has no side effects and does not depend on EmailProcessor.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Tuple
 from sqlalchemy.orm import Session
 
@@ -87,7 +87,7 @@ def compute_importance_score(
     try:
         if email_record.received_at or email_record.date:
             ts = email_record.received_at or email_record.date
-            age_hours = (datetime.utcnow() - ts).total_seconds() / 3600
+            age_hours = (datetime.now(timezone.utc).replace(tzinfo=None) - ts).total_seconds() / 3600
             if age_hours <= 24:
                 score += 20
             elif age_hours <= 48:
