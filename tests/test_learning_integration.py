@@ -599,10 +599,10 @@ class TestApplyActionToProfile:
 # ===========================================================================
 
 class TestLearnedProfilePrecedence:
-    """_get_learned_profile must prefer address-level over domain-level."""
+    """resolve_sender_profile must prefer address-level over domain-level."""
 
     def test_returns_address_profile_when_available(self, db):
-        from src.services.importance_scorer import _get_learned_profile
+        from src.services.sender_precedence import resolve_sender_profile
 
         # Domain profile
         db.add(SenderProfile(
@@ -624,12 +624,12 @@ class TestLearnedProfilePrecedence:
         ))
         db.commit()
 
-        profile = _get_learned_profile(db, address="ceo@prec.com", domain="prec.com")
+        profile = resolve_sender_profile(db, "ceo@prec.com", min_support=3)
         assert profile is not None
         assert profile.sender_address == "ceo@prec.com"
 
     def test_falls_back_to_domain_when_address_insufficient(self, db):
-        from src.services.importance_scorer import _get_learned_profile
+        from src.services.sender_precedence import resolve_sender_profile
 
         # Domain profile with enough support
         db.add(SenderProfile(
@@ -651,15 +651,15 @@ class TestLearnedProfilePrecedence:
         ))
         db.commit()
 
-        profile = _get_learned_profile(db, address="new@fallback.com", domain="fallback.com")
+        profile = resolve_sender_profile(db, "new@fallback.com", min_support=3)
         assert profile is not None
         assert profile.sender_address is None  # domain fallback
         assert profile.sender_domain == "fallback.com"
 
     def test_returns_none_when_no_profiles(self, db):
-        from src.services.importance_scorer import _get_learned_profile
+        from src.services.sender_precedence import resolve_sender_profile
 
-        profile = _get_learned_profile(db, address="ghost@nowhere.com", domain="nowhere.com")
+        profile = resolve_sender_profile(db, "ghost@nowhere.com", min_support=3)
         assert profile is None
 
 
@@ -683,6 +683,13 @@ class TestSourceInspectionWiring:
         from src.services import importance_scorer
         source = inspect.getsource(importance_scorer.compute_importance_score)
         assert "_learned_behavior_boost" in source
+
+    def test_importance_scorer_uses_centralized_precedence(self):
+        """_learned_behavior_boost must delegate to sender_precedence module."""
+        import inspect
+        from src.services import importance_scorer
+        source = inspect.getsource(importance_scorer._learned_behavior_boost)
+        assert "resolve_sender_profile" in source
 
     def test_record_user_action_updates_address_and_domain(self):
         """record_user_action must call _update_sender_profile_for_action for both."""

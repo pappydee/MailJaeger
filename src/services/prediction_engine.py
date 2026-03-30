@@ -23,6 +23,11 @@ from src.models.database import (
     EmailPrediction,
 )
 from src.services.folder_classifier import extract_sender_domain, extract_sender_address
+from src.services.sender_precedence import (
+    build_folder_tiers,
+    build_reply_tiers,
+    resolve_sender_profile_label,
+)
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -84,7 +89,8 @@ def generate_predictions(db: Session, email: ProcessedEmail) -> List[EmailPredic
 def _predict_folder(db: Session, email: ProcessedEmail) -> Optional[EmailPrediction]:
     """Predict the likely target folder for an email.
 
-    Uses FolderPlacementAggregate patterns in strict priority order:
+    Uses FolderPlacementAggregate patterns in strict priority order
+    (via ``build_folder_tiers``):
       1. sender_address (most specific — always wins when sufficient)
       2. sender_domain
       3. category
@@ -95,33 +101,26 @@ def _predict_folder(db: Session, email: ProcessedEmail) -> Optional[EmailPredict
     raw confidence scores.
     """
     sender = email.sender or ""
-    domain = extract_sender_domain(sender)
-    address = extract_sender_address(sender)
     category = email.category or ""
-
-    # Strict precedence: try each tier in order, return the first that qualifies
-    tiers = []
-    if address:
-        tiers.append(("sender_address", address,
-                       lambda v: f"Emails from {v} were placed in folder"))
-    if domain:
-        tiers.append(("sender_domain", domain,
-                       lambda v: f"Sender domain {v} historically moved to folder"))
-    if category:
-        tiers.append(("category", category,
-                       lambda v: f"Emails with category '{v}' were placed in folder"))
-    # Subject keywords (use first 3 significant keywords)
     from src.services.folder_classifier import extract_subject_keywords
     keywords = extract_subject_keywords(email.subject or "")
-    for kw in keywords[:3]:
-        tiers.append(("subject_keyword", kw,
-                       lambda v: f"Subject keyword '{v}' historically associated with folder"))
 
-    for pattern_type, pattern_value, explain_fn in tiers:
+    # Build strict-precedence tiers via the shared helper
+    tiers = build_folder_tiers(sender, category, keywords)
+
+    _EXPLAIN = {
+        "sender_address": lambda v: f"Emails from {v} were placed in folder",
+        "sender_domain": lambda v: f"Sender domain {v} historically moved to folder",
+        "category": lambda v: f"Emails with category '{v}' were placed in folder",
+        "subject_keyword": lambda v: f"Subject keyword '{v}' historically associated with folder",
+    }
+
+    for pattern_type, pattern_value in tiers:
         agg = _get_best_aggregate(db, pattern_type, pattern_value)
         if (agg
                 and agg.confidence >= MIN_CONFIDENCE_FOLDER
                 and agg.occurrence_count >= MIN_SAMPLES_FOLDER):
+            explain_fn = _EXPLAIN.get(pattern_type, lambda v: v)
             explanation = (
                 f"{explain_fn(pattern_value)} "
                 f"'{agg.target_folder}' in {agg.occurrence_count}/{agg.total_for_pattern} cases "
@@ -149,7 +148,8 @@ def _predict_folder(db: Session, email: ProcessedEmail) -> Optional[EmailPredict
 def _predict_reply_needed(db: Session, email: ProcessedEmail) -> Optional[EmailPrediction]:
     """Predict whether an email is likely to need a reply.
 
-    Uses ReplyPattern aggregates in strict priority order:
+    Uses ReplyPattern aggregates in strict priority order
+    (via ``build_reply_tiers``):
       1. sender_address (most specific — always wins when sufficient)
       2. sender_domain
       3. category
@@ -157,23 +157,18 @@ def _predict_reply_needed(db: Session, email: ProcessedEmail) -> Optional[EmailP
     The first tier that meets thresholds wins.
     """
     sender = email.sender or ""
-    domain = extract_sender_domain(sender)
-    address = extract_sender_address(sender)
     category = email.category or ""
 
-    # Build tiers in strict precedence order
-    tiers = []
-    if address:
-        tiers.append(("sender_address", address,
-                       lambda v: f"Emails from {v}"))
-    if domain:
-        tiers.append(("sender_domain", domain,
-                       lambda v: f"Emails from domain {v}"))
-    if category:
-        tiers.append(("category", category,
-                       lambda v: f"Emails in category '{v}'"))
+    # Build tiers via the shared helper
+    tiers = build_reply_tiers(sender, category)
 
-    for pattern_type, pattern_value, explain_fn in tiers:
+    _EXPLAIN = {
+        "sender_address": lambda v: f"Emails from {v}",
+        "sender_domain": lambda v: f"Emails from domain {v}",
+        "category": lambda v: f"Emails in category '{v}'",
+    }
+
+    for pattern_type, pattern_value in tiers:
         pattern = (
             db.query(ReplyPattern)
             .filter(ReplyPattern.pattern_type == pattern_type,
@@ -187,6 +182,7 @@ def _predict_reply_needed(db: Session, email: ProcessedEmail) -> Optional[EmailP
                 if pattern.avg_reply_delay_seconds:
                     hours = pattern.avg_reply_delay_seconds / 3600
                     delay_info = f", avg reply delay {hours:.1f}h"
+                explain_fn = _EXPLAIN.get(pattern_type, lambda v: v)
                 explanation = (
                     f"{explain_fn(pattern_value)} were replied to in "
                     f"{pattern.total_replied}/{pattern.total_received} historical cases "
@@ -217,38 +213,20 @@ def _predict_importance_boost(db: Session, email: ProcessedEmail) -> Optional[Em
     """Predict whether an email should get an importance boost.
 
     Uses SenderProfile importance_tendency, reply_rate, and spam_tendency.
+    Resolves the best matching profile via the centralized
+    ``resolve_sender_profile_label`` helper (address > domain).
     """
     sender = email.sender or ""
     domain = extract_sender_domain(sender)
-    address = extract_sender_address(sender)
 
     if not domain:
         return None
 
-    # Try address-level profile first, fall back to domain-level
-    profile = None
-    profile_label = domain
-    if address:
-        profile = (
-            db.query(SenderProfile)
-            .filter(SenderProfile.sender_address == address)
-            .first()
-        )
-        if profile and (profile.total_emails or 0) >= MIN_SAMPLES_FOLDER:
-            profile_label = address
-        else:
-            profile = None  # fall through to domain
-
+    # Resolve best sender profile via centralized precedence helper
+    profile, profile_label = resolve_sender_profile_label(
+        db, sender, min_support=MIN_SAMPLES_FOLDER
+    )
     if not profile:
-        profile = (
-            db.query(SenderProfile)
-            .filter(
-                SenderProfile.sender_domain == domain,
-                SenderProfile.sender_address.is_(None),
-            )
-            .first()
-        )
-    if not profile or (profile.total_emails or 0) < MIN_SAMPLES_FOLDER:
         return None
 
     # Calculate boost based on multiple signals

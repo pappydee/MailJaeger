@@ -166,7 +166,8 @@ _MIN_PROFILE_SUPPORT = 3
 def _learned_behavior_boost(db: Session, sender: str) -> float:
     """Compute an importance adjustment from learned SenderProfile data.
 
-    Precedence: address-level profile > domain-level profile.
+    Resolves the best matching profile via the centralized
+    ``resolve_sender_profile`` helper (address > domain precedence).
 
     Signals used (each adds up to a small bounded bonus/penalty):
       - importance_tendency (marked-important rate)
@@ -177,13 +178,10 @@ def _learned_behavior_boost(db: Session, sender: str) -> float:
     Returns a bounded adjustment in the range [-10, +15].
     """
     try:
-        from src.services.folder_classifier import extract_sender_domain, extract_sender_address
+        from src.services.sender_precedence import resolve_sender_profile
 
-        address = extract_sender_address(sender)
-        domain = extract_sender_domain(sender)
-
-        profile = _get_learned_profile(db, address=address, domain=domain)
-        if not profile or (profile.total_emails or 0) < _MIN_PROFILE_SUPPORT:
+        profile = resolve_sender_profile(db, sender, min_support=_MIN_PROFILE_SUPPORT)
+        if not profile:
             return 0.0
 
         boost = 0.0
@@ -209,29 +207,3 @@ def _learned_behavior_boost(db: Session, sender: str) -> float:
         return max(-10.0, min(15.0, boost))
     except Exception:
         return 0.0
-
-
-def _get_learned_profile(
-    db: Session, *, address: Optional[str] = None, domain: Optional[str] = None
-) -> Optional[SenderProfile]:
-    """Get the most specific SenderProfile available (address > domain)."""
-    if address:
-        profile = (
-            db.query(SenderProfile)
-            .filter(SenderProfile.sender_address == address)
-            .first()
-        )
-        if profile and (profile.total_emails or 0) >= _MIN_PROFILE_SUPPORT:
-            return profile
-
-    if domain:
-        return (
-            db.query(SenderProfile)
-            .filter(
-                SenderProfile.sender_domain == domain,
-                SenderProfile.sender_address.is_(None),
-            )
-            .first()
-        )
-
-    return None
