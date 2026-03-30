@@ -780,3 +780,49 @@ class HistoricalLearningProgress(Base):
     __table_args__ = (
         Index("idx_hlp_folder_status", "folder_name", "status"),
     )
+
+
+class ReplyLink(Base):
+    """Durable per-email record linking a sent email to the incoming email it replied to.
+
+    Supports explainability (linkage_method) and deduplication (unique constraint).
+    Aggregates (ReplyPattern, SenderProfile) are still updated separately;
+    this table stores the underlying explicit relation.
+    """
+
+    __tablename__ = "reply_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # The sent email that constitutes the reply
+    sent_email_id = Column(
+        Integer, ForeignKey("processed_emails.id"), nullable=False, index=True
+    )
+    # The incoming email that was replied to
+    original_email_id = Column(
+        Integer, ForeignKey("processed_emails.id"), nullable=False, index=True
+    )
+
+    # Thread context (if available)
+    thread_id = Column(String(200), index=True)
+
+    # Linkage provenance
+    linkage_method = Column(
+        String(50), nullable=False
+    )  # exact_header / thread_id / heuristic_subject
+    confidence = Column(Float, default=1.0)  # 1.0 for exact, 0.7 for thread, 0.4 for heuristic
+
+    # Measured reply delay
+    reply_delay_seconds = Column(Float)
+
+    # Context snapshot for future learning
+    original_sender_domain = Column(String(200))
+    original_category = Column(String(50))
+    original_folder = Column(String(200))
+
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("idx_rl_sent_original", "sent_email_id", "original_email_id", unique=True),
+    )

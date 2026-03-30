@@ -810,3 +810,272 @@ class TestUserActionRecording:
         db.commit()
 
         assert event.source == "imported-history"
+
+
+# ===========================================================================
+# 9. Incremental Learning (completed folders pick up new emails)
+# ===========================================================================
+
+class TestIncrementalLearning:
+    """Test that historical learning is truly incremental."""
+
+    def test_completed_folder_picks_up_new_emails(self, db):
+        """Completed folders must still process newly arrived emails."""
+        from src.pipeline.historical_learning_job import run_historical_learning_job
+
+        # Create initial emails and run first scan
+        for i in range(3):
+            _make_email(
+                db, message_id=f"inc-initial-{i}@test.com",
+                sender=f"s{i}@d.com", folder="INBOX"
+            )
+        stats1 = run_historical_learning_job(db)
+        assert stats1["emails_learned"] == 3
+
+        # Add new emails to the same folder
+        for i in range(2):
+            _make_email(
+                db, message_id=f"inc-new-{i}@test.com",
+                sender=f"n{i}@d.com", folder="INBOX"
+            )
+
+        # Second run must pick up only the 2 new emails
+        stats2 = run_historical_learning_job(db)
+        assert stats2["emails_learned"] == 2
+
+    def test_completed_folder_no_reprocessing_without_new_emails(self, db):
+        """A completed folder with no new emails is truly skipped."""
+        from src.pipeline.historical_learning_job import run_historical_learning_job
+
+        _make_email(db, message_id="noreproc@test.com", sender="a@b.com", folder="INBOX")
+        run_historical_learning_job(db)
+
+        # Second run: nothing new
+        stats2 = run_historical_learning_job(db)
+        assert stats2["emails_learned"] == 0
+
+
+# ===========================================================================
+# 10. Sender-Address-Level Profiles
+# ===========================================================================
+
+class TestSenderAddressProfiles:
+    """Test address-level and domain-level profile coexistence."""
+
+    def test_address_level_profile_created(self, db):
+        """learn_from_email creates both domain- and address-level profiles."""
+        from src.services.historical_learning import learn_from_email
+
+        email = _make_email(db, sender="john@corp.com", folder="Work")
+        learn_from_email(db, email)
+        db.commit()
+
+        # Domain-level profile
+        domain_p = db.query(SenderProfile).filter(
+            SenderProfile.sender_domain == "corp.com",
+            SenderProfile.sender_address.is_(None),
+        ).first()
+        assert domain_p is not None
+        assert domain_p.total_emails == 1
+
+        # Address-level profile
+        addr_p = db.query(SenderProfile).filter(
+            SenderProfile.sender_address == "john@corp.com",
+        ).first()
+        assert addr_p is not None
+        assert addr_p.total_emails == 1
+
+    def test_domain_fallback_when_address_absent(self, db):
+        """Predictions use domain when no address-level data exists."""
+        from src.services.historical_learning import learn_from_email
+        from src.services.prediction_engine import generate_predictions
+
+        # Build domain-level aggregate from many senders at same domain
+        for i in range(5):
+            email = _make_email(
+                db, message_id=f"dom-fb-{i}@test.com",
+                sender=f"user{i}@bigcorp.com", folder="Rechnungen"
+            )
+            learn_from_email(db, email)
+        db.commit()
+
+        # New email from a never-seen address at that domain
+        new_email = _make_email(
+            db, message_id="dom-fb-new@test.com",
+            sender="newperson@bigcorp.com", folder="INBOX"
+        )
+        preds = generate_predictions(db, new_email)
+        db.commit()
+
+        folder_pred = next((p for p in preds if p.prediction_type == "target_folder"), None)
+        assert folder_pred is not None
+        assert folder_pred.predicted_value == "Rechnungen"
+        # Source should be domain-level since address has only 1 sample
+        assert folder_pred.source_data.get("pattern_type") in ("sender_domain", "sender_address")
+
+
+# ===========================================================================
+# 11. Durable Reply Links
+# ===========================================================================
+
+class TestReplyLinks:
+    """Test durable reply link storage."""
+
+    def test_reply_link_stored(self, db):
+        """learn_reply_linkage persists a ReplyLink record."""
+        from src.services.historical_learning import learn_reply_linkage
+        from src.models.database import ReplyLink
+
+        now = datetime.now(timezone.utc)
+        incoming = _make_email(
+            db, message_id="rl-in@test.com",
+            sender="client@client.com", folder="INBOX",
+            thread_id="rl-thread", date=now - timedelta(hours=2),
+        )
+        sent = _make_email(
+            db, message_id="rl-out@test.com",
+            sender="me@mymail.com", folder="Sent",
+            thread_id="rl-thread", date=now,
+        )
+
+        result = learn_reply_linkage(db, sent)
+        db.commit()
+
+        assert result is not None
+        link = db.query(ReplyLink).filter(
+            ReplyLink.sent_email_id == sent.id,
+            ReplyLink.original_email_id == incoming.id,
+        ).first()
+        assert link is not None
+        assert link.linkage_method == "thread_id"
+        assert link.confidence == 0.9
+        assert link.reply_delay_seconds is not None
+        assert link.original_sender_domain == "client.com"
+
+    def test_reply_link_not_duplicated(self, db):
+        """Running learn_reply_linkage twice does not duplicate the link."""
+        from src.services.historical_learning import learn_reply_linkage
+        from src.models.database import ReplyLink
+
+        now = datetime.now(timezone.utc)
+        incoming = _make_email(
+            db, message_id="rl-dup-in@test.com",
+            sender="x@y.com", folder="INBOX",
+            thread_id="rl-dup-thread", date=now - timedelta(hours=1),
+        )
+        sent = _make_email(
+            db, message_id="rl-dup-out@test.com",
+            sender="me@mymail.com", folder="Sent",
+            thread_id="rl-dup-thread", date=now,
+        )
+
+        learn_reply_linkage(db, sent)
+        db.commit()
+        learn_reply_linkage(db, sent)
+        db.commit()
+
+        count = db.query(ReplyLink).filter(
+            ReplyLink.sent_email_id == sent.id,
+        ).count()
+        assert count == 1
+
+    def test_heuristic_reply_link_has_lower_confidence(self, db):
+        """Subject-heuristic links get lower confidence than thread-based links."""
+        from src.services.historical_learning import learn_reply_linkage
+        from src.models.database import ReplyLink
+
+        now = datetime.now(timezone.utc)
+        _make_email(
+            db, message_id="rl-heur-in@test.com",
+            sender="col@work.com", folder="INBOX",
+            subject="Budget Meeting",
+            date=now - timedelta(hours=1),
+        )
+        sent = _make_email(
+            db, message_id="rl-heur-out@test.com",
+            sender="me@mymail.com", folder="Sent",
+            subject="Re: Budget Meeting",
+            date=now,
+            thread_id=None,
+        )
+
+        learn_reply_linkage(db, sent)
+        db.commit()
+
+        link = db.query(ReplyLink).filter(
+            ReplyLink.sent_email_id == sent.id,
+        ).first()
+        assert link is not None
+        assert link.linkage_method == "subject_heuristic"
+        assert link.confidence < 0.9  # lower than thread-based
+
+
+# ===========================================================================
+# 12. Prediction Precedence (address > domain > category)
+# ===========================================================================
+
+class TestPredictionPrecedence:
+    """Test that prediction uses sender_address > sender_domain > category."""
+
+    def test_address_takes_precedence_over_domain(self, db):
+        """If address-level data says folder X and domain says folder Y, address wins."""
+        from src.services.prediction_engine import generate_predictions
+
+        # Create domain-level aggregate: domain -> "Work"
+        agg = FolderPlacementAggregate(
+            pattern_type="sender_domain", pattern_value="mixed.com",
+            target_folder="Work", occurrence_count=5, total_for_pattern=10,
+            confidence=0.5,
+        )
+        db.add(agg)
+
+        # Create address-level aggregate: specific address -> "VIP"
+        agg2 = FolderPlacementAggregate(
+            pattern_type="sender_address", pattern_value="boss@mixed.com",
+            target_folder="VIP", occurrence_count=4, total_for_pattern=4,
+            confidence=1.0,
+        )
+        db.add(agg2)
+        db.commit()
+
+        email = _make_email(
+            db, message_id="prec-test@test.com",
+            sender="boss@mixed.com", folder="INBOX",
+        )
+        preds = generate_predictions(db, email)
+        db.commit()
+
+        folder_pred = next((p for p in preds if p.prediction_type == "target_folder"), None)
+        assert folder_pred is not None
+        assert folder_pred.predicted_value == "VIP"
+        assert folder_pred.source_data["pattern_type"] == "sender_address"
+
+    def test_importance_uses_historical_signals(self, db):
+        """Importance boost uses reply rate, importance markings, and inbox retention."""
+        from src.services.prediction_engine import generate_predictions
+
+        profile = SenderProfile(
+            sender_domain="engaged.com",
+            total_emails=20,
+            reply_rate=0.8, total_replies=16,
+            importance_tendency=0.3, marked_important_count=6,
+            spam_tendency=0.0, marked_spam_count=0,
+            kept_in_inbox_count=15,
+            folder_distribution={"INBOX": 20},
+            first_seen=datetime.now(timezone.utc),
+            last_seen=datetime.now(timezone.utc),
+        )
+        db.add(profile)
+        db.commit()
+
+        email = _make_email(
+            db, message_id="imp-det@test.com",
+            sender="exec@engaged.com", folder="INBOX"
+        )
+        preds = generate_predictions(db, email)
+        db.commit()
+
+        imp_pred = next((p for p in preds if p.prediction_type == "importance_boost"), None)
+        assert imp_pred is not None
+        assert imp_pred.confidence > 0
+        assert "reply rate" in imp_pred.explanation or "important" in imp_pred.explanation

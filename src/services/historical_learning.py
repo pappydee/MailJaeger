@@ -24,6 +24,7 @@ from src.models.database import (
     FolderPlacementAggregate,
     ReplyPattern,
     UserActionEvent,
+    ReplyLink,
 )
 from src.services.folder_classifier import (
     classify_folder,
@@ -64,7 +65,12 @@ def learn_from_email(db: Session, email: ProcessedEmail, source: str = "imported
 
     # Update sender profile (domain-level)
     if domain:
-        _update_sender_profile_for_email(db, domain, folder, email)
+        _update_sender_profile_for_email(db, domain, None, folder, email)
+        stats["sender_profiles"] += 1
+
+    # Update sender profile (address-level)
+    if address:
+        _update_sender_profile_for_email(db, None, address, folder, email)
         stats["sender_profiles"] += 1
 
     # Update folder placement aggregates
@@ -98,19 +104,35 @@ def learn_from_email(db: Session, email: ProcessedEmail, source: str = "imported
 
 
 def _update_sender_profile_for_email(
-    db: Session, domain: str, folder: str, email: ProcessedEmail
+    db: Session, domain: str | None, address: str | None, folder: str, email: ProcessedEmail
 ) -> None:
-    """Update or create a SenderProfile for the given domain."""
-    profile = (
-        db.query(SenderProfile)
-        .filter(SenderProfile.sender_domain == domain)
-        .first()
-    )
+    """Update or create a SenderProfile for the given domain or address.
+
+    Exactly one of domain/address should be set.  When address is set a
+    per-address profile is maintained; when domain is set a per-domain
+    profile is maintained.
+    """
+    if address:
+        profile = (
+            db.query(SenderProfile)
+            .filter(SenderProfile.sender_address == address)
+            .first()
+        )
+    else:
+        profile = (
+            db.query(SenderProfile)
+            .filter(
+                SenderProfile.sender_domain == domain,
+                SenderProfile.sender_address.is_(None),
+            )
+            .first()
+        )
     now = datetime.now(timezone.utc)
 
     if not profile:
         profile = SenderProfile(
-            sender_domain=domain,
+            sender_domain=domain if domain else extract_sender_domain(address or ""),
+            sender_address=address,
             total_emails=0,
             folder_distribution={},
             first_seen=now,
@@ -264,7 +286,10 @@ def _update_sender_profile_for_action(db: Session, domain: str, action_type: str
     """Update SenderProfile counters based on a user action."""
     profile = (
         db.query(SenderProfile)
-        .filter(SenderProfile.sender_domain == domain)
+        .filter(
+            SenderProfile.sender_domain == domain,
+            SenderProfile.sender_address.is_(None),
+        )
         .first()
     )
     if not profile:
@@ -394,6 +419,21 @@ def learn_reply_linkage(
     if original_domain:
         _update_sender_profile_reply(db, original_domain, reply_delay_seconds)
 
+    # Persist durable reply link (deduplicated by unique constraint)
+    _confidence_map = {"thread_id": 0.9, "subject_heuristic": 0.4}
+    _persist_reply_link(
+        db,
+        sent_email_id=sent_email.id,
+        original_email_id=linked_email.id,
+        thread_id=linked_email.thread_id or sent_email.thread_id,
+        linkage_method=linkage_method or "unknown",
+        confidence=_confidence_map.get(linkage_method, 0.5),
+        reply_delay_seconds=reply_delay_seconds,
+        original_sender_domain=original_domain,
+        original_category=original_category,
+        original_folder=linked_email.folder,
+    )
+
     result = {
         "replied_to_email_id": linked_email.id,
         "replied_to_thread_id": linked_email.thread_id,
@@ -481,7 +521,10 @@ def _update_sender_profile_reply(
     """Update SenderProfile reply statistics."""
     profile = (
         db.query(SenderProfile)
-        .filter(SenderProfile.sender_domain == domain)
+        .filter(
+            SenderProfile.sender_domain == domain,
+            SenderProfile.sender_address.is_(None),
+        )
         .first()
     )
     if not profile:
@@ -499,6 +542,46 @@ def _update_sender_profile_reply(
         profile.median_reply_delay_seconds = profile.avg_reply_delay_seconds
 
     db.add(profile)
+
+
+def _persist_reply_link(
+    db: Session,
+    *,
+    sent_email_id: int,
+    original_email_id: int,
+    thread_id: Optional[str],
+    linkage_method: str,
+    confidence: float,
+    reply_delay_seconds: Optional[float],
+    original_sender_domain: str,
+    original_category: str,
+    original_folder: Optional[str],
+) -> Optional[ReplyLink]:
+    """Persist a durable reply-link record, deduplicated by (sent, original) pair."""
+    existing = (
+        db.query(ReplyLink)
+        .filter(
+            ReplyLink.sent_email_id == sent_email_id,
+            ReplyLink.original_email_id == original_email_id,
+        )
+        .first()
+    )
+    if existing:
+        return existing  # already stored — no duplicate
+
+    link = ReplyLink(
+        sent_email_id=sent_email_id,
+        original_email_id=original_email_id,
+        thread_id=thread_id,
+        linkage_method=linkage_method,
+        confidence=confidence,
+        reply_delay_seconds=reply_delay_seconds,
+        original_sender_domain=original_sender_domain,
+        original_category=original_category,
+        original_folder=original_folder,
+    )
+    db.add(link)
+    return link
 
 
 def update_reply_pattern_totals(db: Session) -> int:

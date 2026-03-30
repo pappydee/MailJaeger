@@ -179,12 +179,43 @@ def _predict_reply_needed(db: Session, email: ProcessedEmail) -> Optional[EmailP
     """
     sender = email.sender or ""
     domain = extract_sender_domain(sender)
+    address = extract_sender_address(sender)
     category = email.category or ""
 
     best_probability = 0.0
     best_explanation = ""
     best_source_data = {}
     pattern_source = ""
+
+    # Check sender_address reply pattern first (most specific)
+    if address:
+        pattern = (
+            db.query(ReplyPattern)
+            .filter(ReplyPattern.pattern_type == "sender_address", ReplyPattern.pattern_value == address)
+            .first()
+        )
+        if pattern and (pattern.total_received or 0) >= MIN_SAMPLES_REPLY:
+            prob = pattern.reply_probability or 0.0
+            if prob > best_probability:
+                best_probability = prob
+                delay_info = ""
+                if pattern.avg_reply_delay_seconds:
+                    hours = pattern.avg_reply_delay_seconds / 3600
+                    delay_info = f", avg reply delay {hours:.1f}h"
+                best_explanation = (
+                    f"Emails from {address} were replied to in "
+                    f"{pattern.total_replied}/{pattern.total_received} historical cases "
+                    f"({prob:.0%}){delay_info}"
+                )
+                best_source_data = {
+                    "pattern_type": "sender_address",
+                    "pattern_value": address,
+                    "total_received": pattern.total_received,
+                    "total_replied": pattern.total_replied,
+                    "reply_probability": prob,
+                    "avg_delay_seconds": pattern.avg_reply_delay_seconds,
+                }
+                pattern_source = "reply_pattern"
 
     # Check sender_domain reply pattern
     if domain:
@@ -262,15 +293,34 @@ def _predict_importance_boost(db: Session, email: ProcessedEmail) -> Optional[Em
     """
     sender = email.sender or ""
     domain = extract_sender_domain(sender)
+    address = extract_sender_address(sender)
 
     if not domain:
         return None
 
-    profile = (
-        db.query(SenderProfile)
-        .filter(SenderProfile.sender_domain == domain)
-        .first()
-    )
+    # Try address-level profile first, fall back to domain-level
+    profile = None
+    profile_label = domain
+    if address:
+        profile = (
+            db.query(SenderProfile)
+            .filter(SenderProfile.sender_address == address)
+            .first()
+        )
+        if profile and (profile.total_emails or 0) >= MIN_SAMPLES_FOLDER:
+            profile_label = address
+        else:
+            profile = None  # fall through to domain
+
+    if not profile:
+        profile = (
+            db.query(SenderProfile)
+            .filter(
+                SenderProfile.sender_domain == domain,
+                SenderProfile.sender_address.is_(None),
+            )
+            .first()
+        )
     if not profile or (profile.total_emails or 0) < MIN_SAMPLES_FOLDER:
         return None
 
@@ -309,7 +359,7 @@ def _predict_importance_boost(db: Session, email: ProcessedEmail) -> Optional[Em
 
     confidence = min(1.0, boost)
     explanation = (
-        f"Sender domain {domain} has historical importance signals: "
+        f"Sender {profile_label} has historical importance signals: "
         + "; ".join(reasons)
     )
 
@@ -321,6 +371,7 @@ def _predict_importance_boost(db: Session, email: ProcessedEmail) -> Optional[Em
         explanation=explanation,
         source_aggregate="sender_profile",
         source_data={
+            "profile_key": profile_label,
             "domain": domain,
             "total_emails": profile.total_emails,
             "reply_rate": profile.reply_rate,

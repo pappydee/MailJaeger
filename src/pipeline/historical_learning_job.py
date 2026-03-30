@@ -153,6 +153,8 @@ def _process_folder(
     """Process a single folder for historical learning.
 
     Resumes from the last processed email ID for this folder.
+    Completed folders are still checked for newly arrived emails
+    (id > last_processed_email_id) to support true incremental learning.
     """
     folder_type = classify_folder(folder_name)
     is_sent = folder_type == FOLDER_TYPE_SENT
@@ -160,9 +162,21 @@ def _process_folder(
     # Get or create folder progress
     progress = _get_or_create_folder_progress(db, folder_name, folder_type)
 
+    # For completed folders, re-open to check for new emails only
     if progress.status == "completed":
-        logger.debug("historical_learning_folder_skip folder=%s (already completed)", folder_name)
-        return {"learned": 0, "replies_linked": 0, "predictions": 0, "failed": 0, "skipped": 0}
+        # Check if there are emails with id > last cursor
+        cursor = progress.last_processed_email_id
+        new_count_query = db.query(func.count(ProcessedEmail.id)).filter(
+            ProcessedEmail.folder == folder_name
+        )
+        if cursor is not None:
+            new_count_query = new_count_query.filter(ProcessedEmail.id > cursor)
+        new_count = new_count_query.scalar() or 0
+        if new_count == 0:
+            logger.debug("historical_learning_folder_skip folder=%s (no new emails)", folder_name)
+            return {"learned": 0, "replies_linked": 0, "predictions": 0, "failed": 0, "skipped": 0}
+        # Re-open the folder for incremental processing
+        logger.info("historical_learning_folder_incremental folder=%s new_emails=%s", folder_name, new_count)
 
     progress.status = "running"
     if not progress.started_at:
