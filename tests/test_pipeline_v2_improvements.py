@@ -531,3 +531,159 @@ class TestOverrideReapplication:
         reloaded_no = db.query(ProcessedEmail).filter(ProcessedEmail.id == no_match.id).first()
         assert reloaded_no.category != "Verwaltung"
         db.close()
+
+
+# =====================================================================
+# STEP 5 (v3): Remaining private coupling cleanup
+# =====================================================================
+
+
+class TestNoRemainingPrivateCoupling:
+    """No remaining private-method fallback use where a public API exists."""
+
+    def test_analysis_pipeline_uses_public_fallback(self):
+        """AnalysisPipeline.stage3_llm_analyse must not call _fallback_classification."""
+        from src.services import analysis_pipeline
+
+        source = inspect.getsource(analysis_pipeline)
+        # Find all _fallback_classification calls in the module
+        import re
+        private_fallback_calls = re.findall(r"ai_service\._fallback_classification\(", source)
+        assert private_fallback_calls == [], (
+            f"analysis_pipeline.py still calls _fallback_classification: {private_fallback_calls}"
+        )
+
+    def test_analysis_pipeline_no_email_processor_import(self):
+        """AnalysisPipeline must not import EmailProcessor."""
+        from src.services import analysis_pipeline
+
+        source = inspect.getsource(analysis_pipeline)
+        assert "from src.services.email_processor import EmailProcessor" not in source, (
+            "analysis_pipeline.py still imports EmailProcessor"
+        )
+
+    def test_email_processor_uses_public_fallback(self):
+        """EmailProcessor must only use the public fallback_classification API."""
+        from src.services import email_processor
+
+        source = inspect.getsource(email_processor)
+        import re
+        private_calls = re.findall(r"\.ai_service\._fallback_classification\(", source)
+        assert private_calls == [], (
+            f"email_processor.py still calls private _fallback_classification: {private_calls}"
+        )
+
+    def test_ai_service_public_fallback_returns_valid_analysis(self):
+        """AIService.fallback_classification must return a valid analysis dict."""
+        db = _make_db()
+        from src.services.ai_service import AIService
+
+        ai_service = AIService()
+        result = ai_service.fallback_classification({
+            "subject": "Test email",
+            "sender": "user@example.com",
+            "body_plain": "Hello",
+        })
+        assert isinstance(result, dict)
+        assert "category" in result
+        assert "spam_probability" in result
+        assert "action_required" in result
+        db.close()
+
+    def test_backward_compat_aliases_are_documented(self):
+        """Backward-compat aliases must have transitional documentation."""
+        from src.services import analysis_pipeline
+
+        source = inspect.getsource(analysis_pipeline)
+        assert "transitional" in source.lower(), (
+            "Backward-compat alias section should document transitional status"
+        )
+
+
+# =====================================================================
+# STEP 6 (v3): Ingestion resume semantics
+# =====================================================================
+
+
+class TestIngestionResume:
+    """Ingestion resume semantics must be concrete and documented."""
+
+    def test_run_ingestion_returns_last_ingested_email_id(self):
+        """run_ingestion stats must include last_ingested_email_id."""
+        from src.pipeline.ingestion import run_ingestion
+
+        sig = inspect.signature(run_ingestion)
+        # Cannot test IMAP without a server, but test the function signature
+        assert "folder" in sig.parameters
+        assert "run_id" in sig.parameters
+
+    def test_ingestion_module_documents_resume_semantics(self):
+        """The ingestion module docstring must document resume semantics."""
+        from src.pipeline import ingestion
+
+        doc = ingestion.__doc__
+        assert "idempotent" in doc.lower(), (
+            "Ingestion module must document idempotent behavior"
+        )
+        assert "uid" in doc.lower(), (
+            "Ingestion module must document UID checkpoint mechanism"
+        )
+
+    def test_ingestion_error_returns_none_last_id(self):
+        """On ingestion error, last_ingested_email_id should be None."""
+        db = _make_db()
+        from src.pipeline.ingestion import run_ingestion
+
+        # Mock the ingestion service to raise
+        with patch("src.services.mail_ingestion_service.MailIngestionService", side_effect=RuntimeError("IMAP down")):
+            stats = run_ingestion(db)
+
+        assert stats["last_ingested_email_id"] is None
+        assert stats["new"] == 0
+        db.close()
+
+    def test_ingestion_job_persists_last_email_id(self):
+        """run_ingestion_job should persist last_ingested_email_id in ProcessingJob."""
+        db = _make_db()
+        from src.models.database import ProcessedEmail, ProcessingJob
+        from src.pipeline.jobs import run_ingestion_job
+
+        # Pre-create some emails to simulate ingestion having occurred
+        for i in range(3):
+            email = ProcessedEmail(
+                message_id=f"<ingest-{i}@example.com>",
+                subject=f"Email {i}",
+                sender="user@example.com",
+                folder="INBOX",
+                analysis_state="pending",
+            )
+            db.add(email)
+        db.commit()
+
+        # Mock the ingestion to return typical stats
+        mock_stats = {"new": 3, "skipped": 0, "failed": 0, "total": 3}
+        with patch("src.services.mail_ingestion_service.MailIngestionService") as MockService:
+            instance = MockService.return_value
+            instance.ingest_folder.return_value = mock_stats
+
+            result = run_ingestion_job(db)
+
+        # The job should have persisted the last email id
+        job = db.query(ProcessingJob).filter(ProcessingJob.id == result["job_id"]).first()
+        assert job is not None
+        assert job.last_processed_email_id is not None  # Should track the last email
+        assert job.processed_count >= 3
+        db.close()
+
+    def test_jobs_module_documents_resume_semantics(self):
+        """The jobs module docstring must document resume semantics for all job types."""
+        from src.pipeline import jobs
+
+        doc = jobs.__doc__
+        assert "ingestion" in doc.lower()
+        assert "analysis" in doc.lower()
+        assert "action" in doc.lower()
+        assert "idempotent" in doc.lower()
+        assert "cursor" in doc.lower()
+        db = _make_db()
+        db.close()

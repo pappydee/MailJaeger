@@ -7,8 +7,28 @@ Provides three independently callable jobs:
   - ``run_action_job(db)``  — execute approved actions
 
 Each job persists its state in the ``processing_jobs`` table so it can
-be resumed after interruption.  Progress is tracked via
-``last_processed_email_id`` to avoid reprocessing.
+be resumed after interruption.
+
+Resume semantics per job type:
+
+  **Ingestion jobs**:
+    Ingestion is idempotent by design.  ``MailIngestionService`` uses
+    the highest IMAP UID already stored for the target folder as a
+    checkpoint — re-running never re-fetches messages.
+    ``last_processed_email_id`` records the DB id of the most recently
+    ingested email for observability but is not required for
+    correctness.
+
+  **Analysis jobs**:
+    Analysis uses ``last_processed_email_id`` as a real cursor.  When
+    a job is resumed, only emails with ``id > cursor`` and
+    ``analysis_state == 'pending'`` are considered.  This avoids
+    reprocessing already-classified emails.
+
+  **Action jobs**:
+    Action jobs are idempotent: only *approved* actions in the queue
+    are executed; once executed, their status changes so they are not
+    re-executed on a subsequent run.
 """
 
 from typing import Dict, Any, Optional
@@ -89,6 +109,13 @@ def run_ingestion_job(
     """
     Run an ingestion job with progress tracking.
 
+    Resume semantics:
+      Ingestion is **idempotent by design**.  The underlying
+      ``MailIngestionService`` uses a UID checkpoint (highest IMAP
+      UID already stored) so re-running never re-fetches messages.
+      ``last_processed_email_id`` is persisted for observability
+      but is not needed for correctness.
+
     Returns: {job_id, stats, status}
     """
     job = _start_job(db, "ingestion", run_id)
@@ -96,8 +123,13 @@ def run_ingestion_job(
         stats = run_ingestion(db, folder=folder, run_id=run_id or str(job.id))
 
         # Track progress
-        job.processed_count = stats.get("new", 0) + stats.get("skipped", 0)
-        job.failed_count = stats.get("failed", 0)
+        job.processed_count = (job.processed_count or 0) + stats.get("new", 0) + stats.get("skipped", 0)
+        job.failed_count = (job.failed_count or 0) + stats.get("failed", 0)
+
+        # Persist last ingested email id for observability / tracking
+        last_id = stats.get("last_ingested_email_id")
+        if last_id is not None:
+            job.last_processed_email_id = last_id
 
         status = "completed" if stats.get("failed", 0) == 0 else "partial"
         _finish_job(db, job, stats, status=status)

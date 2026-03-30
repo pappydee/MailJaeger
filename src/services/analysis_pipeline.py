@@ -266,7 +266,6 @@ class AnalysisPipeline:
         Returns a result dict with 'confident' flag and 'analysis'.
         """
         from src.models.database import ClassificationOverride
-        from src.services.email_processor import EmailProcessor
 
         sender = (email.sender or "").lower()
         subject = (email.subject or "").lower()
@@ -341,7 +340,7 @@ class AnalysisPipeline:
         except Exception as e:
             sanitized = sanitize_error(e, debug=self.settings.debug)
             logger.error(f"LLM analysis failed: {sanitized}")
-            analysis = ai_service._fallback_classification(email_data)
+            analysis = ai_service.fallback_classification(email_data)
 
         return {
             "confident": True,
@@ -486,7 +485,11 @@ class AnalysisPipeline:
         self.db.commit()
 
     # ------------------------------------------------------------------
-    # Backward-compatible aliases (deprecated — use the public names)
+    # Backward-compatible aliases (transitional — will be removed)
+    #
+    # These exist solely so that legacy code (e.g. EmailProcessor,
+    # older tests) that references the private names still works.
+    # New code MUST use the public names above.
     # ------------------------------------------------------------------
     _stage1_pre_classify = stage1_pre_classify
     _stage2_rule_classify = stage2_rule_classify

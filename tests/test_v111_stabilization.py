@@ -245,7 +245,7 @@ class TestEmailProcessorOverrideLogic:
             category="Forschung", priority="MEDIUM",
             spam=False, action_required=True, suggested_folder="Research",
         )
-        with patch.object(proc.ai_service, "_fallback_classification") as mock_fb:
+        with patch.object(proc.ai_service, "fallback_classification") as mock_fb:
             mock_fb.return_value = {
                 "summary": "x", "category": "Unklar", "spam_probability": 0.2,
                 "action_required": False, "priority": "LOW",
@@ -266,7 +266,7 @@ class TestEmailProcessorOverrideLogic:
             id=3, sender_pattern="@spam.com", subject_pattern=None,
             category=None, priority=None, spam=True, action_required=None, suggested_folder=None,
         )
-        with patch.object(proc.ai_service, "_fallback_classification") as mock_fb:
+        with patch.object(proc.ai_service, "fallback_classification") as mock_fb:
             mock_fb.return_value = {
                 "summary": "", "category": "Unklar", "spam_probability": 0.1,
                 "action_required": False, "priority": "LOW",
@@ -282,7 +282,7 @@ class TestEmailProcessorOverrideLogic:
             id=4, sender_pattern="@x.com", subject_pattern=None,
             category=None, priority=None, spam=None, action_required=None, suggested_folder=None,
         )
-        with patch.object(proc.ai_service, "_fallback_classification") as mock_fb:
+        with patch.object(proc.ai_service, "fallback_classification") as mock_fb:
             mock_fb.return_value = {
                 "summary": "text", "category": "Privat", "spam_probability": 0.3,
                 "action_required": True, "priority": "HIGH",

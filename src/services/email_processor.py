@@ -789,7 +789,7 @@ class EmailProcessor:
             sanitized = sanitize_error(e, debug=self.settings.debug)
             logger.error(f"Batch LLM analysis failed: {sanitized}")
             results = [
-                self.ai_service._fallback_classification(ed) for ed in email_data_list
+                self.ai_service.fallback_classification(ed) for ed in email_data_list
             ]
 
         for email_record, analysis in zip(email_records, results):
@@ -1086,7 +1086,7 @@ class EmailProcessor:
             except Exception as e:
                 sanitized_error = sanitize_error(e, debug=self.settings.debug)
                 logger.error(f"AI analysis failed for {message_id}: {sanitized_error}")
-                analysis = self.ai_service._fallback_classification(email_data)
+                analysis = self.ai_service.fallback_classification(email_data)
 
         is_spam = self._classify_spam(email_data, analysis)
         action_required = analysis["action_required"]
@@ -1289,7 +1289,7 @@ class EmailProcessor:
         email_data: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Build an AI-style analysis dict from a ClassificationOverride rule."""
-        fallback = self.ai_service._fallback_classification(email_data)
+        fallback = self.ai_service.fallback_classification(email_data)
         return {
             "summary": fallback.get("summary", ""),
             "category": rule.category if rule.category else fallback["category"],
