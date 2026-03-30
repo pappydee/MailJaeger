@@ -921,6 +921,7 @@ class TestPredictionConsumption:
     def test_importance_boost_backfills_when_none(self, db):
         """importance_boost fills importance_score when it was None."""
         from src.pipeline.analysis import _apply_prediction_hints
+        from src.services.importance_scorer import _IMPORTANCE_BASELINE
 
         email = _make_email(db, sender="vip@company.com", analysis_state="classified",
                             importance_score=None)
@@ -938,7 +939,8 @@ class TestPredictionConsumption:
 
         db.refresh(email)
         assert email.importance_score is not None
-        assert email.importance_score == pytest.approx(36.0, abs=0.1)  # 30.0 + 0.6*10
+        expected = _IMPORTANCE_BASELINE + 0.6 * 10.0
+        assert email.importance_score == pytest.approx(expected, abs=0.1)
 
     def test_importance_boost_skips_when_already_scored(self, db):
         """importance_boost does NOT apply when importance_score already set."""

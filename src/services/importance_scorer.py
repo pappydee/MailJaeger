@@ -64,6 +64,12 @@ URGENT_KEYWORDS: Tuple[str, ...] = (
 )
 
 
+# Baseline importance score (neutral starting point).
+# Exported so downstream modules (e.g. _apply_prediction_hints) can
+# reference the same value instead of hard-coding a magic number.
+_IMPORTANCE_BASELINE = 30.0
+
+
 def compute_importance_score(
     db: Session, email_record: ProcessedEmail
 ) -> float:
@@ -73,7 +79,7 @@ def compute_importance_score(
     This is a pure function (no IMAP side effects).  The DB session is
     used only for sender-domain reputation queries.
     """
-    score = 30.0  # neutral baseline
+    score = _IMPORTANCE_BASELINE
 
     subject = (email_record.subject or "").lower()
     sender = (email_record.sender or "").lower()

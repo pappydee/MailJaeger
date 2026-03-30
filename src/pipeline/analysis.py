@@ -298,9 +298,10 @@ def _apply_prediction_hints(
                     # absent).
                     boost_value = pred.confidence or 0.0
                     if boost_value > 0 and email_record.importance_score is None:
+                        from src.services.importance_scorer import _IMPORTANCE_BASELINE
                         # Scale: prediction confidence 0-1 → up to +10 points
                         adjustment = min(10.0, boost_value * 10.0)
-                        email_record.importance_score = 30.0 + adjustment  # neutral baseline + boost
+                        email_record.importance_score = _IMPORTANCE_BASELINE + adjustment
                         logger.debug(
                             "hint_applied email_id=%s type=importance_boost adj=+%.1f",
                             email_record.id,
