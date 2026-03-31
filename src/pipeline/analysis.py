@@ -205,4 +205,4 @@ def run_analysis(
 
 # NOTE: All prediction generation and hint consumption is handled by the
 # shared ``prediction_signals`` module.  No inline logic should exist here.
-# See ``enrich_and_apply_hints`` call in ``run_analysis`` above.
+# See ``enrich_and_apply_hints`` call in ``run_analysis()``.
