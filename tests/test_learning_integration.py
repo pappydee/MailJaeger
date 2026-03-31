@@ -1077,3 +1077,363 @@ class TestImportanceScorerConsistency:
 
         score = compute_importance_score(db, email)
         assert 0.0 <= score <= 100.0  # valid range, no crash
+
+
+# ===========================================================================
+# 14. Shared prediction_signals module — behavioral tests
+# ===========================================================================
+
+class TestPredictionSignalsSharedModule:
+    """Verify the shared prediction_signals module is functional and used by both paths."""
+
+    def test_apply_prediction_hints_backfills_suggested_folder(self, db):
+        """apply_prediction_hints backfills suggested_folder from target_folder prediction."""
+        from src.services.prediction_signals import apply_prediction_hints
+
+        email = _make_email(db, analysis_state="classified", suggested_folder=None)
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="target_folder",
+            predicted_value="Work/Projects",
+            confidence=0.85,
+            explanation="folder pattern from sender",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        apply_prediction_hints(db, [email])
+        db.refresh(email)
+
+        assert email.suggested_folder == "Work/Projects"
+        assert "[learned]" in (email.reasoning or "")
+        assert "Work/Projects" in (email.reasoning or "")
+
+    def test_apply_prediction_hints_does_not_override_explicit_folder(self, db):
+        """Explicit analysis suggested_folder must NOT be overwritten."""
+        from src.services.prediction_signals import apply_prediction_hints
+
+        email = _make_email(
+            db, analysis_state="classified",
+            suggested_folder="Archive",
+            reasoning="Spam detection"
+        )
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="target_folder",
+            predicted_value="Work/Projects",
+            confidence=0.95,
+            explanation="should not override",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        apply_prediction_hints(db, [email])
+        db.refresh(email)
+
+        assert email.suggested_folder == "Archive"  # unchanged
+        assert "should not override" not in (email.reasoning or "")
+
+    def test_apply_prediction_hints_sets_action_required_from_reply_needed(self, db):
+        """reply_needed prediction sets action_required with preserved reasoning."""
+        from src.services.prediction_signals import apply_prediction_hints
+
+        email = _make_email(
+            db, analysis_state="classified",
+            action_required=False,
+            reasoning="Initial analysis"
+        )
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="reply_needed",
+            predicted_value=None,
+            confidence=0.75,
+            explanation="80% reply rate from sender_address",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        apply_prediction_hints(db, [email])
+        db.refresh(email)
+
+        assert email.action_required is True
+        assert "[learned]" in email.reasoning
+        assert "80% reply rate" in email.reasoning
+        # Original reasoning is preserved
+        assert "Initial analysis" in email.reasoning
+
+    def test_apply_prediction_hints_skips_low_confidence_reply(self, db):
+        """reply_needed prediction below threshold does NOT set action_required."""
+        from src.services.prediction_signals import apply_prediction_hints
+
+        email = _make_email(db, analysis_state="classified", action_required=False)
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="reply_needed",
+            predicted_value=None,
+            confidence=0.3,
+            explanation="low confidence reply signal",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        apply_prediction_hints(db, [email])
+        db.refresh(email)
+
+        assert email.action_required is not True
+
+    def test_apply_prediction_hints_does_not_override_explicit_action_required(self, db):
+        """When analysis already set action_required=True, reply hint doesn't matter."""
+        from src.services.prediction_signals import apply_prediction_hints
+
+        email = _make_email(
+            db, analysis_state="classified",
+            action_required=True,
+            reasoning="LLM flagged as urgent"
+        )
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="reply_needed",
+            predicted_value=None,
+            confidence=0.9,
+            explanation="high reply signal",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        apply_prediction_hints(db, [email])
+        db.refresh(email)
+
+        assert email.action_required is True  # still true
+        assert "LLM flagged as urgent" in email.reasoning
+        # Hint should NOT be appended since action_required was already True
+        assert "[learned]" not in email.reasoning
+
+    def test_apply_prediction_hints_importance_boost_backfills(self, db):
+        """importance_boost prediction backfills importance_score when absent."""
+        from src.services.prediction_signals import apply_prediction_hints
+        from src.services.importance_scorer import _IMPORTANCE_BASELINE
+
+        email = _make_email(
+            db, analysis_state="classified",
+            importance_score=None,
+        )
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="importance_boost",
+            predicted_value=None,
+            confidence=0.7,
+            explanation="high engagement sender",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        apply_prediction_hints(db, [email])
+        db.refresh(email)
+
+        assert email.importance_score is not None
+        assert email.importance_score > _IMPORTANCE_BASELINE
+        assert "[learned]" in (email.reasoning or "")
+        assert "importance boost" in (email.reasoning or "")
+
+    def test_apply_prediction_hints_does_not_replace_existing_importance(self, db):
+        """importance_boost must NOT replace an already-computed score."""
+        from src.services.prediction_signals import apply_prediction_hints
+
+        email = _make_email(
+            db, analysis_state="classified",
+            importance_score=55.0,
+        )
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="importance_boost",
+            predicted_value=None,
+            confidence=0.8,
+            explanation="should not change score",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        apply_prediction_hints(db, [email])
+        db.refresh(email)
+
+        assert email.importance_score == 55.0  # unchanged
+
+    def test_generate_email_predictions_creates_records(self, db):
+        """generate_email_predictions creates EmailPrediction rows for classified emails."""
+        from src.services.prediction_signals import generate_email_predictions
+
+        # Create a sender profile + folder aggregate so predictions can be generated
+        db.add(SenderProfile(
+            sender_domain="test.com",
+            sender_address="known@test.com",
+            total_emails=30,
+            folder_distribution={"Work": 25, "INBOX": 5},
+            importance_tendency=0.6,
+            reply_rate=0.7,
+            total_replies=21,
+            first_seen=datetime.now(timezone.utc),
+            last_seen=datetime.now(timezone.utc),
+        ))
+        db.add(FolderPlacementAggregate(
+            pattern_type="sender_address",
+            pattern_value="known@test.com",
+            target_folder="Work",
+            occurrence_count=15,
+            total_for_pattern=20,
+            confidence=0.75,
+        ))
+        db.commit()
+
+        email = _make_email(
+            db,
+            sender="known@test.com",
+            analysis_state="classified",
+            category="Business",
+        )
+
+        generate_email_predictions(db, [email])
+
+        preds = db.query(EmailPrediction).filter(
+            EmailPrediction.email_id == email.id
+        ).all()
+        # Should have generated at least one prediction
+        assert len(preds) > 0
+        types = {p.prediction_type for p in preds}
+        # target_folder or importance_boost or reply_needed expected
+        assert len(types) > 0
+
+    def test_enrich_and_apply_hints_end_to_end(self, db):
+        """enrich_and_apply_hints generates predictions AND applies them in one call."""
+        from src.services.prediction_signals import enrich_and_apply_hints
+
+        # Setup: create historical data that will produce a folder prediction
+        db.add(FolderPlacementAggregate(
+            pattern_type="sender_address",
+            pattern_value="ceo@corp.com",
+            target_folder="Management",
+            occurrence_count=20,
+            total_for_pattern=25,
+            confidence=0.80,
+        ))
+        db.commit()
+
+        email = _make_email(
+            db,
+            sender="ceo@corp.com",
+            analysis_state="classified",
+            suggested_folder=None,
+            category="Business",
+        )
+
+        enrich_and_apply_hints(db, [email])
+        db.refresh(email)
+
+        # Predictions should have been created
+        preds = db.query(EmailPrediction).filter(
+            EmailPrediction.email_id == email.id
+        ).all()
+        assert len(preds) > 0
+
+        # If a target_folder prediction was generated, suggested_folder should be backfilled
+        folder_preds = [p for p in preds if p.prediction_type == "target_folder"]
+        if folder_preds:
+            assert email.suggested_folder == "Management"
+
+    def test_skips_failed_emails(self, db):
+        """Predictions are not generated/consumed for failed emails."""
+        from src.services.prediction_signals import enrich_and_apply_hints
+
+        email = _make_email(db, analysis_state="failed")
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="target_folder",
+            predicted_value="ShouldNotApply",
+            confidence=0.9,
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        enrich_and_apply_hints(db, [email])
+        db.refresh(email)
+
+        assert email.suggested_folder is None  # not applied
+
+    def test_reasoning_append_preserves_original(self, db):
+        """When hints are applied, the original reasoning text is preserved."""
+        from src.services.prediction_signals import apply_prediction_hints
+
+        email = _make_email(
+            db, analysis_state="classified",
+            action_required=False,
+            reasoning="LLM analysis: normal business email",
+        )
+        db.add(EmailPrediction(
+            email_id=email.id,
+            prediction_type="reply_needed",
+            confidence=0.8,
+            explanation="sender has 80% reply rate",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        apply_prediction_hints(db, [email])
+        db.refresh(email)
+
+        assert email.reasoning.startswith("LLM analysis: normal business email")
+        assert "; [learned]" in email.reasoning
+        assert "80% reply rate" in email.reasoning
+
+
+# ===========================================================================
+# 15. Cross-path convergence: both runtime paths use shared signals
+# ===========================================================================
+
+class TestCrossPathConvergence:
+    """Verify that both the modern pipeline and EmailProcessor paths share
+    the same prediction-signal logic, preventing behavioral drift."""
+
+    def test_email_processor_has_prediction_hint_method(self):
+        """EmailProcessor must have _enrich_and_apply_prediction_hints method."""
+        import inspect
+        from src.services.email_processor import EmailProcessor
+        assert hasattr(EmailProcessor, "_enrich_and_apply_prediction_hints")
+        source = inspect.getsource(EmailProcessor._enrich_and_apply_prediction_hints)
+        assert "enrich_and_apply_hints" in source
+
+    def test_email_processor_process_emails_calls_hints(self):
+        """EmailProcessor.process_emails must call _enrich_and_apply_prediction_hints per batch."""
+        import inspect
+        from src.services.email_processor import EmailProcessor
+        source = inspect.getsource(EmailProcessor.process_emails)
+        assert "_enrich_and_apply_prediction_hints" in source
+
+    def test_pipeline_analysis_uses_shared_module(self):
+        """pipeline/analysis.py run_analysis must call the shared enrich_and_apply_hints."""
+        import inspect
+        from src.pipeline import analysis
+        source = inspect.getsource(analysis.run_analysis)
+        assert "enrich_and_apply_hints" in source
+
+    def test_both_paths_use_same_shared_module(self):
+        """Both paths must import from prediction_signals (no inline duplication)."""
+        import inspect
+        from src.pipeline import analysis
+        from src.services.email_processor import EmailProcessor
+
+        analysis_source = inspect.getsource(analysis)
+        processor_source = inspect.getsource(EmailProcessor._enrich_and_apply_prediction_hints)
+
+        # Both must reference the shared module
+        assert "prediction_signals" in analysis_source
+        assert "prediction_signals" in processor_source
+
+    def test_prediction_signals_module_has_all_exports(self):
+        """The shared prediction_signals module must expose the expected API."""
+        from src.services.prediction_signals import (
+            generate_email_predictions,
+            apply_prediction_hints,
+            enrich_and_apply_hints,
+        )
+        assert callable(generate_email_predictions)
+        assert callable(apply_prediction_hints)
+        assert callable(enrich_and_apply_hints)
