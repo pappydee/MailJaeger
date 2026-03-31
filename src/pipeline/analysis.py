@@ -202,33 +202,7 @@ def run_analysis(
     return stats
 
 
-def _enrich_batch_with_predictions(
-    db: Session,
-    batch: List[ProcessedEmail],
-    needs_llm: List[ProcessedEmail],
-) -> None:
-    """Generate and persist learned-behavior predictions for successfully analysed emails.
 
-    Delegates to the shared ``prediction_signals`` module so the logic is
-    reusable by all active runtime paths.
-    """
-    from src.services.prediction_signals import generate_email_predictions
-
-    all_emails = list(set(batch) | set(needs_llm))
-    generate_email_predictions(db, all_emails)
-
-
-def _apply_prediction_hints(
-    db: Session,
-    batch: List[ProcessedEmail],
-    needs_llm: List[ProcessedEmail],
-) -> None:
-    """Consume persisted EmailPrediction records as internal signals.
-
-    Delegates to the shared ``prediction_signals`` module so the logic is
-    reusable by all active runtime paths.
-    """
-    from src.services.prediction_signals import apply_prediction_hints
-
-    all_emails = list(set(batch) | set(needs_llm))
-    apply_prediction_hints(db, all_emails)
+# NOTE: All prediction generation and hint consumption is handled by the
+# shared ``prediction_signals`` module.  No inline logic should exist here.
+# See ``enrich_and_apply_hints`` call in ``run_analysis`` above.

@@ -65,8 +65,8 @@ URGENT_KEYWORDS: Tuple[str, ...] = (
 
 
 # Baseline importance score (neutral starting point).
-# Exported so downstream modules (e.g. _apply_prediction_hints) can
-# reference the same value instead of hard-coding a magic number.
+# Exported so the shared prediction_signals module can reference
+# the same value instead of hard-coding a magic number.
 _IMPORTANCE_BASELINE = 30.0
 
 

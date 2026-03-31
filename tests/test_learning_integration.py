@@ -419,13 +419,13 @@ class TestAnalysisEnrichment:
         db.commit()
 
         # The enrichment function should generate predictions
-        from src.pipeline.analysis import _enrich_batch_with_predictions
+        from src.services.prediction_signals import generate_email_predictions
         # Simulate post-analysis by setting state
         new_email.analysis_state = "classified"
         db.add(new_email)
         db.commit()
 
-        _enrich_batch_with_predictions(db, [new_email], [])
+        generate_email_predictions(db, [new_email])
 
         preds = db.query(EmailPrediction).filter(
             EmailPrediction.email_id == new_email.id,
@@ -441,7 +441,7 @@ class TestAnalysisEnrichment:
 
     def test_enrichment_skips_failed_emails(self, db):
         """Emails with analysis_state='failed' should not get predictions."""
-        from src.pipeline.analysis import _enrich_batch_with_predictions
+        from src.services.prediction_signals import generate_email_predictions
 
         failed_email = _make_email(
             db, message_id="fail@test.com",
@@ -450,7 +450,7 @@ class TestAnalysisEnrichment:
         )
         db.commit()
 
-        _enrich_batch_with_predictions(db, [failed_email], [])
+        generate_email_predictions(db, [failed_email])
 
         preds = db.query(EmailPrediction).filter(
             EmailPrediction.email_id == failed_email.id,
@@ -805,15 +805,19 @@ class TestSenderPrecedenceHelper:
 
 
 # ===========================================================================
-# 11. Prediction consumption — _apply_prediction_hints
+# 11. Prediction consumption — prediction_signals.apply_prediction_hints
 # ===========================================================================
 
 class TestPredictionConsumption:
-    """Verify that _apply_prediction_hints actually consumes stored predictions."""
+    """Verify that apply_prediction_hints actually consumes stored predictions.
+
+    All tests use the canonical ``prediction_signals.apply_prediction_hints``
+    — the single source of truth for hint application.
+    """
 
     def test_target_folder_backfills_suggested_folder(self, db):
         """When analysis didn't set suggested_folder, prediction fills it."""
-        from src.pipeline.analysis import _apply_prediction_hints
+        from src.services.prediction_signals import apply_prediction_hints
 
         email = _make_email(db, sender="alice@hospital.org", analysis_state="classified",
                             suggested_folder=None, action_required=False)
@@ -828,14 +832,14 @@ class TestPredictionConsumption:
         ))
         db.commit()
 
-        _apply_prediction_hints(db, [email], [])
+        apply_prediction_hints(db, [email])
 
         db.refresh(email)
         assert email.suggested_folder == "Klinik/Eingehend"
 
     def test_target_folder_does_not_override_existing(self, db):
         """When analysis already set suggested_folder, prediction does NOT override."""
-        from src.pipeline.analysis import _apply_prediction_hints
+        from src.services.prediction_signals import apply_prediction_hints
 
         email = _make_email(db, sender="bob@lab.com", analysis_state="deep_analyzed",
                             suggested_folder="Archive")
@@ -848,14 +852,14 @@ class TestPredictionConsumption:
         ))
         db.commit()
 
-        _apply_prediction_hints(db, [email], [])
+        apply_prediction_hints(db, [email])
 
         db.refresh(email)
         assert email.suggested_folder == "Archive"  # unchanged
 
     def test_reply_needed_sets_action_required(self, db):
         """When reply_needed prediction is high and action_required unset, it becomes True."""
-        from src.pipeline.analysis import _apply_prediction_hints
+        from src.services.prediction_signals import apply_prediction_hints
 
         email = _make_email(db, sender="urgent@dept.org", analysis_state="classified",
                             action_required=False)
@@ -869,7 +873,7 @@ class TestPredictionConsumption:
         ))
         db.commit()
 
-        _apply_prediction_hints(db, [email], [])
+        apply_prediction_hints(db, [email])
 
         db.refresh(email)
         assert email.action_required is True
@@ -877,7 +881,7 @@ class TestPredictionConsumption:
 
     def test_reply_needed_does_not_override_existing_action_required(self, db):
         """When action_required is already True, prediction doesn't change it."""
-        from src.pipeline.analysis import _apply_prediction_hints
+        from src.services.prediction_signals import apply_prediction_hints
 
         email = _make_email(db, sender="ok@test.com", analysis_state="classified",
                             action_required=True, reasoning="LLM said so")
@@ -891,7 +895,7 @@ class TestPredictionConsumption:
         ))
         db.commit()
 
-        _apply_prediction_hints(db, [email], [])
+        apply_prediction_hints(db, [email])
 
         db.refresh(email)
         assert email.action_required is True
@@ -899,7 +903,7 @@ class TestPredictionConsumption:
 
     def test_reply_needed_below_threshold_no_change(self, db):
         """reply_needed with low confidence doesn't set action_required."""
-        from src.pipeline.analysis import _apply_prediction_hints
+        from src.services.prediction_signals import apply_prediction_hints
 
         email = _make_email(db, sender="low@test.com", analysis_state="classified",
                             action_required=False)
@@ -913,14 +917,14 @@ class TestPredictionConsumption:
         ))
         db.commit()
 
-        _apply_prediction_hints(db, [email], [])
+        apply_prediction_hints(db, [email])
 
         db.refresh(email)
         assert email.action_required is False  # unchanged
 
     def test_importance_boost_backfills_when_none(self, db):
         """importance_boost fills importance_score when it was None."""
-        from src.pipeline.analysis import _apply_prediction_hints
+        from src.services.prediction_signals import apply_prediction_hints
         from src.services.importance_scorer import _IMPORTANCE_BASELINE
 
         email = _make_email(db, sender="vip@company.com", analysis_state="classified",
@@ -935,7 +939,7 @@ class TestPredictionConsumption:
         ))
         db.commit()
 
-        _apply_prediction_hints(db, [email], [])
+        apply_prediction_hints(db, [email])
 
         db.refresh(email)
         assert email.importance_score is not None
@@ -944,7 +948,7 @@ class TestPredictionConsumption:
 
     def test_importance_boost_skips_when_already_scored(self, db):
         """importance_boost does NOT apply when importance_score already set."""
-        from src.pipeline.analysis import _apply_prediction_hints
+        from src.services.prediction_signals import apply_prediction_hints
 
         email = _make_email(db, sender="known@org.com", analysis_state="classified",
                             importance_score=55.0)
@@ -958,14 +962,14 @@ class TestPredictionConsumption:
         ))
         db.commit()
 
-        _apply_prediction_hints(db, [email], [])
+        apply_prediction_hints(db, [email])
 
         db.refresh(email)
         assert email.importance_score == pytest.approx(55.0, abs=0.1)  # unchanged
 
     def test_skips_failed_emails(self, db):
         """Predictions for failed emails are not consumed."""
-        from src.pipeline.analysis import _apply_prediction_hints
+        from src.services.prediction_signals import apply_prediction_hints
 
         email = _make_email(db, sender="fail@test.com", analysis_state="failed",
                             suggested_folder=None)
@@ -978,7 +982,7 @@ class TestPredictionConsumption:
         ))
         db.commit()
 
-        _apply_prediction_hints(db, [email], [])
+        apply_prediction_hints(db, [email])
 
         db.refresh(email)
         assert email.suggested_folder is None  # not applied
@@ -1033,12 +1037,14 @@ class TestAntiDrift:
         source = inspect.getsource(analysis.run_analysis)
         assert "enrich_and_apply_hints" in source
 
-    def test_analysis_pipeline_calls_enrich_batch(self):
-        """The delegate _enrich_batch_with_predictions must call the shared module."""
+    def test_analysis_module_has_no_inline_hint_logic(self):
+        """analysis.py must NOT contain stale delegate functions — all logic is in prediction_signals."""
         import inspect
         from src.pipeline import analysis
-        source = inspect.getsource(analysis._enrich_batch_with_predictions)
-        assert "generate_email_predictions" in source
+        source = inspect.getsource(analysis)
+        # The old delegates must be gone
+        assert "def _enrich_batch_with_predictions" not in source
+        assert "def _apply_prediction_hints" not in source
 
 
 # ===========================================================================
