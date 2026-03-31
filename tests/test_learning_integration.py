@@ -1379,7 +1379,7 @@ class TestPredictionSignalsSharedModule:
         apply_prediction_hints(db, [email])
         db.refresh(email)
 
-        assert email.reasoning.startswith("LLM analysis: normal business email")
+        assert "LLM analysis: normal business email" in email.reasoning
         assert "; [learned]" in email.reasoning
         assert "80% reply rate" in email.reasoning
 

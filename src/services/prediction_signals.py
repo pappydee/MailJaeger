@@ -22,6 +22,10 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Confidence threshold for reply-needed predictions to set action_required.
+# Predictions with confidence below this value are not strong enough to flag.
+_REPLY_CONFIDENCE_THRESHOLD = 0.5
+
 
 def generate_email_predictions(
     db: Session,
@@ -100,7 +104,7 @@ def apply_prediction_hints(
                     # If analysis did not flag action_required but learned
                     # signal indicates high reply probability, set it.
                     confidence = pred.confidence or 0.0
-                    if not email_record.action_required and confidence >= 0.5:
+                    if not email_record.action_required and confidence >= _REPLY_CONFIDENCE_THRESHOLD:
                         email_record.action_required = True
                         hint_reason = (
                             f"[learned] {pred.explanation or 'reply likely'}"
