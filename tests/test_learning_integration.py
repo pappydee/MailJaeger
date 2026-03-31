@@ -671,11 +671,11 @@ class TestSourceInspectionWiring:
     """Secondary enforcement: confirm key integration points exist in source."""
 
     def test_analysis_py_calls_enrich_batch(self):
-        """The analysis module must call _enrich_batch_with_predictions."""
+        """The analysis module must call the shared prediction signal helper."""
         import inspect
         from src.pipeline import analysis
         source = inspect.getsource(analysis.run_analysis)
-        assert "_enrich_batch_with_predictions" in source
+        assert "enrich_and_apply_hints" in source
 
     def test_importance_scorer_calls_learned_behavior_boost(self):
         """compute_importance_score must call _learned_behavior_boost."""
@@ -1027,18 +1027,18 @@ class TestAntiDrift:
         assert "_get_or_create_sender_profile" in source
 
     def test_analysis_pipeline_calls_apply_prediction_hints(self):
-        """The analysis module must call _apply_prediction_hints after enrichment."""
+        """The analysis module must call the shared prediction signals helper."""
         import inspect
         from src.pipeline import analysis
         source = inspect.getsource(analysis.run_analysis)
-        assert "_apply_prediction_hints" in source
+        assert "enrich_and_apply_hints" in source
 
     def test_analysis_pipeline_calls_enrich_batch(self):
-        """The analysis module must call _enrich_batch_with_predictions."""
+        """The delegate _enrich_batch_with_predictions must call the shared module."""
         import inspect
         from src.pipeline import analysis
-        source = inspect.getsource(analysis.run_analysis)
-        assert "_enrich_batch_with_predictions" in source
+        source = inspect.getsource(analysis._enrich_batch_with_predictions)
+        assert "generate_email_predictions" in source
 
 
 # ===========================================================================
