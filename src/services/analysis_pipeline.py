@@ -3,6 +3,11 @@ Multi-Stage Analysis Pipeline — Priority 9
 
 Implements a staged pipeline to avoid sending every email to the LLM.
 
+Stage 0 — Learned rule-based classification (no LLM)
+  Uses: SenderProfile learned from user classifications, newsletter/spam heuristics
+  Delegates to ``rule_based_classify()`` in ``src/services/learning_loop.py``
+  Result: deterministic classification for known senders; skips all later stages
+
 Stage 1 — Fast pre-classification (no LLM)
   Uses: sender, domain, subject, folder, snippet, known patterns
   Detects: newsletters, automated messages, known senders
@@ -12,7 +17,7 @@ Stage 2 — Lightweight rule-based classification
   Result: high-confidence classification without LLM
 
 Stage 3 — Deep LLM analysis
-  Only when Stages 1 and 2 are inconclusive
+  Only when Stages 0, 1, and 2 are inconclusive
   Uses: full email content via Ollama
 """
 

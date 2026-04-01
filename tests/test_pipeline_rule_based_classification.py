@@ -900,3 +900,101 @@ class TestSenderNormalization:
 
         assert result["confident"] is True
         assert result["analysis"]["category"] == "newsletter"
+
+
+# ── Test: Cross-path consistency ────────────────────────────────────
+
+
+class TestCrossPathConsistency:
+    """Verify all three production paths produce identical Stage 0 outcomes."""
+
+    def _create_known_sender_scenario(self, db_session):
+        """Set up a known sender + pending email for all paths."""
+        _make_sender_profile(
+            db_session,
+            sender_address="crosspath@company.com",
+            sender_domain="company.com",
+            preferred_category="work",
+            preferred_folder="Work",
+            user_classification_count=4,
+        )
+
+    def test_all_paths_classify_known_sender_identically(self, db_session):
+        """AnalysisPipeline.analyse, run_analysis, and _process_indexed_email_stages12
+        all produce identical learned_classified state for a known sender."""
+        from src.services.analysis_pipeline import AnalysisPipeline
+        from src.pipeline.analysis import run_analysis
+        from src.services.email_processor import EmailProcessor
+
+        self._create_known_sender_scenario(db_session)
+
+        # -- Path 1: AnalysisPipeline.analyse() --
+        email1 = _make_email(
+            db_session,
+            message_id="crosspath-1@test.com",
+            sender="crosspath@company.com",
+            subject="Path 1 test",
+            analysis_state="pending",
+        )
+        pipeline = AnalysisPipeline(db_session)
+        analysis1 = pipeline.analyse(email1)
+        pipeline.apply_analysis_to_record(email1, analysis1)
+        db_session.commit()
+
+        # -- Path 2: run_analysis() --
+        email2 = _make_email(
+            db_session,
+            message_id="crosspath-2@test.com",
+            sender="crosspath@company.com",
+            subject="Path 2 test",
+            analysis_state="pending",
+        )
+        with patch("src.pipeline.analysis.get_settings") as mock_settings:
+            settings = MagicMock()
+            settings.max_emails_per_run = 10
+            settings.ai_batch_size = 5
+            settings.max_llm_calls_per_run = 10
+            settings.max_runtime_minutes = 5
+            settings.debug = False
+            settings.spam_threshold = 0.8
+            mock_settings.return_value = settings
+            with patch("src.pipeline.analysis._compute_pending_importance_scores"), \
+                 patch("src.services.prediction_signals.enrich_and_apply_hints"):
+                run_analysis(db_session)
+
+        db_session.refresh(email2)
+
+        # -- Path 3: EmailProcessor._process_indexed_email_stages12() --
+        email3 = _make_email(
+            db_session,
+            message_id="crosspath-3@test.com",
+            sender="crosspath@company.com",
+            subject="Path 3 test",
+            analysis_state="pending",
+        )
+        with patch("src.services.email_processor.get_settings") as mock_settings:
+            settings = MagicMock()
+            settings.safe_mode = True
+            settings.require_approval = False
+            settings.debug = False
+            settings.spam_threshold = 0.8
+            settings.max_llm_calls_per_run = 10
+            settings.max_runtime_minutes = 5
+            settings.max_emails_per_batch = 50
+            mock_settings.return_value = settings
+            processor = EmailProcessor.__new__(EmailProcessor)
+            processor.settings = settings
+            processor.db = db_session
+            processor.ai_service = MagicMock()
+            processor.stats = {"processed": 0, "spam": 0, "archived": 0, "action_required": 0, "failed": 0}
+            needs_llm = processor._process_indexed_email_stages12(email3, None)
+
+        db_session.refresh(email3)
+
+        # All three paths must produce identical outcomes
+        for label, email in [("analyse()", email1), ("run_analysis()", email2), ("stages12()", email3)]:
+            assert email.analysis_state == "learned_classified", f"{label}: expected learned_classified, got {email.analysis_state}"
+            assert email.category == "work", f"{label}: expected work, got {email.category}"
+            assert "Learned from previous user classification" in (email.reasoning or ""), f"{label}: missing explanation"
+
+        assert needs_llm is False  # Path 3 confirms LLM not needed
