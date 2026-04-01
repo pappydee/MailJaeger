@@ -563,6 +563,30 @@ See [System Overview § High-Priority Next Steps](docs/SYSTEM_OVERVIEW.md#10-hig
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
+## Versioning
+
+**Current version:** `1.1.0` (defined in `src/version.py`)
+
+MailJaeger uses [Semantic Versioning](https://semver.org/):
+
+| Component | When to bump |
+|-----------|-------------|
+| **MAJOR** (X.0.0) | Incompatible API or config changes |
+| **MINOR** (0.X.0) | New features, backward-compatible |
+| **PATCH** (0.0.X) | Bug fixes, backward-compatible |
+
+### How to bump the version
+
+1. Edit `src/version.py` — change the `VERSION` string
+2. Add a changelog entry in `src/__init__.py` → `CHANGELOG` list
+3. Commit with a message like `bump: v1.2.0 — <summary>`
+
+The version is automatically exposed via:
+- **API:** `GET /api/version` and `GET /api/health`
+- **UI:** version badge in the header (fetched from `/api/version`)
+
+No automatic release tooling — version bumps are human-controlled and explicit.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

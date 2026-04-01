@@ -3034,6 +3034,7 @@ async def health_check():
 
     return {
         "status": "healthy",
+        "version": __version__,
         "checks": {
             "mail_server": imap_service.check_health(),
             "ai_service": ai_service.check_health(),

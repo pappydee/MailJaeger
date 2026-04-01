@@ -1,6 +1,8 @@
 """MailJaeger - Local AI email processing system"""
 
-__version__ = "1.1.1"
+from src.version import VERSION
+
+__version__ = VERSION
 __author__ = "MailJaeger Team"
 __description__ = "Fully local, privacy-first AI email processing system"
 

@@ -1,4 +1,4 @@
-// MailJaeger Dashboard — v1.1.0
+// MailJaeger Dashboard — version fetched dynamically from /api/version
 
 const API_BASE = window.location.origin;
 
