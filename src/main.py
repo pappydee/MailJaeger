@@ -1586,6 +1586,71 @@ async def get_processing_run(run_id: int, db: Session = Depends(get_db)):
     return ProcessingRunResponse.from_orm(run)
 
 
+# ---------------------------------------------------------------------------
+# Historical Learning Job Endpoints
+# ---------------------------------------------------------------------------
+
+_learning_cancel_requested = False
+
+
+@app.post("/api/learning/start", dependencies=[Depends(require_authentication)])
+@limiter.limit("5/minute")
+async def start_learning_job(request: Request, db: Session = Depends(get_db)):
+    """Start (or resume) the historical mailbox learning job.
+
+    The job runs synchronously in-process, scanning all indexed folders
+    in batches.  It is safe to call multiple times — already-processed
+    emails are never relearned.
+
+    Query parameters:
+      batch_size (int, default 100): Emails per batch
+      max_runtime_seconds (int, optional): Time budget; job pauses when exceeded
+    """
+    global _learning_cancel_requested
+    _learning_cancel_requested = False
+
+    batch_size = int(request.query_params.get("batch_size", "100"))
+    max_runtime_raw = request.query_params.get("max_runtime_seconds")
+    max_runtime = int(max_runtime_raw) if max_runtime_raw else None
+
+    from src.pipeline.historical_learning_job import run_historical_learning_job
+
+    stats = run_historical_learning_job(
+        db,
+        batch_size=batch_size,
+        max_runtime_seconds=max_runtime,
+        cancel_requested=lambda: _learning_cancel_requested,
+    )
+    return {"success": True, **stats}
+
+
+@app.post("/api/learning/stop", dependencies=[Depends(require_authentication)])
+@limiter.limit("10/minute")
+async def stop_learning_job(request: Request, db: Session = Depends(get_db)):
+    """Request the running historical learning job to stop.
+
+    If the job is running in this process, the cancel signal is set and
+    the job will stop at the next batch boundary.  The DB status is also
+    set to ``paused`` so a future ``/api/learning/start`` resumes from
+    the saved checkpoint.
+    """
+    global _learning_cancel_requested
+    _learning_cancel_requested = True
+
+    from src.pipeline.historical_learning_job import pause_historical_learning_job
+
+    result = pause_historical_learning_job(db)
+    return result
+
+
+@app.get("/api/learning/status", dependencies=[Depends(require_authentication)])
+async def learning_job_status(db: Session = Depends(get_db)):
+    """Return the current historical learning job status and per-folder progress."""
+    from src.pipeline.historical_learning_job import get_historical_learning_status
+
+    return get_historical_learning_status(db)
+
+
 @app.get("/api/settings", dependencies=[Depends(require_authentication)])
 async def get_settings_api(db: Session = Depends(get_db)):
     """Get current settings (sanitized - no sensitive credentials)"""
