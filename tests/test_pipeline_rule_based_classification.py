@@ -12,6 +12,7 @@ Verifies that:
 """
 
 import pytest
+import uuid
 from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
 
@@ -26,6 +27,8 @@ from src.models.database import (
     ClassificationOverride,
     AnalysisProgress,
 )
+
+_email_counter = 0
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────
@@ -45,9 +48,12 @@ def db_session(tmp_path):
 
 def _make_email(db_session, **kwargs):
     """Helper to create a ProcessedEmail with sensible defaults."""
+    global _email_counter
+    _email_counter += 1
+    uid_val = str(100 + _email_counter)
     defaults = dict(
-        message_id=f"test-{id(kwargs)}@example.com",
-        uid=str(100 + id(kwargs) % 1000),
+        message_id=f"test-{_email_counter}@example.com",
+        uid=uid_val,
         subject="Test Email",
         sender="unknown@example.com",
         category=None,

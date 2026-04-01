@@ -30,6 +30,11 @@ logger = get_logger(__name__)
 
 PIPELINE_VERSION = "1.0.0"
 
+# Spam probability thresholds for learned classification results
+_LEARNED_SPAM_PROB = 0.9
+_LEARNED_NEWSLETTER_PROB = 0.65
+_LEARNED_DEFAULT_PROB = 0.1
+
 # Known newsletter/automated sender patterns for Stage 1
 _NEWSLETTER_PATTERNS = [
     r"newsletter",
@@ -229,7 +234,7 @@ class AnalysisPipeline:
         # Map learned result to standard analysis dict
         is_spam = category.lower() == "spam"
         is_newsletter = category.lower() == "newsletter"
-        spam_prob = 0.9 if is_spam else (0.65 if is_newsletter else 0.1)
+        spam_prob = _LEARNED_SPAM_PROB if is_spam else (_LEARNED_NEWSLETTER_PROB if is_newsletter else _LEARNED_DEFAULT_PROB)
         action_required = category.lower() in ("work", "todo")
 
         analysis = {
