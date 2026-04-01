@@ -187,6 +187,12 @@ def run_analysis(
 
         db.commit()
 
+        # Post-analysis enrichment: generate + consume learned predictions
+        # (shared helper ensures all runtime paths behave identically)
+        from src.services.prediction_signals import enrich_and_apply_hints
+        all_in_batch = list(set(batch) | set(needs_llm))
+        enrich_and_apply_hints(db, all_in_batch)
+
     logger.info(
         "analysis_complete analysed=%s failed=%s llm_calls=%s",
         stats["analysed"],
@@ -194,3 +200,9 @@ def run_analysis(
         stats["llm_calls"],
     )
     return stats
+
+
+
+# NOTE: All prediction generation and hint consumption is handled by the
+# shared ``prediction_signals`` module.  No inline logic should exist here.
+# See ``enrich_and_apply_hints`` call in ``run_analysis()``.

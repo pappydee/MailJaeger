@@ -434,6 +434,10 @@ class EmailProcessor:
                     if needs_llm:
                         self._process_batch_llm(needs_llm, imap_for_actions)
 
+                    # Post-analysis: generate + consume learned prediction hints
+                    # (shared helper ensures both pipeline paths behave identically)
+                    self._enrich_and_apply_prediction_hints(batch)
+
             finally:
                 if imap_for_actions:
                     try:
@@ -720,6 +724,28 @@ class EmailProcessor:
         except Exception as e:
             sanitized = sanitize_error(e, debug=self.settings.debug)
             logger.warning(f"Failed to compute importance scores: {sanitized}")
+
+    def _enrich_and_apply_prediction_hints(
+        self, emails: List[ProcessedEmail]
+    ) -> None:
+        """Generate + consume learned prediction hints for a batch of emails.
+
+        Delegates to the shared ``prediction_signals`` module so the same
+        hint-application logic is used by both the ``EmailProcessor`` path
+        and the ``pipeline/analysis.py`` path.
+
+        Integration point: called once per batch after Stage 1/2/3 analysis
+        and IMAP action execution are complete.
+        """
+        try:
+            from src.services.prediction_signals import enrich_and_apply_hints
+
+            enrich_and_apply_hints(self.db, emails)
+        except Exception as e:
+            sanitized = sanitize_error(e, debug=self.settings.debug)
+            logger.warning(
+                f"Failed to apply prediction hints: {sanitized}"
+            )
 
     def _process_indexed_email_stages12(
         self,

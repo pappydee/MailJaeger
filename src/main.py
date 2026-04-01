@@ -215,6 +215,42 @@ def _record_decision_event(
     )
 
 
+def _record_user_action_for_execution(
+    db: Session,
+    email: ProcessedEmail,
+    action: "ActionQueue",
+) -> None:
+    """Record a user action for sender-profile learning after action execution.
+
+    Maps ActionQueue.action_type to historical learning action types and
+    updates both address-level and domain-level SenderProfiles.
+    """
+    try:
+        from src.services.historical_learning import record_user_action
+
+        action_map = {
+            "move": "moved_to_folder",
+            "archive": "archived",
+            "delete": "deleted",
+            "mark_spam": "marked_spam",
+            "mark_important": "marked_important",
+        }
+        learning_action = action_map.get(action.action_type)
+        if not learning_action:
+            return
+
+        payload = action.payload if isinstance(action.payload, dict) else {}
+        record_user_action(
+            db,
+            email,
+            learning_action,
+            new_folder=payload.get("target_folder"),
+            source="action_execution",
+        )
+    except Exception as exc:
+        logger.warning("Failed to record user action for learning: %s", exc)
+
+
 def _build_reply_draft_payload(subject: Optional[str]) -> Dict[str, str]:
     safe_subject = subject or "(kein Betreff)"
     return {
@@ -2032,6 +2068,9 @@ async def execute_action(
                         target_folder=move_payload.get("target_folder"),
                         email=email,
                     )
+                # Record user action for sender-profile learning (address + domain)
+                if email:
+                    _record_user_action_for_execution(db, email, action)
             logger.info(
                 "Action %s execution result action_type=%s status=%s",
                 action.id,

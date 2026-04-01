@@ -7,6 +7,7 @@ Computes a 0–100 importance score for an email based on:
   - Thread participation
   - Urgent-keyword heuristics
   - Sender domain reputation (historical action-required rate)
+  - Learned sender-profile behavior (address-level > domain fallback)
 
 Higher score → higher priority → processed first.
 
@@ -14,10 +15,10 @@ This module has no side effects and does not depend on EmailProcessor.
 """
 
 from datetime import datetime, timezone
-from typing import Tuple
+from typing import Optional, Tuple
 from sqlalchemy.orm import Session
 
-from src.models.database import ProcessedEmail
+from src.models.database import ProcessedEmail, SenderProfile
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -63,6 +64,12 @@ URGENT_KEYWORDS: Tuple[str, ...] = (
 )
 
 
+# Baseline importance score (neutral starting point).
+# Exported so the shared prediction_signals module can reference
+# the same value instead of hard-coding a magic number.
+_IMPORTANCE_BASELINE = 30.0
+
+
 def compute_importance_score(
     db: Session, email_record: ProcessedEmail
 ) -> float:
@@ -72,7 +79,7 @@ def compute_importance_score(
     This is a pure function (no IMAP side effects).  The DB session is
     used only for sender-domain reputation queries.
     """
-    score = 30.0  # neutral baseline
+    score = _IMPORTANCE_BASELINE
 
     subject = (email_record.subject or "").lower()
     sender = (email_record.sender or "").lower()
@@ -130,6 +137,9 @@ def compute_importance_score(
     except Exception:
         pass
 
+    # Learned sender-profile behavior (address-level preferred, domain fallback)
+    score += _learned_behavior_boost(db, sender)
+
     return max(0.0, min(100.0, score))
 
 
@@ -153,3 +163,53 @@ def compute_pending_importance_scores(db: Session) -> None:
         db.commit()
     except Exception as e:
         logger.warning("Failed to compute importance scores: %s", e)
+
+
+# Minimum historical emails before learned profile influences scoring
+_MIN_PROFILE_SUPPORT = 3
+
+
+def _learned_behavior_boost(db: Session, sender: str) -> float:
+    """Compute an importance adjustment from learned SenderProfile data.
+
+    Resolves the best matching profile via the centralized
+    ``resolve_sender_profile`` helper (address > domain precedence).
+
+    Signals used (each adds up to a small bounded bonus/penalty):
+      - importance_tendency (marked-important rate)
+      - kept_in_inbox_count / total_emails (engagement rate)
+      - spam_tendency (spam penalty)
+      - reply_rate (high reply rate = importance signal)
+
+    Returns a bounded adjustment in the range [-10, +15].
+    """
+    try:
+        from src.services.sender_precedence import resolve_sender_profile
+
+        profile = resolve_sender_profile(db, sender, min_support=_MIN_PROFILE_SUPPORT)
+        if not profile:
+            return 0.0
+
+        boost = 0.0
+
+        # Importance tendency: +5 if > 10%
+        if (profile.importance_tendency or 0) > 0.1:
+            boost += 5.0
+
+        # Kept-in-inbox engagement: +5 if > 50%
+        total = profile.total_emails or 1
+        inbox_rate = (profile.kept_in_inbox_count or 0) / total
+        if inbox_rate > 0.5:
+            boost += 5.0
+
+        # Reply rate: +5 if > 50%
+        if (profile.reply_rate or 0) > 0.5:
+            boost += 5.0
+
+        # Spam tendency penalty: -10 if > 50%
+        if (profile.spam_tendency or 0) > 0.5:
+            boost -= 10.0
+
+        return max(-10.0, min(15.0, boost))
+    except Exception:
+        return 0.0
