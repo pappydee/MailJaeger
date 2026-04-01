@@ -792,9 +792,20 @@ app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle validation errors with sanitized responses"""
     logger.warning(f"Validation error on {request.url.path}: {exc.errors()}")
+    # Sanitize errors to ensure JSON-serializable output (ctx may contain
+    # non-serializable objects like ValueError instances)
+    safe_errors = []
+    for err in exc.errors():
+        safe_err = {k: v for k, v in err.items() if k != "ctx"}
+        if "ctx" in err and isinstance(err["ctx"], dict):
+            safe_err["ctx"] = {
+                k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
+                for k, v in err["ctx"].items()
+            }
+        safe_errors.append(safe_err)
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": "Invalid request data", "errors": exc.errors()},
+        content={"detail": "Invalid request data", "errors": safe_errors},
     )
 
 
