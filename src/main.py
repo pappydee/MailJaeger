@@ -27,6 +27,7 @@ import secrets
 import hashlib
 import json
 import time
+import threading
 
 from src.config import get_settings
 from src.database.connection import init_db, get_db, get_engine, get_db_session
@@ -1590,7 +1591,7 @@ async def get_processing_run(run_id: int, db: Session = Depends(get_db)):
 # Historical Learning Job Endpoints
 # ---------------------------------------------------------------------------
 
-_learning_cancel_event = __import__("threading").Event()
+_learning_cancel_event = threading.Event()
 
 
 @app.post("/api/learning/start", dependencies=[Depends(require_authentication)])
@@ -1608,9 +1609,15 @@ async def start_learning_job(request: Request, db: Session = Depends(get_db)):
     """
     _learning_cancel_event.clear()
 
-    batch_size = int(request.query_params.get("batch_size", "100"))
+    try:
+        batch_size = int(request.query_params.get("batch_size", "100"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="batch_size must be an integer")
     max_runtime_raw = request.query_params.get("max_runtime_seconds")
-    max_runtime = int(max_runtime_raw) if max_runtime_raw else None
+    try:
+        max_runtime = int(max_runtime_raw) if max_runtime_raw else None
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="max_runtime_seconds must be an integer")
 
     from src.pipeline.historical_learning_job import run_historical_learning_job
 
