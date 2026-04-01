@@ -226,9 +226,9 @@ def _process_folder(
     db.add(progress)
     db.commit()
 
-    folder_stats: Dict[str, int] = {
+    folder_stats: Dict[str, Any] = {
         "learned": 0, "replies_linked": 0, "predictions": 0,
-        "failed": 0, "skipped": 0, "stopped_early": 0,
+        "failed": 0, "skipped": 0, "stopped_early": False,
     }
     cursor = progress.last_processed_email_id
     exhausted = False  # True when the folder has no more emails to process
@@ -236,7 +236,7 @@ def _process_folder(
     while True:
         # Check cancellation between batches
         if should_stop and should_stop():
-            folder_stats["stopped_early"] = 1
+            folder_stats["stopped_early"] = True
             logger.info("historical_learning_folder_stopped folder=%s", folder_name)
             break
 

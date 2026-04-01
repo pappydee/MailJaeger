@@ -1590,7 +1590,7 @@ async def get_processing_run(run_id: int, db: Session = Depends(get_db)):
 # Historical Learning Job Endpoints
 # ---------------------------------------------------------------------------
 
-_learning_cancel_requested = False
+_learning_cancel_event = __import__("threading").Event()
 
 
 @app.post("/api/learning/start", dependencies=[Depends(require_authentication)])
@@ -1606,8 +1606,7 @@ async def start_learning_job(request: Request, db: Session = Depends(get_db)):
       batch_size (int, default 100): Emails per batch
       max_runtime_seconds (int, optional): Time budget; job pauses when exceeded
     """
-    global _learning_cancel_requested
-    _learning_cancel_requested = False
+    _learning_cancel_event.clear()
 
     batch_size = int(request.query_params.get("batch_size", "100"))
     max_runtime_raw = request.query_params.get("max_runtime_seconds")
@@ -1619,7 +1618,7 @@ async def start_learning_job(request: Request, db: Session = Depends(get_db)):
         db,
         batch_size=batch_size,
         max_runtime_seconds=max_runtime,
-        cancel_requested=lambda: _learning_cancel_requested,
+        cancel_requested=_learning_cancel_event.is_set,
     )
     return {"success": True, **stats}
 
@@ -1634,8 +1633,7 @@ async def stop_learning_job(request: Request, db: Session = Depends(get_db)):
     set to ``paused`` so a future ``/api/learning/start`` resumes from
     the saved checkpoint.
     """
-    global _learning_cancel_requested
-    _learning_cancel_requested = True
+    _learning_cancel_event.set()
 
     from src.pipeline.historical_learning_job import pause_historical_learning_job
 
