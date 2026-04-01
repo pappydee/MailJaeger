@@ -764,6 +764,14 @@ class EmailProcessor:
 
         pipeline = AnalysisPipeline(self.db)
 
+        # Stage 0: Learned rule-based classification
+        learned = pipeline.stage_learned_classify(email_record)
+        if learned["confident"]:
+            pipeline.record_decision(email_record, "learned_classified", learned)
+            pipeline.update_analysis_state(email_record, "learned_classified")
+            self._apply_analysis_and_act(email_record, learned["analysis"], imap)
+            return False
+
         # Stage 1
         stage1 = pipeline.stage1_pre_classify(email_record)
         if stage1["confident"]:
