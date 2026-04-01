@@ -42,9 +42,12 @@ class TestVersionSingleSourceOfTruth:
         from src import __version__
         assert __version__ == VERSION
 
-    def test_version_is_1_1_0(self):
+    def test_initial_version_is_semver(self):
         from src.version import VERSION
-        assert VERSION == "1.1.0"
+        parts = VERSION.split(".")
+        assert len(parts) == 3, "VERSION must be semver MAJOR.MINOR.PATCH"
+        for part in parts:
+            assert part.isdigit(), f"VERSION segment '{part}' must be numeric"
 
 
 class TestApiVersionEndpoint:

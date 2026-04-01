@@ -565,7 +565,7 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for gu
 
 ## Versioning
 
-**Current version:** `1.1.0` (defined in `src/version.py`)
+**Current version:** `1.1.0` (defined in [`src/version.py`](src/version.py) — update this value when bumping)
 
 MailJaeger uses [Semantic Versioning](https://semver.org/):
 
