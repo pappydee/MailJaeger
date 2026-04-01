@@ -361,10 +361,12 @@ class ApplyActionsResponse(BaseModel):
 
 class ActionQueueStatus(str, Enum):
     proposed = "proposed"
+    waiting_for_user = "waiting_for_user"
     approved = "approved"
     executed = "executed"
     failed = "failed"
     rejected = "rejected"
+    expired = "expired"
 
 
 class ActionQueueResponse(BaseModel):
@@ -379,6 +381,7 @@ class ActionQueueResponse(BaseModel):
     action_type: str
     payload: Optional[dict] = None
     status: str
+    explanation: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
     executed_at: Optional[datetime] = None
@@ -387,3 +390,46 @@ class ActionQueueResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ── Manual Classification ───────────────────────────────────────────────
+
+LEARNING_CATEGORIES = ["work", "private", "newsletter", "todo", "spam"]
+
+
+class ManualClassifyRequest(BaseModel):
+    """Body for POST /api/emails/{id}/classify"""
+
+    category: str = Field(..., description="One of: work, private, newsletter, todo, spam")
+    target_folder: Optional[str] = Field(None, description="Target IMAP folder for this email")
+
+    @field_validator("category")
+    @classmethod
+    def validate_category(cls, v: str) -> str:
+        if v.lower() not in LEARNING_CATEGORIES:
+            raise ValueError(
+                f"category must be one of {LEARNING_CATEGORIES}, got '{v}'"
+            )
+        return v.lower()
+
+
+class ManualClassifyResponse(BaseModel):
+    """Response from POST /api/emails/{id}/classify"""
+
+    success: bool
+    email_id: int
+    category: str
+    target_folder: Optional[str] = None
+    sender_profile_updated: bool = False
+    explanation: str = ""
+
+
+class SenderLearningInfoResponse(BaseModel):
+    """Response for sender-based learning info lookup."""
+
+    sender: str
+    preferred_category: Optional[str] = None
+    preferred_folder: Optional[str] = None
+    user_classification_count: int = 0
+    total_emails: int = 0
+    typical_folder: Optional[str] = None

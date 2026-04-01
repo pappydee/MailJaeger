@@ -16,6 +16,7 @@ _ACTION_QUEUE_REQUIRED_COLUMNS = {
     "thread_id": "VARCHAR(200)",
     "payload": "JSON",
     "status": "VARCHAR(30) DEFAULT 'proposed_action'",
+    "explanation": "VARCHAR(500)",
     "created_at": "DATETIME",
     "updated_at": "DATETIME",
     "queued_at": "DATETIME",
