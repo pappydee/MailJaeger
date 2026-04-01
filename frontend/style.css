@@ -849,3 +849,64 @@ body {
     font-size: 13px;
     color: var(--text);
 }
+
+/* ── Classification form ─────────────────────────────────────────────── */
+.classify-section {
+    background: #F0F4FF;
+    border: 1px solid #C7D2FE;
+    border-radius: 10px;
+    padding: 16px;
+}
+.classify-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+}
+.classify-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.classify-label {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text);
+    white-space: nowrap;
+}
+.classify-select {
+    min-width: 140px;
+}
+.classify-btn {
+    white-space: nowrap;
+}
+.classify-result {
+    font-size: 13px;
+    margin-left: 8px;
+}
+.classify-result.classify-success {
+    color: var(--success);
+    font-weight: 600;
+}
+.classify-result.classify-error {
+    color: var(--danger);
+    font-weight: 600;
+}
+
+/* ── Action queue explanation ────────────────────────────────────────── */
+.action-queue-explanation {
+    font-size: 12px;
+    color: var(--primary);
+    margin-top: 4px;
+    font-style: italic;
+}
+
+/* ── Queue status badge extra states ────────────────────────────────── */
+.queue-status-badge.waiting_for_user {
+    background: #FEF3C7;
+    color: #92400E;
+}
+.queue-status-badge.expired {
+    background: #E5E7EB;
+    color: #6B7280;
+}

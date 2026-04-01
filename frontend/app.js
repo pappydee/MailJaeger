@@ -522,6 +522,20 @@ async function openEmail(id) {
         if (!r.ok) { body.innerHTML = '<div class="loading">Fehler</div>'; return; }
         const e = await r.json();
         document.getElementById('modalSubject').textContent = e.subject || '–';
+
+        const classifyCategories = ['work', 'private', 'newsletter', 'todo', 'spam'];
+        const currentCat = (e.category || '').toLowerCase();
+        const categoryOptions = classifyCategories.map(c =>
+            `<option value="${escHtml(c)}" ${c === currentCat ? 'selected' : ''}>${escHtml(c.charAt(0).toUpperCase() + c.slice(1))}</option>`
+        ).join('');
+
+        const folderOptions = _foldersCache.length
+            ? _foldersCache.map(f => {
+                const name = typeof f === 'string' ? f : (f.name || f.folder || '');
+                return `<option value="${escHtml(name)}" ${name === (e.suggested_folder || '') ? 'selected' : ''}>${escHtml(name)}</option>`;
+            }).join('')
+            : `<option value="${escHtml(e.suggested_folder || '')}">${escHtml(e.suggested_folder || '–')}</option>`;
+
         body.innerHTML = `
             <div class="detail-section">
                 <h3>Details</h3>
@@ -544,6 +558,27 @@ async function openEmail(id) {
                         ${t.confidence != null ? `<span>🎯 ${(t.confidence*100).toFixed(0)}%</span>` : ''}
                     </div>
                 </div>`).join('')}</div></div>` : ''}
+            <div class="detail-section classify-section">
+                <h3>📋 Klassifizieren</h3>
+                <div class="classify-form">
+                    <div class="classify-row">
+                        <label class="classify-label" for="classifyCategory">Kategorie:</label>
+                        <select id="classifyCategory" class="filter-select classify-select">
+                            <option value="">— Wählen —</option>
+                            ${categoryOptions}
+                        </select>
+                    </div>
+                    <div class="classify-row">
+                        <label class="classify-label" for="classifyFolder">Zielordner:</label>
+                        <select id="classifyFolder" class="filter-select classify-select">
+                            <option value="">— Optional —</option>
+                            ${folderOptions}
+                        </select>
+                    </div>
+                    <button class="btn btn-primary classify-btn" onclick="submitClassification(${e.id})">Klassifizieren</button>
+                    <span id="classifyResult" class="classify-result"></span>
+                </div>
+            </div>
             ${!e.is_resolved ? `<div class="detail-section"><button class="btn btn-primary" onclick="markResolved(${e.id})">Als bearbeitet markieren</button></div>` : ''}`;
     } catch { body.innerHTML = '<div class="loading">Fehler beim Laden</div>'; }
 }
@@ -561,6 +596,42 @@ async function markResolved(id) {
         await loadDashboard();
         await loadEmails();
     } catch { showToast('Fehler beim Markieren', 'error'); }
+}
+
+async function submitClassification(emailId) {
+    const catSelect = document.getElementById('classifyCategory');
+    const folderSelect = document.getElementById('classifyFolder');
+    const resultEl = document.getElementById('classifyResult');
+    const category = catSelect?.value;
+    if (!category) {
+        showToast('Bitte eine Kategorie wählen', 'error');
+        return;
+    }
+    const target_folder = folderSelect?.value || null;
+    resultEl.textContent = 'Wird gespeichert…';
+    resultEl.className = 'classify-result';
+    try {
+        const payload = { category };
+        if (target_folder) payload.target_folder = target_folder;
+        const r = await fetch(`${API_BASE}/api/emails/${emailId}/classify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.detail || `HTTP ${r.status}`);
+        }
+        const data = await r.json();
+        resultEl.textContent = data.explanation || 'Klassifizierung gespeichert ✓';
+        resultEl.className = 'classify-result classify-success';
+        showToast('Klassifizierung gespeichert ✓', 'success', 2500);
+        await loadEmails();
+    } catch (e) {
+        resultEl.textContent = e?.message || 'Fehler';
+        resultEl.className = 'classify-result classify-error';
+        showToast(e?.message || 'Klassifizierung fehlgeschlagen', 'error');
+    }
 }
 
 // ── Cancel processing ──────────────────────────────────────────────────
@@ -969,12 +1040,16 @@ async function previewReplyDraft(action) {
 }
 
 // ── Action queue ────────────────────────────────────────────────────────
-async function loadActionQueue() {
+let _actionQueueStatusFilter = '';
+
+async function loadActionQueue(statusFilter) {
     const list = document.getElementById('actionQueueList');
     if (!list) return;
     list.innerHTML = '<div class="loading">Lade Aktionen…</div>';
+    const filter = statusFilter !== undefined ? statusFilter : _actionQueueStatusFilter;
+    const url = filter ? `${API_BASE}/api/actions?status=${encodeURIComponent(filter)}` : `${API_BASE}/api/actions`;
     try {
-        const r = await fetch(`${API_BASE}/api/actions`);
+        const r = await fetch(url);
         if (!r.ok) {
             const message = r.status === 401 ? 'Nicht autorisiert' : 'Fehler beim Laden';
             list.innerHTML = `<div class="report-empty-state report-error">${escHtml(message)}</div>`;
@@ -986,6 +1061,12 @@ async function loadActionQueue() {
     } catch {
         list.innerHTML = '<div class="report-empty-state report-error">Aktionen konnten nicht geladen werden</div>';
     }
+}
+
+function onActionQueueFilterChange() {
+    const sel = document.getElementById('actionQueueFilter');
+    _actionQueueStatusFilter = sel ? sel.value : '';
+    loadActionQueue(_actionQueueStatusFilter);
 }
 
 function renderActionQueue(actions = []) {
@@ -1043,6 +1124,7 @@ function renderActionQueue(actions = []) {
                 </div>
                 ${action.action_type === 'move' && payload.target_folder ? `<div class="report-action-context"><strong>Zielordner:</strong> ${escHtml(payload.target_folder)}</div>` : ''}
                 ${payload.description ? `<div class="action-queue-description">${escHtml(payload.description)}</div>` : ''}
+                ${action.explanation ? `<div class="action-queue-explanation">💡 ${escHtml(action.explanation)}</div>` : ''}
                 ${action.action_type === 'reply_draft' ? `<div class="report-draft-snippet">${escHtml((payload.draft_text || '').slice(0, 180))}${payload.draft_text && payload.draft_text.length > 180 ? '…' : ''}</div>` : ''}
                 ${action.error_message ? `<div class="action-queue-error">${escHtml(action.error_message)}</div>` : ''}
                 <div class="action-queue-controls">
@@ -1174,7 +1256,8 @@ function statusLabel(s) {
         // run_status lowercase
         idle: 'Bereit', running: 'Läuft', cancelling: 'Wird abgebrochen…',
         cancelled: 'Abgebrochen', success: 'Erfolgreich', failed: 'Fehler',
-        proposed: 'Vorgeschlagen', approved: 'Freigegeben', executed: 'Ausgeführt', rejected: 'Abgelehnt',
+        proposed: 'Vorgeschlagen', waiting_for_user: 'Warte auf Nutzer', approved: 'Freigegeben',
+        executed: 'Ausgeführt', rejected: 'Abgelehnt', expired: 'Abgelaufen',
     })[s] || s || '–';
 }
 
@@ -1188,6 +1271,8 @@ function normalizeQueueStatus(status) {
     if (normalized === 'executed_action') return 'executed';
     if (normalized === 'failed_action') return 'failed';
     if (normalized === 'rejected_action') return 'rejected';
+    if (normalized === 'waiting_for_user') return 'waiting_for_user';
+    if (normalized === 'expired') return 'expired';
     return normalized || 'proposed';
 }
 

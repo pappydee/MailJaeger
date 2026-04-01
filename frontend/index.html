@@ -215,6 +215,16 @@
         <div class="info-header">
             <h2>Action Queue</h2>
             <div style="display:flex;gap:8px;align-items:center;">
+                <select id="actionQueueFilter" class="filter-select" onchange="onActionQueueFilterChange()">
+                    <option value="">Aktionierbar</option>
+                    <option value="proposed">Vorgeschlagen</option>
+                    <option value="waiting_for_user">Warte auf Nutzer</option>
+                    <option value="approved">Freigegeben</option>
+                    <option value="executed">Ausgeführt</option>
+                    <option value="rejected">Abgelehnt</option>
+                    <option value="expired">Abgelaufen</option>
+                    <option value="all">Alle</option>
+                </select>
                 <span class="info-time" id="actionQueueSummary">Lade…</span>
                 <button id="refreshActionQueue" class="btn btn-secondary">Aktualisieren</button>
             </div>
