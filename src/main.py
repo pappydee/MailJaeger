@@ -59,6 +59,9 @@ from src.models.schemas import (
     ActionQueueResponse,
     ClassificationOverrideRequest,
     ClassificationOverrideResponse,
+    ManualClassifyRequest,
+    ManualClassifyResponse,
+    SenderLearningInfoResponse,
 )
 from src.models.database import (
     ProcessedEmail,
@@ -497,6 +500,8 @@ def _normalize_action_status(status_value: Optional[str]) -> str:
         "executed_action": "executed",
         "failed_action": "failed",
         "rejected_action": "rejected",
+        "waiting_for_user": "waiting_for_user",
+        "expired": "expired",
     }
     return aliases.get((status_value or "").lower(), (status_value or "").lower())
 
@@ -625,6 +630,7 @@ def _serialize_action_queue(
         "action_type": action.action_type,
         "payload": action.payload,
         "status": _normalize_action_status(action.status),
+        "explanation": getattr(action, "explanation", None),
         "created_at": action.created_at,
         "updated_at": action.updated_at,
         "executed_at": action.executed_at,
@@ -1404,6 +1410,71 @@ async def override_email_classification(
     )
 
 
+@app.post(
+    "/api/emails/{email_id}/classify",
+    response_model=ManualClassifyResponse,
+    dependencies=[Depends(require_authentication)],
+)
+async def classify_email(
+    email_id: int,
+    classify_req: ManualClassifyRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Manually classify an email with a user-chosen category and optional target folder.
+
+    This is the primary entry point for the learning loop:
+      user decision → DecisionEvent → SenderProfile → reused on future emails
+    """
+    email = db.query(ProcessedEmail).filter(ProcessedEmail.id == email_id).first()
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    try:
+        from src.services.learning_loop import record_manual_classification
+
+        result = record_manual_classification(
+            db,
+            email,
+            category=classify_req.category,
+            target_folder=classify_req.target_folder,
+        )
+        db.commit()
+
+        return ManualClassifyResponse(
+            success=True,
+            email_id=email_id,
+            category=result["category"],
+            target_folder=result.get("target_folder"),
+            sender_profile_updated=result.get("sender_profile_updated", False),
+            explanation="Classification saved. Sender profile updated for future emails."
+            if result.get("sender_profile_updated")
+            else "Classification saved.",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("classify_email failed: %s", exc)
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Classification failed")
+
+
+@app.get(
+    "/api/sender-learning/{sender}",
+    response_model=SenderLearningInfoResponse,
+    dependencies=[Depends(require_authentication)],
+)
+async def get_sender_learning(
+    sender: str,
+    db: Session = Depends(get_db),
+):
+    """Retrieve learning info for a given sender (address or domain)."""
+    from src.services.learning_loop import get_sender_learning_info
+
+    info = get_sender_learning_info(db, sender)
+    return SenderLearningInfoResponse(**info)
+
+
 @app.post("/api/processing/trigger", dependencies=[Depends(require_authentication)])
 @limiter.limit("5/minute")  # Strict rate limit on manual processing trigger
 async def trigger_processing(
@@ -1601,24 +1672,42 @@ async def list_imap_folders(db: Session = Depends(get_db)):
 async def list_actions(
     status: Optional[str] = Query(
         None,
-        description="Optional filter: proposed, approved, executed, failed, rejected",
+        description="Optional filter: proposed, waiting_for_user, approved, executed, failed, rejected, expired, all",
     ),
     db: Session = Depends(get_db),
 ):
-    """List action_queue entries with optional status filter."""
+    """List action_queue entries with optional status filter.
+
+    By default, only actionable items are shown (proposed, waiting_for_user,
+    approved, failed).  Use status=all to include rejected/expired/executed,
+    or filter by a specific status.
+    """
     query = db.query(ActionQueue)
     if status:
         normalized = status.lower()
-        aliases = {
-            "proposed": ["proposed", "proposed_action"],
-            "approved": ["approved", "approved_action"],
-            "executed": ["executed", "executed_action"],
-            "failed": ["failed", "failed_action", "rejected_action"],
-            "rejected": ["rejected", "rejected_action"],
-        }
-        query = query.filter(
-            ActionQueue.status.in_(aliases.get(normalized, [normalized]))
-        )
+        if normalized == "all":
+            pass  # no filter — show everything
+        else:
+            aliases = {
+                "proposed": ["proposed", "proposed_action"],
+                "waiting_for_user": ["waiting_for_user"],
+                "approved": ["approved", "approved_action"],
+                "executed": ["executed", "executed_action"],
+                "failed": ["failed", "failed_action"],
+                "rejected": ["rejected", "rejected_action"],
+                "expired": ["expired"],
+            }
+            query = query.filter(
+                ActionQueue.status.in_(aliases.get(normalized, [normalized]))
+            )
+    else:
+        # Default: only actionable items (hide rejected, expired, executed)
+        excluded = [
+            "rejected", "rejected_action",
+            "expired",
+            "executed", "executed_action",
+        ]
+        query = query.filter(ActionQueue.status.notin_(excluded))
     actions = query.order_by(ActionQueue.created_at.desc()).all()
 
     action_rows = []
