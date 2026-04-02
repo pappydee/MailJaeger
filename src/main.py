@@ -1588,10 +1588,16 @@ async def get_processing_run(run_id: int, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Historical Learning Job Endpoints
+# Historical Learning Job Endpoints (v1.2.0 — background thread execution)
 # ---------------------------------------------------------------------------
 
 _learning_cancel_event = threading.Event()
+
+
+def _learning_db_factory():
+    """Create a new DB session for the background learning thread."""
+    from src.database.connection import get_session_factory
+    return get_session_factory()()
 
 
 @app.post("/api/learning/start", dependencies=[Depends(require_authentication)])
@@ -1599,12 +1605,11 @@ _learning_cancel_event = threading.Event()
 async def start_learning_job(request: Request, db: Session = Depends(get_db)):
     """Start (or resume) the historical mailbox learning job.
 
-    The job runs synchronously in-process, scanning all indexed folders
-    in batches.  It is safe to call multiple times — already-processed
-    emails are never relearned.
+    The job runs in a background thread, so this endpoint returns immediately.
+    Use GET /api/learning/status to poll progress.
 
     Query parameters:
-      batch_size (int, default 100): Emails per batch
+      batch_size (int, default 100): Emails per batch (clamped to 50–200)
       max_runtime_seconds (int, optional): Time budget; job pauses when exceeded
     """
     _learning_cancel_event.clear()
@@ -1619,15 +1624,10 @@ async def start_learning_job(request: Request, db: Session = Depends(get_db)):
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="max_runtime_seconds must be an integer")
 
-    from src.pipeline.historical_learning_job import run_historical_learning_job
+    from src.services.historical_learning_service import start_learning
 
-    stats = run_historical_learning_job(
-        db,
-        batch_size=batch_size,
-        max_runtime_seconds=max_runtime,
-        cancel_requested=_learning_cancel_event.is_set,
-    )
-    return {"success": True, **stats}
+    result = start_learning(_learning_db_factory, batch_size=batch_size)
+    return result
 
 
 @app.post("/api/learning/stop", dependencies=[Depends(require_authentication)])
@@ -1635,25 +1635,47 @@ async def start_learning_job(request: Request, db: Session = Depends(get_db)):
 async def stop_learning_job(request: Request, db: Session = Depends(get_db)):
     """Request the running historical learning job to stop.
 
-    If the job is running in this process, the cancel signal is set and
-    the job will stop at the next batch boundary.  The DB status is also
-    set to ``paused`` so a future ``/api/learning/start`` resumes from
-    the saved checkpoint.
+    Sets the cancel signal so the job pauses at the next batch boundary.
+    Progress is persisted and a future start call resumes from the checkpoint.
     """
     _learning_cancel_event.set()
 
-    from src.pipeline.historical_learning_job import pause_historical_learning_job
+    from src.services.historical_learning_service import stop_learning
 
-    result = pause_historical_learning_job(db)
+    result = stop_learning(_learning_db_factory)
+
+    # Also pause the legacy ProcessingJob-based tracker for backward compat
+    try:
+        from src.pipeline.historical_learning_job import pause_historical_learning_job
+        pause_historical_learning_job(db)
+    except Exception:
+        pass
+
     return result
 
 
 @app.get("/api/learning/status", dependencies=[Depends(require_authentication)])
 async def learning_job_status(db: Session = Depends(get_db)):
-    """Return the current historical learning job status and per-folder progress."""
-    from src.pipeline.historical_learning_job import get_historical_learning_status
+    """Return the current historical learning job status.
 
-    return get_historical_learning_status(db)
+    Returns a structured object with progress, phase, and timing information.
+    """
+    from src.services.historical_learning_service import get_status
+
+    return get_status(_learning_db_factory)
+
+
+@app.post("/api/learning/reset", dependencies=[Depends(require_authentication)])
+@limiter.limit("3/minute")
+async def reset_learning_job(request: Request, db: Session = Depends(get_db)):
+    """Reset all learning run/progress data.
+
+    Stops any running job and deletes all LearningRun and LearningProgress
+    records. Does NOT delete learned aggregates (SenderProfile, etc.).
+    """
+    from src.services.historical_learning_service import reset_learning
+
+    return reset_learning(_learning_db_factory)
 
 
 @app.get("/api/settings", dependencies=[Depends(require_authentication)])
