@@ -212,14 +212,16 @@ class TestTriggerEndpoint:
 # ─── Version bump ─────────────────────────────────────────────────────────────
 
 class TestVersion110:
-    def test_version_is_110(self):
+    def test_version_matches_central_constant(self):
         from src import __version__
-        assert __version__ == "1.1.1"
+        from src.version import VERSION
+        assert __version__ == VERSION
 
-    def test_changelog_has_110_entry(self):
+    def test_changelog_has_current_version_entry(self):
         from src import CHANGELOG
+        from src.version import VERSION
         versions = [e["version"] for e in CHANGELOG]
-        assert "1.1.1" in versions
+        assert VERSION in versions
 
     def test_changelog_oldest_is_100(self):
         from src import CHANGELOG

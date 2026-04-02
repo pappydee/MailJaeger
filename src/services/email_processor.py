@@ -753,16 +753,27 @@ class EmailProcessor:
         imap: Optional[IMAPService],
     ) -> bool:
         """
-        Run Stage 1 and Stage 2 of the analysis pipeline on a single indexed email.
+        Run Stages 0, 1, and 2 of the analysis pipeline on a single indexed email.
 
-        If Stages 1 and 2 produce a confident classification the email is
-        fully handled here and ``False`` is returned.
-        If Stage 3 (LLM) is required, the email is left in its current
-        analysis_state and ``True`` is returned so the caller can batch it.
+        Stage 0 (learned rule-based) is checked first — if a sender profile
+        learned from previous user classifications matches, the email is
+        classified immediately without LLM.
+
+        If none of Stages 0, 1, or 2 produce a confident classification the
+        email is left in its current analysis_state and ``True`` is returned
+        so the caller can batch it for Stage 3 (LLM).
         """
         from src.services.analysis_pipeline import AnalysisPipeline
 
         pipeline = AnalysisPipeline(self.db)
+
+        # Stage 0: Learned rule-based classification
+        learned = pipeline.stage_learned_classify(email_record)
+        if learned["confident"]:
+            pipeline.record_decision(email_record, "learned_classified", learned)
+            pipeline.update_analysis_state(email_record, "learned_classified")
+            self._apply_analysis_and_act(email_record, learned["analysis"], imap)
+            return False
 
         # Stage 1
         stage1 = pipeline.stage1_pre_classify(email_record)

@@ -27,6 +27,7 @@ import secrets
 import hashlib
 import json
 import time
+import threading
 
 from src.config import get_settings
 from src.database.connection import init_db, get_db, get_engine, get_db_session
@@ -59,6 +60,9 @@ from src.models.schemas import (
     ActionQueueResponse,
     ClassificationOverrideRequest,
     ClassificationOverrideResponse,
+    ManualClassifyRequest,
+    ManualClassifyResponse,
+    SenderLearningInfoResponse,
 )
 from src.models.database import (
     ProcessedEmail,
@@ -497,6 +501,8 @@ def _normalize_action_status(status_value: Optional[str]) -> str:
         "executed_action": "executed",
         "failed_action": "failed",
         "rejected_action": "rejected",
+        "waiting_for_user": "waiting_for_user",
+        "expired": "expired",
     }
     return aliases.get((status_value or "").lower(), (status_value or "").lower())
 
@@ -625,6 +631,7 @@ def _serialize_action_queue(
         "action_type": action.action_type,
         "payload": action.payload,
         "status": _normalize_action_status(action.status),
+        "explanation": getattr(action, "explanation", None),
         "created_at": action.created_at,
         "updated_at": action.updated_at,
         "executed_at": action.executed_at,
@@ -786,9 +793,20 @@ app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle validation errors with sanitized responses"""
     logger.warning(f"Validation error on {request.url.path}: {exc.errors()}")
+    # Sanitize errors to ensure JSON-serializable output (ctx may contain
+    # non-serializable objects like ValueError instances)
+    safe_errors = []
+    for err in exc.errors():
+        safe_err = {k: v for k, v in err.items() if k != "ctx"}
+        if "ctx" in err and isinstance(err["ctx"], dict):
+            safe_err["ctx"] = {
+                k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
+                for k, v in err["ctx"].items()
+            }
+        safe_errors.append(safe_err)
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": "Invalid request data", "errors": exc.errors()},
+        content={"detail": "Invalid request data", "errors": safe_errors},
     )
 
 
@@ -1404,6 +1422,71 @@ async def override_email_classification(
     )
 
 
+@app.post(
+    "/api/emails/{email_id}/classify",
+    response_model=ManualClassifyResponse,
+    dependencies=[Depends(require_authentication)],
+)
+async def classify_email(
+    email_id: int,
+    classify_req: ManualClassifyRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Manually classify an email with a user-chosen category and optional target folder.
+
+    This is the primary entry point for the learning loop:
+      user decision → DecisionEvent → SenderProfile → reused on future emails
+    """
+    email = db.query(ProcessedEmail).filter(ProcessedEmail.id == email_id).first()
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    try:
+        from src.services.learning_loop import record_manual_classification
+
+        result = record_manual_classification(
+            db,
+            email,
+            category=classify_req.category,
+            target_folder=classify_req.target_folder,
+        )
+        db.commit()
+
+        return ManualClassifyResponse(
+            success=True,
+            email_id=email_id,
+            category=result["category"],
+            target_folder=result.get("target_folder"),
+            sender_profile_updated=result.get("sender_profile_updated", False),
+            explanation="Classification saved. Sender profile updated for future emails."
+            if result.get("sender_profile_updated")
+            else "Classification saved.",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("classify_email failed: %s", exc)
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Classification failed")
+
+
+@app.get(
+    "/api/sender-learning/{sender}",
+    response_model=SenderLearningInfoResponse,
+    dependencies=[Depends(require_authentication)],
+)
+async def get_sender_learning(
+    sender: str,
+    db: Session = Depends(get_db),
+):
+    """Retrieve learning info for a given sender (address or domain)."""
+    from src.services.learning_loop import get_sender_learning_info
+
+    info = get_sender_learning_info(db, sender)
+    return SenderLearningInfoResponse(**info)
+
+
 @app.post("/api/processing/trigger", dependencies=[Depends(require_authentication)])
 @limiter.limit("5/minute")  # Strict rate limit on manual processing trigger
 async def trigger_processing(
@@ -1504,6 +1587,75 @@ async def get_processing_run(run_id: int, db: Session = Depends(get_db)):
     return ProcessingRunResponse.from_orm(run)
 
 
+# ---------------------------------------------------------------------------
+# Historical Learning Job Endpoints
+# ---------------------------------------------------------------------------
+
+_learning_cancel_event = threading.Event()
+
+
+@app.post("/api/learning/start", dependencies=[Depends(require_authentication)])
+@limiter.limit("5/minute")
+async def start_learning_job(request: Request, db: Session = Depends(get_db)):
+    """Start (or resume) the historical mailbox learning job.
+
+    The job runs synchronously in-process, scanning all indexed folders
+    in batches.  It is safe to call multiple times — already-processed
+    emails are never relearned.
+
+    Query parameters:
+      batch_size (int, default 100): Emails per batch
+      max_runtime_seconds (int, optional): Time budget; job pauses when exceeded
+    """
+    _learning_cancel_event.clear()
+
+    try:
+        batch_size = int(request.query_params.get("batch_size", "100"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="batch_size must be an integer")
+    max_runtime_raw = request.query_params.get("max_runtime_seconds")
+    try:
+        max_runtime = int(max_runtime_raw) if max_runtime_raw else None
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="max_runtime_seconds must be an integer")
+
+    from src.pipeline.historical_learning_job import run_historical_learning_job
+
+    stats = run_historical_learning_job(
+        db,
+        batch_size=batch_size,
+        max_runtime_seconds=max_runtime,
+        cancel_requested=_learning_cancel_event.is_set,
+    )
+    return {"success": True, **stats}
+
+
+@app.post("/api/learning/stop", dependencies=[Depends(require_authentication)])
+@limiter.limit("10/minute")
+async def stop_learning_job(request: Request, db: Session = Depends(get_db)):
+    """Request the running historical learning job to stop.
+
+    If the job is running in this process, the cancel signal is set and
+    the job will stop at the next batch boundary.  The DB status is also
+    set to ``paused`` so a future ``/api/learning/start`` resumes from
+    the saved checkpoint.
+    """
+    _learning_cancel_event.set()
+
+    from src.pipeline.historical_learning_job import pause_historical_learning_job
+
+    result = pause_historical_learning_job(db)
+    return result
+
+
+@app.get("/api/learning/status", dependencies=[Depends(require_authentication)])
+async def learning_job_status(db: Session = Depends(get_db)):
+    """Return the current historical learning job status and per-folder progress."""
+    from src.pipeline.historical_learning_job import get_historical_learning_status
+
+    return get_historical_learning_status(db)
+
+
 @app.get("/api/settings", dependencies=[Depends(require_authentication)])
 async def get_settings_api(db: Session = Depends(get_db)):
     """Get current settings (sanitized - no sensitive credentials)"""
@@ -1601,24 +1753,42 @@ async def list_imap_folders(db: Session = Depends(get_db)):
 async def list_actions(
     status: Optional[str] = Query(
         None,
-        description="Optional filter: proposed, approved, executed, failed, rejected",
+        description="Optional filter: proposed, waiting_for_user, approved, executed, failed, rejected, expired, all",
     ),
     db: Session = Depends(get_db),
 ):
-    """List action_queue entries with optional status filter."""
+    """List action_queue entries with optional status filter.
+
+    By default, only actionable items are shown (proposed, waiting_for_user,
+    approved, failed).  Use status=all to include rejected/expired/executed,
+    or filter by a specific status.
+    """
     query = db.query(ActionQueue)
     if status:
         normalized = status.lower()
-        aliases = {
-            "proposed": ["proposed", "proposed_action"],
-            "approved": ["approved", "approved_action"],
-            "executed": ["executed", "executed_action"],
-            "failed": ["failed", "failed_action", "rejected_action"],
-            "rejected": ["rejected", "rejected_action"],
-        }
-        query = query.filter(
-            ActionQueue.status.in_(aliases.get(normalized, [normalized]))
-        )
+        if normalized == "all":
+            pass  # no filter — show everything
+        else:
+            aliases = {
+                "proposed": ["proposed", "proposed_action"],
+                "waiting_for_user": ["waiting_for_user"],
+                "approved": ["approved", "approved_action"],
+                "executed": ["executed", "executed_action"],
+                "failed": ["failed", "failed_action"],
+                "rejected": ["rejected", "rejected_action"],
+                "expired": ["expired"],
+            }
+            query = query.filter(
+                ActionQueue.status.in_(aliases.get(normalized, [normalized]))
+            )
+    else:
+        # Default: only actionable items (hide rejected, expired, executed)
+        excluded = [
+            "rejected", "rejected_action",
+            "expired",
+            "executed", "executed_action",
+        ]
+        query = query.filter(ActionQueue.status.notin_(excluded))
     actions = query.order_by(ActionQueue.created_at.desc()).all()
 
     action_rows = []
@@ -2864,6 +3034,7 @@ async def health_check():
 
     return {
         "status": "healthy",
+        "version": __version__,
         "checks": {
             "mail_server": imap_service.check_health(),
             "ai_service": ai_service.check_health(),

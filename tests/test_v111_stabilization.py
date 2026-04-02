@@ -300,14 +300,16 @@ class TestEmailProcessorOverrideLogic:
 # 5. Version and changelog
 
 class TestVersion111:
-    def test_version_is_111(self):
+    def test_version_matches_central_constant(self):
         from src import __version__
-        assert __version__ == "1.1.1"
+        from src.version import VERSION
+        assert __version__ == VERSION
 
-    def test_changelog_has_111_entry(self):
+    def test_changelog_has_current_version_entry(self):
         from src import CHANGELOG
+        from src.version import VERSION
         versions = [e["version"] for e in CHANGELOG]
-        assert "1.1.1" in versions
+        assert VERSION in versions
 
     def test_changelog_still_has_110_and_100(self):
         from src import CHANGELOG

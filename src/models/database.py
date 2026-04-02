@@ -358,14 +358,20 @@ class DecisionEvent(Base):
     # Event classification
     event_type = Column(
         String(50), nullable=False, index=True
-    )  # move_to_folder, mark_spam, archive, approve_suggestion, reject_suggestion
+    )  # move_to_folder, mark_spam, archive, approve_suggestion, reject_suggestion, manual_classify
     source = Column(
         String(50), index=True
-    )  # system, user, rule, llm, pipeline_stage1, pipeline_stage2
+    )  # system, user, user_manual, rule, llm, pipeline_stage1, pipeline_stage2
 
     # Before/after values
     old_value = Column(String(200))
     new_value = Column(String(200))
+
+    # Learning signal context (populated for manual classifications)
+    sender = Column(String(200), nullable=True, index=True)
+    subject_snippet = Column(String(200), nullable=True)
+    chosen_category = Column(String(50), nullable=True)
+    chosen_folder = Column(String(200), nullable=True)
 
     # Confidence and versioning
     confidence = Column(Float)
@@ -386,6 +392,7 @@ class DecisionEvent(Base):
     __table_args__ = (
         Index("idx_decision_email_type", "email_id", "event_type"),
         Index("idx_decision_thread", "thread_id", "created_at"),
+        Index("idx_decision_sender", "sender", "event_type"),
     )
 
 
@@ -407,8 +414,11 @@ class ActionQueue(Base):
     # proposed_action, queued_action, approved_action, executed_action,
     # rejected_action, failed_action.
     # The API foundation introduced in this branch uses:
-    # proposed, approved, executed, failed.
+    # proposed, waiting_for_user, approved, rejected, executed, failed, expired.
     status = Column(String(30), default="proposed_action", index=True)
+
+    # Explanation / transparency for the user
+    explanation = Column(String(500), nullable=True)  # e.g. "Known sender rule"
 
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -634,6 +644,11 @@ class SenderProfile(Base):
     archived_count = Column(Integer, default=0)
     deleted_count = Column(Integer, default=0)
     kept_in_inbox_count = Column(Integer, default=0)
+
+    # User-classified learning signals
+    preferred_category = Column(String(50), nullable=True)  # user-assigned category
+    preferred_folder = Column(String(200), nullable=True)  # user-assigned target folder
+    user_classification_count = Column(Integer, default=0)  # how many times user classified
 
     # Timestamps
     first_seen = Column(DateTime, default=datetime.utcnow)

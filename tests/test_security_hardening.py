@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 import os
+from pathlib import Path
 
 # Test with NO API key configured to verify fail-closed behavior
 os.environ["API_KEY"] = ""
@@ -16,6 +17,8 @@ os.environ["AI_ENDPOINT"] = "http://localhost:11434"
 
 from src.main import app
 from src.config import reload_settings
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
@@ -128,7 +131,7 @@ class TestDockerfileHostDefault:
 
     def test_dockerfile_has_safe_host_default(self):
         """Dockerfile should use 127.0.0.1 as default host"""
-        with open("/home/runner/work/MailJaeger/MailJaeger/Dockerfile", "r") as f:
+        with open(ROOT / "Dockerfile", "r") as f:
             dockerfile_content = f.read()
 
         # Check for the safe default pattern
@@ -147,9 +150,7 @@ class TestProductionComposeSecurity:
 
     def test_prod_compose_does_not_expose_ollama_port(self):
         """Production compose should not publish Ollama port"""
-        with open(
-            "/home/runner/work/MailJaeger/MailJaeger/docker-compose.prod.yml", "r"
-        ) as f:
+        with open(ROOT / "docker-compose.prod.yml", "r") as f:
             prod_compose = f.read()
 
         # Check that ollama service doesn't have ports exposed
@@ -159,9 +160,7 @@ class TestProductionComposeSecurity:
 
     def test_prod_compose_does_not_publish_mailjaeger_port(self):
         """Production compose should not publish mailjaeger port by default"""
-        with open(
-            "/home/runner/work/MailJaeger/MailJaeger/docker-compose.prod.yml", "r"
-        ) as f:
+        with open(ROOT / "docker-compose.prod.yml", "r") as f:
             prod_compose = f.read()
 
         # Look for the mailjaeger service

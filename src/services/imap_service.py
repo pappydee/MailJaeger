@@ -37,12 +37,13 @@ class IMAPService:
         On failure, ensures self.client is None and performs best-effort cleanup.
         """
         temp_client = None
+        login_succeeded = False
         self.last_error = None
         try:
             # Build SSL context with configurable certificate verification
             ssl_context = None
             if self.settings.imap_use_ssl:
-                ssl_context = ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
+                ssl_context = ssl.create_default_context()
                 if not self.settings.imap_ssl_verify:
                     ssl_context.check_hostname = False
                     ssl_context.verify_mode = ssl.CERT_NONE
@@ -59,6 +60,7 @@ class IMAPService:
             # Get password from settings (handles file-based secrets)
             password = self.settings.get_imap_password()
             temp_client.login(self.settings.imap_username, password)
+            login_succeeded = True
             
             # Only set self.client if authentication succeeded
             self.client = temp_client
@@ -66,22 +68,20 @@ class IMAPService:
             return True
             
         except Exception as e:
-            # Best-effort cleanup without raising new exceptions
-            if temp_client:
-                try:
-                    temp_client.logout()
-                except:
-                    pass  # Ignore cleanup errors
-            
-            # Ensure client is None on failure
             self.client = None
-            
             sanitized_error = sanitize_error(e, debug=self.settings.debug)
             self.last_error = sanitized_error
             logger.error(
                 f"Failed to connect to IMAP server {self.settings.imap_host}: {sanitized_error}"
             )
             return False
+        finally:
+            if temp_client is not None and not login_succeeded:
+                try:
+                    temp_client.logout()
+                except Exception:
+                    pass
+                self.client = None
 
     def disconnect(self):
         """Disconnect from IMAP server"""
@@ -96,13 +96,8 @@ class IMAPService:
                 self.client = None
 
     def __enter__(self):
-        """
-        Context manager entry - fail-fast behavior.
-        
-        Raises RuntimeError if connection fails, ensuring no half-connected state.
-        """
-        if not self.connect():
-            raise RuntimeError("IMAP connection failed")
+        """Context manager entry; return self even if connect fails."""
+        self.connect()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):

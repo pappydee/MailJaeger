@@ -88,6 +88,20 @@ def run_analysis(
 
         for email_record in batch:
             try:
+                # Stage 0: Learned rule-based classification
+                learned = pipeline.stage_learned_classify(email_record)
+                if learned["confident"]:
+                    pipeline.record_decision(
+                        email_record, "learned_classified", learned
+                    )
+                    pipeline.update_analysis_state(email_record, "learned_classified")
+                    pipeline.apply_analysis_to_record(
+                        email_record, learned["analysis"]
+                    )
+                    stats["analysed"] += 1
+                    stats["last_email_id"] = email_record.id
+                    continue
+
                 # Stage 1: Fast pre-classification
                 stage1 = pipeline.stage1_pre_classify(email_record)
                 if stage1["confident"]:

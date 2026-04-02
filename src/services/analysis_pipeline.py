@@ -3,6 +3,11 @@ Multi-Stage Analysis Pipeline — Priority 9
 
 Implements a staged pipeline to avoid sending every email to the LLM.
 
+Stage 0 — Learned rule-based classification (no LLM)
+  Uses: SenderProfile learned from user classifications, newsletter/spam heuristics
+  Delegates to ``rule_based_classify()`` in ``src/services/learning_loop.py``
+  Result: deterministic classification for known senders; skips all later stages
+
 Stage 1 — Fast pre-classification (no LLM)
   Uses: sender, domain, subject, folder, snippet, known patterns
   Detects: newsletters, automated messages, known senders
@@ -12,7 +17,7 @@ Stage 2 — Lightweight rule-based classification
   Result: high-confidence classification without LLM
 
 Stage 3 — Deep LLM analysis
-  Only when Stages 1 and 2 are inconclusive
+  Only when Stages 0, 1, and 2 are inconclusive
   Uses: full email content via Ollama
 """
 
@@ -29,6 +34,11 @@ from src.utils.error_handling import sanitize_error
 logger = get_logger(__name__)
 
 PIPELINE_VERSION = "1.0.0"
+
+# Spam probability thresholds for learned classification results
+_LEARNED_SPAM_PROB = 0.9
+_LEARNED_NEWSLETTER_PROB = 0.65
+_LEARNED_DEFAULT_PROB = 0.1
 
 # Known newsletter/automated sender patterns for Stage 1
 _NEWSLETTER_PATTERNS = [
@@ -84,6 +94,13 @@ class AnalysisPipeline:
         Updates the email's analysis_state field.
         """
         try:
+            # Stage 0: Learned rule-based classification (sender profile + heuristics)
+            learned_result = self.stage_learned_classify(email_record)
+            if learned_result["confident"]:
+                self.record_decision(email_record, "learned_classified", learned_result)
+                self.update_analysis_state(email_record, "learned_classified")
+                return learned_result["analysis"]
+
             # Stage 1: Fast pre-classification
             stage1_result = self.stage1_pre_classify(email_record)
             if stage1_result["confident"]:
@@ -188,6 +205,59 @@ class AnalysisPipeline:
         stats["llm_calls"] = self._llm_calls_this_run
         self._mark_progress_complete(progress, stats)
         return stats
+
+    # ------------------------------------------------------------------
+    # Stage 0: Learned rule-based classification (no LLM)
+    # ------------------------------------------------------------------
+
+    def stage_learned_classify(self, email: ProcessedEmail) -> Dict[str, Any]:
+        """
+        Classify using learned sender profiles and deterministic heuristics.
+
+        Delegates to ``rule_based_classify()`` from the learning_loop service.
+        This is the FIRST classification check — runs before Stages 1, 2, and 3.
+
+        Returns a result dict with 'confident' flag and 'analysis'.
+        """
+        try:
+            from src.services.learning_loop import rule_based_classify
+
+            result = rule_based_classify(self.db, email)
+        except Exception as e:
+            sanitized = sanitize_error(e, debug=self.settings.debug)
+            logger.warning(f"Learned classification lookup failed: {sanitized}")
+            result = None
+
+        if not result:
+            return {"confident": False, "stage": 0, "analysis": self._fallback_analysis(email)}
+
+        # Only treat as confident if a category was determined
+        category = result.get("category")
+        if not category:
+            return {"confident": False, "stage": 0, "analysis": self._fallback_analysis(email)}
+
+        # Map learned result to standard analysis dict
+        is_spam = category.lower() == "spam"
+        is_newsletter = category.lower() == "newsletter"
+        spam_prob = _LEARNED_SPAM_PROB if is_spam else (_LEARNED_NEWSLETTER_PROB if is_newsletter else _LEARNED_DEFAULT_PROB)
+        action_required = category.lower() in ("work", "todo")
+
+        analysis = {
+            "summary": f"Klassifiziert durch gelernte Regel für {email.sender or 'Unbekannt'}",
+            "category": category,
+            "spam_probability": spam_prob,
+            "action_required": action_required,
+            "priority": "LOW" if (is_spam or is_newsletter) else "MEDIUM",
+            "tasks": [],
+            "suggested_folder": result.get("suggested_folder") or ("Archive" if is_newsletter else None),
+            "reasoning": result.get("explanation", "Learned rule-based classification"),
+        }
+        return {
+            "confident": True,
+            "stage": 0,
+            "source": result.get("source", "learned_rule"),
+            "analysis": analysis,
+        }
 
     # ------------------------------------------------------------------
     # Stage 1: Fast pre-classification (no LLM)

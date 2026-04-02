@@ -1379,3 +1379,310 @@ class TestReplyProfilePropagation:
         assert ap is not None
         assert (ap.total_replies or 0) >= 1
         assert (ap.reply_rate or 0) > 0
+
+
+# ===========================================================================
+# Historical Learning Job — pause, resume, cancel, status, resource limits
+# ===========================================================================
+
+
+class TestHistoricalLearningJobPauseResume:
+    """Test pause/resume and cancellation of the historical learning job."""
+
+    def test_cancel_stops_job_between_batches(self, db):
+        """cancel_requested callback causes the job to stop early."""
+        from src.pipeline.historical_learning_job import run_historical_learning_job
+
+        for i in range(20):
+            _make_email(
+                db, message_id=f"cancel-{i}@test.com",
+                sender=f"c{i}@cancel.com", folder="INBOX"
+            )
+
+        call_count = 0
+
+        def cancel_after_several():
+            nonlocal call_count
+            call_count += 1
+            # Allow a few calls (outer loop + inner loop) before cancelling
+            return call_count > 3
+
+        stats = run_historical_learning_job(
+            db, batch_size=5, cancel_requested=cancel_after_several,
+        )
+        assert stats["status"] == "paused"
+        # Should have processed some but not all emails
+        assert stats["emails_learned"] < 20
+
+    def test_paused_job_resumes_from_checkpoint(self, db):
+        """A paused job resumes from the last checkpoint on next run."""
+        from src.pipeline.historical_learning_job import run_historical_learning_job
+
+        for i in range(10):
+            _make_email(
+                db, message_id=f"pause-resume-{i}@test.com",
+                sender=f"pr{i}@test.com", folder="INBOX"
+            )
+
+        # First run: cancel after processing one batch
+        call_count = 0
+        def cancel_after_several():
+            nonlocal call_count
+            call_count += 1
+            return call_count > 3
+
+        stats1 = run_historical_learning_job(
+            db, batch_size=3, cancel_requested=cancel_after_several,
+        )
+        learned_first = stats1["emails_learned"]
+        assert learned_first > 0
+        assert stats1["status"] == "paused"
+
+        # Second run: no cancellation, should continue from checkpoint
+        stats2 = run_historical_learning_job(db, batch_size=10)
+        learned_second = stats2["emails_learned"]
+        assert learned_second > 0
+        # Total learned across both runs should equal all 10 emails
+        assert learned_first + learned_second == 10
+
+    def test_resume_does_not_reprocess(self, db):
+        """Already-processed emails must NOT be reprocessed on resume."""
+        from src.pipeline.historical_learning_job import run_historical_learning_job
+
+        for i in range(6):
+            _make_email(
+                db, message_id=f"no-reproc-{i}@test.com",
+                sender="same@same.com", folder="INBOX"
+            )
+
+        # First run: partial
+        stats1 = run_historical_learning_job(db, max_emails=3)
+        first_count = stats1["emails_learned"]
+
+        # Check the folder progress cursor was saved
+        fp = db.query(HistoricalLearningProgress).filter(
+            HistoricalLearningProgress.folder_name == "INBOX"
+        ).first()
+        assert fp is not None
+        cursor_after_first = fp.last_processed_email_id
+
+        # Second run: should continue past cursor
+        stats2 = run_historical_learning_job(db, batch_size=10)
+        second_count = stats2["emails_learned"]
+
+        # Should NOT have reprocessed the first batch
+        assert first_count + second_count == 6
+
+    def test_pause_sets_db_status(self, db):
+        """pause_historical_learning_job sets the DB status to paused."""
+        from src.pipeline.historical_learning_job import (
+            pause_historical_learning_job,
+            _start_learning_job,
+        )
+
+        # Create a running job
+        job = _start_learning_job(db)
+        assert job.status == "running"
+
+        # Create a running folder progress
+        fp = HistoricalLearningProgress(
+            folder_name="INBOX", folder_type="inbox",
+            status="running", processed_count=0,
+        )
+        db.add(fp)
+        db.commit()
+
+        result = pause_historical_learning_job(db)
+        assert result["success"] is True
+
+        db.refresh(job)
+        assert job.status == "paused"
+
+        db.refresh(fp)
+        assert fp.status == "paused"
+
+
+class TestHistoricalLearningJobStatus:
+    """Test progress/status reporting."""
+
+    def test_status_idle_when_no_job(self, db):
+        """Status returns idle when no learning job has ever run."""
+        from src.pipeline.historical_learning_job import get_historical_learning_status
+
+        status = get_historical_learning_status(db)
+        assert status["status"] == "idle"
+        assert status["job_id"] is None
+
+    def test_status_after_completed_job(self, db):
+        """Status reflects completed job state."""
+        from src.pipeline.historical_learning_job import (
+            run_historical_learning_job,
+            get_historical_learning_status,
+        )
+
+        for i in range(3):
+            _make_email(
+                db, message_id=f"status-{i}@test.com",
+                sender=f"s{i}@status.com", folder="INBOX"
+            )
+
+        run_historical_learning_job(db)
+        status = get_historical_learning_status(db)
+
+        assert status["status"] == "completed"
+        assert status["job_id"] is not None
+        assert status["processed_count"] >= 3
+        assert status["total_emails"] >= 3
+        assert isinstance(status["folders"], list)
+        assert len(status["folders"]) >= 1
+
+    def test_status_after_paused_job(self, db):
+        """Status reflects paused job state with remaining count."""
+        from src.pipeline.historical_learning_job import (
+            run_historical_learning_job,
+            get_historical_learning_status,
+        )
+
+        for i in range(10):
+            _make_email(
+                db, message_id=f"paused-status-{i}@test.com",
+                sender=f"ps{i}@test.com", folder="INBOX"
+            )
+
+        call_count = 0
+        def cancel_immediately():
+            nonlocal call_count
+            call_count += 1
+            return call_count > 1
+
+        run_historical_learning_job(
+            db, batch_size=3, cancel_requested=cancel_immediately,
+        )
+        status = get_historical_learning_status(db)
+        assert status["status"] == "paused"
+        assert status["remaining_count"] > 0
+
+    def test_status_folder_detail(self, db):
+        """Status includes per-folder progress detail."""
+        from src.pipeline.historical_learning_job import (
+            run_historical_learning_job,
+            get_historical_learning_status,
+        )
+
+        for i in range(2):
+            _make_email(
+                db, message_id=f"fd-inbox-{i}@test.com",
+                sender=f"s{i}@d.com", folder="INBOX"
+            )
+        _make_email(
+            db, message_id="fd-work@test.com",
+            sender="w@work.com", folder="Work"
+        )
+
+        run_historical_learning_job(db)
+        status = get_historical_learning_status(db)
+
+        folder_names = [f["folder_name"] for f in status["folders"]]
+        assert "INBOX" in folder_names
+        assert "Work" in folder_names
+
+
+class TestHistoricalLearningJobResourceLimits:
+    """Test resource safety controls."""
+
+    def test_batch_size_limits_memory(self, db):
+        """Job processes in batches, not all at once."""
+        from src.pipeline.historical_learning_job import run_historical_learning_job
+
+        for i in range(15):
+            _make_email(
+                db, message_id=f"batch-{i}@test.com",
+                sender=f"b{i}@batch.com", folder="INBOX"
+            )
+
+        # Use small batch size
+        stats = run_historical_learning_job(db, batch_size=3)
+        assert stats["emails_learned"] == 15
+        assert stats["status"] == "completed"
+
+    def test_max_emails_caps_processing(self, db):
+        """max_emails caps total emails processed."""
+        from src.pipeline.historical_learning_job import run_historical_learning_job
+
+        for i in range(20):
+            _make_email(
+                db, message_id=f"cap-v2-{i}@test.com",
+                sender=f"cv{i}@cap.com", folder="INBOX"
+            )
+
+        stats = run_historical_learning_job(db, max_emails=5)
+        assert stats["emails_learned"] <= 5
+
+    def test_max_runtime_seconds_pauses_job(self, db):
+        """Job pauses when runtime budget is exceeded."""
+        from src.pipeline.historical_learning_job import run_historical_learning_job
+
+        for i in range(10):
+            _make_email(
+                db, message_id=f"runtime-{i}@test.com",
+                sender=f"rt{i}@rt.com", folder="INBOX"
+            )
+
+        # Use a very short runtime budget (0 seconds = immediate stop)
+        stats = run_historical_learning_job(
+            db, batch_size=2, max_runtime_seconds=0,
+        )
+        # Should either process the first batch then pause, or pause immediately
+        assert stats["status"] == "paused"
+        # Not all 10 emails should have been processed
+        assert stats["emails_learned"] < 10
+
+    def test_restart_after_interruption_continues(self, db):
+        """Simulates interruption (partial run) then restart."""
+        from src.pipeline.historical_learning_job import run_historical_learning_job
+
+        for i in range(12):
+            _make_email(
+                db, message_id=f"restart-{i}@test.com",
+                sender=f"r{i}@restart.com", folder="INBOX"
+            )
+
+        # First run: process only 4 emails
+        stats1 = run_historical_learning_job(db, max_emails=4)
+        learned1 = stats1["emails_learned"]
+
+        # Simulate restart: run again without cap
+        stats2 = run_historical_learning_job(db, batch_size=10)
+        learned2 = stats2["emails_learned"]
+
+        # Combined should be all 12
+        assert learned1 + learned2 == 12
+
+    def test_sender_profile_updated_from_historical_evidence(self, db):
+        """Historical learning updates SenderProfile from folder evidence."""
+        from src.pipeline.historical_learning_job import run_historical_learning_job
+
+        # Sender repeatedly placed in same folder
+        for i in range(5):
+            _make_email(
+                db, message_id=f"evidence-{i}@test.com",
+                sender="bills@utilities.com", folder="Bills"
+            )
+
+        run_historical_learning_job(db)
+
+        # Domain-level profile
+        dp = db.query(SenderProfile).filter(
+            SenderProfile.sender_domain == "utilities.com",
+            SenderProfile.sender_address.is_(None),
+        ).first()
+        assert dp is not None
+        assert dp.typical_folder == "Bills"
+        assert dp.total_emails >= 5
+
+        # Address-level profile
+        ap = db.query(SenderProfile).filter(
+            SenderProfile.sender_address == "bills@utilities.com",
+        ).first()
+        assert ap is not None
+        assert ap.typical_folder == "Bills"
