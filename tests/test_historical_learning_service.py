@@ -17,7 +17,7 @@ import time
 import threading
 import pytest
 from datetime import datetime, timezone
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -559,6 +559,31 @@ class TestEdgeCases:
         if profiles:
             assert any((p.interaction_count or 0) > 0 for p in profiles)
 
+    def test_all_internal_failures_mark_run_failed(self, db, db_factory):
+        from src.services.historical_learning_service import start_learning, get_status
+        import src.services.historical_learning_service as svc
+
+        for i in range(3):
+            _make_email(db, i, sender=f"fail{i}@test.com", folder="INBOX")
+
+        original = svc._learn_single_email
+
+        def _always_fail(_db, _email):
+            raise RuntimeError("forced internal failure")
+
+        svc._learn_single_email = _always_fail
+        try:
+            result = start_learning(db_factory, batch_size=50)
+            assert result["success"] is True
+            _wait_for_completion(db)
+        finally:
+            svc._learn_single_email = original
+
+        status = get_status(db_factory)
+        assert status["status"] == "failed"
+        assert status["processed_emails"] == 0
+        assert status["progress_percent"] == 0.0
+
 
 # ===========================================================================
 # New DB model fields
@@ -626,3 +651,73 @@ class TestNewDBFields:
         db.refresh(prog)
         assert prog.id is not None
         assert prog.email_id == email.id
+
+
+class TestLegacySQLiteUpgradeLearning:
+    """Historical learning should work on upgraded legacy SQLite schemas."""
+
+    def test_historical_learning_runs_after_legacy_schema_repair(self, tmp_path):
+        from src.database.startup_checks import ensure_historical_learning_schema_compatibility
+        from src.services.historical_learning_service import start_learning, get_status
+
+        db_file = tmp_path / "legacy_learning_runtime.sqlite"
+        engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+        Base.metadata.create_all(engine)
+
+        with engine.begin() as connection:
+            connection.execute(text("DROP TABLE sender_profiles"))
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE sender_profiles (
+                        id INTEGER PRIMARY KEY,
+                        sender_address VARCHAR(200),
+                        sender_domain VARCHAR(200),
+                        total_emails INTEGER,
+                        typical_folder VARCHAR(200),
+                        folder_distribution JSON,
+                        total_replies INTEGER,
+                        reply_rate FLOAT,
+                        avg_reply_delay_seconds FLOAT,
+                        median_reply_delay_seconds FLOAT,
+                        importance_tendency FLOAT,
+                        spam_tendency FLOAT,
+                        marked_important_count INTEGER,
+                        marked_spam_count INTEGER,
+                        archived_count INTEGER,
+                        deleted_count INTEGER,
+                        kept_in_inbox_count INTEGER,
+                        preferred_category VARCHAR(50),
+                        preferred_folder VARCHAR(200),
+                        user_classification_count INTEGER,
+                        first_seen DATETIME,
+                        last_seen DATETIME,
+                        updated_at DATETIME
+                    )
+                    """
+                )
+            )
+
+        ensure_historical_learning_schema_compatibility(engine, debug=False)
+        repaired_columns = {col["name"] for col in inspect(engine).get_columns("sender_profiles")}
+        assert "spam_probability" in repaired_columns
+        assert "interaction_count" in repaired_columns
+
+        SessionLocal = sessionmaker(bind=engine)
+        db = SessionLocal()
+        try:
+            for i in range(4):
+                _make_email(db, i, sender=f"legacy{i}@upgrade.com", folder="INBOX")
+
+            def db_factory():
+                return SessionLocal()
+
+            result = start_learning(db_factory, batch_size=50)
+            assert result["success"] is True
+            _wait_for_completion(db)
+
+            status = get_status(db_factory)
+            assert status["status"] == "completed"
+            assert status["processed_emails"] >= 1
+        finally:
+            db.close()

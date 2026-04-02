@@ -299,6 +299,8 @@ def _run_learning_thread(db_factory, run_id: int, batch_size: int) -> None:
         cursor = int(run.last_email_uid) if run.last_email_uid is not None else None  # Resume point
         processed_in_run = int(run.processed_emails or 0)
 
+        failures_in_run = 0
+
         while True:
             if _cancel_event.is_set():
                 run.status = "paused"
@@ -362,6 +364,7 @@ def _run_learning_thread(db_factory, run_id: int, batch_size: int) -> None:
                         "learning_email_failed email_id=%s error=%s",
                         email.id, str(e),
                     )
+                    failures_in_run += 1
                     cursor = email.id
 
             # Persist checkpoint after each batch
@@ -386,14 +389,24 @@ def _run_learning_thread(db_factory, run_id: int, batch_size: int) -> None:
         except Exception as e:
             logger.warning("learning_finalize_patterns_failed error=%s", str(e))
 
-        # Mark complete
-        run.status = "completed"
-        run.progress_percent = 100.0
+        # Mark final status truthfully
+        if processed_in_run == 0 and total_emails > 0 and failures_in_run > 0:
+            run.status = "failed"
+            run.progress_percent = 0.0
+            logger.error(
+                "learning_failed_all_emails run_id=%s failures=%s total=%s",
+                run_id,
+                failures_in_run,
+                total_emails,
+            )
+        else:
+            run.status = "completed"
+            run.progress_percent = 100.0
         run.completed_at = datetime.now(timezone.utc)
         db.commit()
         logger.info(
-            "learning_completed run_id=%s processed=%s/%s",
-            run_id, processed_in_run, total_emails,
+            "learning_completed run_id=%s processed=%s/%s failures=%s status=%s",
+            run_id, processed_in_run, total_emails, failures_in_run, run.status,
         )
 
     except Exception as e:

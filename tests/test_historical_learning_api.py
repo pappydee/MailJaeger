@@ -358,6 +358,38 @@ class TestLearningStatusEndpoint:
         data = response.json()
         assert data["progress_percent"] == 100.0
 
+    def test_status_failed_when_all_internal_processing_fails(self, client, _in_memory_db):
+        """If all emails fail internally, status must not report completed success."""
+        import src.services.historical_learning_service as svc
+
+        for i in range(3):
+            _make_email(
+                _in_memory_db,
+                message_id=f"all-fail-{i}@test.com",
+                sender=f"af{i}@test.com",
+                folder="INBOX",
+            )
+
+        original = svc._learn_single_email
+
+        def _always_fail(_db, _email):
+            raise RuntimeError("forced internal failure")
+
+        svc._learn_single_email = _always_fail
+        try:
+            start_response = client.post("/api/learning/start", headers=AUTH_HEADERS)
+            assert start_response.status_code == 200
+            _wait_for_learning(_in_memory_db)
+        finally:
+            svc._learn_single_email = original
+
+        response = client.get("/api/learning/status", headers=AUTH_HEADERS)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "failed"
+        assert data["processed_emails"] == 0
+        assert data["progress_percent"] == 0.0
+
 
 # ===========================================================================
 # POST /api/learning/stop
