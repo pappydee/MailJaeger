@@ -15,4 +15,4 @@ Bump policy:
   No automatic tooling — human-controlled, explicit bumps only.
 """
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"

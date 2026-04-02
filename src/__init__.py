@@ -8,6 +8,16 @@ __description__ = "Fully local, privacy-first AI email processing system"
 
 CHANGELOG = [
     {
+        "version": "1.1.1",
+        "date": "2026-04-02",
+        "changes": [
+            "IMAP connect cleanup fix: always logout instantiated client on failure and clear self.client",
+            "SSL portability fix: removed hardcoded CA bundle path and use default SSL context",
+            "IMAP context manager behavior fix: __enter__ returns self even when connect fails; __exit__ always clears client",
+            "Security hardening test portability fix: dynamic project root paths via pathlib.Path",
+        ],
+    },
+    {
         "version": "1.1.0",
         "date": "2026-02-25",
         "changes": [
