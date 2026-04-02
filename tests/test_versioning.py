@@ -130,3 +130,20 @@ class TestChangelogConsistency:
     def test_changelog_oldest_is_100(self):
         from src import CHANGELOG
         assert CHANGELOG[-1]["version"] == "1.0.0"
+
+    def test_highest_changelog_version_equals_VERSION(self):
+        """Safety: no CHANGELOG entry may exceed the current VERSION."""
+        from src.version import VERSION
+        from src import CHANGELOG
+        assert CHANGELOG[0]["version"] == VERSION, (
+            f"Highest CHANGELOG version {CHANGELOG[0]['version']} != VERSION {VERSION}"
+        )
+
+    def test_changelog_strictly_descending(self):
+        """CHANGELOG versions must be strictly descending (newest → oldest)."""
+        from src import CHANGELOG
+        versions = [tuple(int(x) for x in e["version"].split(".")) for e in CHANGELOG]
+        for i in range(len(versions) - 1):
+            assert versions[i] > versions[i + 1], (
+                f"CHANGELOG not descending: {CHANGELOG[i]['version']} <= {CHANGELOG[i+1]['version']}"
+            )
