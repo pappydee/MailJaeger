@@ -8,6 +8,23 @@ __description__ = "Fully local, privacy-first AI email processing system"
 
 CHANGELOG = [
     {
+        "version": "1.2.0",
+        "date": "2026-04-02",
+        "changes": [
+            "Historical Learning System: persistent, resumable learning jobs that scan all existing emails",
+            "New learning_runs and learning_progress DB tables for durable progress tracking",
+            "Background thread execution: learning jobs never block the API",
+            "Single-job concurrency lock: only one learning job runs at a time",
+            "Resume logic: survives restart/crash, picks up from last_email_uid checkpoint",
+            "New API endpoints: POST /api/learning/reset to clear learning data",
+            "Enhanced SenderProfile: spam_probability and interaction_count fields",
+            "Enhanced DecisionEvent: action_type and target_folder fields",
+            "Phase tracking: scanning → analyzing → learning with progress_percent",
+            "Spam detection integration: sender profiles with high spam probability auto-classify",
+            "Configurable batch size (50–200 emails) for memory-efficient processing",
+        ],
+    },
+    {
         "version": "1.1.1",
         "date": "2026-04-02",
         "changes": [

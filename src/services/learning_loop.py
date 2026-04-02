@@ -342,6 +342,17 @@ def _classify_by_sender_profile(
     if not profile:
         return None
 
+    # Check if sender has high spam probability from historical learning
+    spam_prob = getattr(profile, "spam_probability", None)
+    if spam_prob is not None and float(spam_prob or 0) >= 0.8:
+        return {
+            "category": "spam",
+            "suggested_folder": None,
+            "explanation": "Historical learning: sender has high spam probability",
+            "confidence": min(1.0, float(spam_prob)),
+            "source": "sender_spam_profile",
+        }
+
     # Only use the profile if user has explicitly classified it
     if (profile.user_classification_count or 0) > 0 and profile.preferred_category:
         return {
