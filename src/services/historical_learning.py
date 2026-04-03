@@ -272,6 +272,10 @@ def _get_or_create_sender_profile(
     Exactly one of domain/address should be provided.
     - When domain is set (address is None): returns the domain-level profile.
     - When address is set: returns the address-level profile.
+
+    Calls ``db.flush()`` after inserting a new row so that subsequent
+    queries within the same transaction see it even when the session
+    has ``autoflush=False``.
     """
     now = datetime.now(timezone.utc)
     if address:
@@ -290,6 +294,7 @@ def _get_or_create_sender_profile(
                 last_seen=now,
             )
             db.add(profile)
+            db.flush()
     else:
         profile = (
             db.query(SenderProfile)
@@ -308,6 +313,7 @@ def _get_or_create_sender_profile(
                 last_seen=now,
             )
             db.add(profile)
+            db.flush()
     return profile
 
 

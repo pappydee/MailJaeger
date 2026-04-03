@@ -721,3 +721,193 @@ class TestLegacySQLiteUpgradeLearning:
             assert status["processed_emails"] >= 1
         finally:
             db.close()
+
+
+# ===========================================================================
+# Sender profile UNIQUE constraint regression tests
+# ===========================================================================
+
+
+class TestSenderProfileUniqueConstraint:
+    """Regression tests for:
+    sqlite3.IntegrityError: UNIQUE constraint failed: sender_profiles.sender_address
+
+    The production session uses autoflush=False, so every fixture below
+    mirrors that configuration.
+    """
+
+    @pytest.fixture
+    def noflush_engine(self):
+        eng = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(eng)
+        return eng
+
+    @pytest.fixture
+    def noflush_db(self, noflush_engine):
+        """Session with autoflush=False matching production config."""
+        Session = sessionmaker(
+            bind=noflush_engine, autoflush=False, autocommit=False
+        )
+        session = Session()
+        yield session
+        session.close()
+
+    @pytest.fixture
+    def noflush_db_factory(self, noflush_engine):
+        Session = sessionmaker(
+            bind=noflush_engine, autoflush=False, autocommit=False
+        )
+        def factory():
+            return Session()
+        return factory
+
+    def test_same_sender_multiple_emails_no_integrity_error(self, noflush_db):
+        """Two emails from the same sender processed in the same batch
+        must NOT raise IntegrityError on sender_profiles.sender_address."""
+        from src.services.historical_learning import learn_from_email
+
+        for i in range(3):
+            email = ProcessedEmail(
+                message_id=f"dup-sender-{i}@example.com",
+                subject=f"Subject {i}",
+                sender="alice@example.com",
+                recipients="me@mymail.com",
+                folder="INBOX",
+                category="Allgemein",
+                analysis_state="pending",
+                is_spam=False,
+                is_processed=True,
+                is_flagged=False,
+                body_plain=f"body {i}",
+                date=datetime.now(timezone.utc),
+            )
+            noflush_db.add(email)
+        noflush_db.commit()
+
+        emails = noflush_db.query(ProcessedEmail).all()
+        for email in emails:
+            learn_from_email(noflush_db, email, source="test")
+        noflush_db.commit()  # must NOT raise IntegrityError
+
+        profiles = noflush_db.query(SenderProfile).filter(
+            SenderProfile.sender_address == "alice@example.com"
+        ).all()
+        assert len(profiles) == 1, "Duplicate sender profiles created"
+        assert profiles[0].total_emails == 3
+
+    def test_repeated_learning_runs_no_duplicates(self, noflush_db):
+        """Running learn_from_email twice for same emails must reuse profiles."""
+        from src.services.historical_learning import learn_from_email
+
+        for i in range(2):
+            email = ProcessedEmail(
+                message_id=f"repeat-{i}@example.com",
+                subject=f"Repeat {i}",
+                sender="bob@example.com",
+                recipients="me@mymail.com",
+                folder="INBOX",
+                category="Allgemein",
+                analysis_state="pending",
+                is_spam=False,
+                is_processed=True,
+                is_flagged=False,
+                body_plain=f"body {i}",
+                date=datetime.now(timezone.utc),
+            )
+            noflush_db.add(email)
+        noflush_db.commit()
+
+        emails = noflush_db.query(ProcessedEmail).all()
+        # Run 1
+        for email in emails:
+            learn_from_email(noflush_db, email, source="run-1")
+        noflush_db.commit()
+        # Run 2
+        for email in emails:
+            learn_from_email(noflush_db, email, source="run-2")
+        noflush_db.commit()
+
+        addr_profiles = noflush_db.query(SenderProfile).filter(
+            SenderProfile.sender_address == "bob@example.com"
+        ).all()
+        assert len(addr_profiles) == 1
+        assert addr_profiles[0].total_emails == 4  # 2 emails × 2 runs
+
+    def test_domain_and_address_profiles_coexist(self, noflush_db):
+        """Address-level and domain-level profiles must be separate rows."""
+        from src.services.historical_learning import learn_from_email
+
+        email = ProcessedEmail(
+            message_id="coexist@example.com",
+            subject="Test",
+            sender="charlie@example.com",
+            recipients="me@mymail.com",
+            folder="INBOX",
+            category="Allgemein",
+            analysis_state="pending",
+            is_spam=False,
+            is_processed=True,
+            is_flagged=False,
+            body_plain="body",
+            date=datetime.now(timezone.utc),
+        )
+        noflush_db.add(email)
+        noflush_db.commit()
+
+        learn_from_email(noflush_db, email, source="test")
+        noflush_db.commit()
+
+        addr = noflush_db.query(SenderProfile).filter(
+            SenderProfile.sender_address == "charlie@example.com"
+        ).all()
+        domain = noflush_db.query(SenderProfile).filter(
+            SenderProfile.sender_domain == "example.com",
+            SenderProfile.sender_address.is_(None),
+        ).all()
+        assert len(addr) == 1
+        assert len(domain) == 1
+
+    def test_full_learning_run_same_sender_autoflush_off(
+        self, noflush_db, noflush_db_factory
+    ):
+        """Full historical learning run with autoflush=False and emails from
+        the same sender must complete without IntegrityError."""
+        from src.services.historical_learning_service import start_learning, get_status
+
+        for i in range(5):
+            email = ProcessedEmail(
+                message_id=f"full-run-{i}@example.com",
+                subject=f"Full Run {i}",
+                sender="shared@sender.com",
+                recipients="me@mymail.com",
+                folder="INBOX",
+                category="Allgemein",
+                analysis_state="pending",
+                is_spam=False,
+                is_processed=True,
+                is_flagged=False,
+                body_plain=f"body {i}",
+                date=datetime.now(timezone.utc),
+            )
+            noflush_db.add(email)
+        noflush_db.commit()
+
+        result = start_learning(noflush_db_factory, batch_size=50)
+        assert result["success"] is True
+        _wait_for_completion(noflush_db)
+
+        status = get_status(noflush_db_factory)
+        assert status["status"] == "completed"
+        assert status["processed_emails"] >= 1
+
+        noflush_db.expire_all()
+        profiles = noflush_db.query(SenderProfile).filter(
+            SenderProfile.sender_address == "shared@sender.com"
+        ).all()
+        assert len(profiles) == 1, (
+            f"Expected 1 address profile, found {len(profiles)}"
+        )
