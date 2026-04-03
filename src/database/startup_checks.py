@@ -250,7 +250,7 @@ def ensure_historical_learning_schema_compatibility(engine, debug: bool = False)
         debug=debug,
     )
 
-    from src.models.database import LearningRun, LearningProgress
+    from src.models.database import LearningRun, LearningProgress, MailboxImportRun
 
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
@@ -264,6 +264,10 @@ def ensure_historical_learning_schema_compatibility(engine, debug: bool = False)
             LearningProgress.__table__.create(bind=connection, checkfirst=True)
             tables_created.append("learning_progress")
             logger.warning("SQLite schema repair: created missing table 'learning_progress'")
+        if "mailbox_import_runs" not in existing_tables:
+            MailboxImportRun.__table__.create(bind=connection, checkfirst=True)
+            tables_created.append("mailbox_import_runs")
+            logger.warning("SQLite schema repair: created missing table 'mailbox_import_runs'")
 
     if sender_result["columns_added"] or decision_result["columns_added"] or tables_created:
         logger.info(

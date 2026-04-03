@@ -1678,6 +1678,84 @@ async def reset_learning_job(request: Request, db: Session = Depends(get_db)):
     return reset_learning(_learning_db_factory)
 
 
+# ---------------------------------------------------------------------------
+# Mailbox-Wide Import Endpoints (v1.2.0 — streaming batch import + learn)
+# ---------------------------------------------------------------------------
+
+_import_cancel_event_api = threading.Event()
+
+
+def _import_db_factory():
+    """Create a new DB session for the background import thread."""
+    from src.database.connection import get_session_factory
+    return get_session_factory()()
+
+
+@app.post("/api/import/start", dependencies=[Depends(require_authentication)])
+@limiter.limit("5/minute")
+async def start_import_job(request: Request, db: Session = Depends(get_db)):
+    """Start (or resume) a mailbox-wide streaming import + learn job.
+
+    The job connects to IMAP, discovers all folders, and processes them
+    in small streaming batches (fetch → ingest → learn → checkpoint).
+
+    Query parameters:
+      batch_size (int, default 20): Emails per IMAP batch (5–100)
+      skip_attachment_binaries (bool, default true): Skip downloading
+          attachment content; only extract metadata.
+    """
+    try:
+        batch_size = int(request.query_params.get("batch_size", "20"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="batch_size must be an integer")
+
+    skip_att_raw = request.query_params.get("skip_attachment_binaries", "true")
+    skip_attachment_binaries = skip_att_raw.lower() not in ("false", "0", "no")
+
+    from src.services.mailbox_import_service import start_import
+
+    result = start_import(
+        _import_db_factory,
+        batch_size=batch_size,
+        skip_attachment_binaries=skip_attachment_binaries,
+    )
+    return result
+
+
+@app.post("/api/import/stop", dependencies=[Depends(require_authentication)])
+@limiter.limit("10/minute")
+async def stop_import_job(request: Request, db: Session = Depends(get_db)):
+    """Request the running import job to stop at the next batch boundary."""
+    from src.services.mailbox_import_service import stop_import
+
+    return stop_import(_import_db_factory)
+
+
+@app.get("/api/import/status", dependencies=[Depends(require_authentication)])
+async def import_job_status(db: Session = Depends(get_db)):
+    """Return the current mailbox import job status.
+
+    Reports: current folder, batch progress, folder counts,
+    email counts, whether attachment binaries are skipped.
+    """
+    from src.services.mailbox_import_service import get_import_status
+
+    return get_import_status(_import_db_factory)
+
+
+@app.post("/api/import/reset", dependencies=[Depends(require_authentication)])
+@limiter.limit("3/minute")
+async def reset_import_job(request: Request, db: Session = Depends(get_db)):
+    """Reset all import run data.
+
+    Stops any running job and deletes all MailboxImportRun records.
+    Does NOT delete ingested emails or learned aggregates.
+    """
+    from src.services.mailbox_import_service import reset_import
+
+    return reset_import(_import_db_factory)
+
+
 @app.get("/api/settings", dependencies=[Depends(require_authentication)])
 async def get_settings_api(db: Session = Depends(get_db)):
     """Get current settings (sanitized - no sensitive credentials)"""
