@@ -532,7 +532,7 @@ def _ingest_and_learn_single(
         integrity_hash=email_data.get("integrity_hash"),
         analysis_state="pending",
         is_processed=False,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
 
     db.add(email_record)
@@ -630,9 +630,9 @@ def _parse_email_for_import(
                 from email.utils import parsedate_to_datetime
                 email_date = parsedate_to_datetime(date_str)
             except (ValueError, TypeError):
-                email_date = datetime.utcnow()
+                email_date = datetime.now(timezone.utc)
         else:
-            email_date = datetime.utcnow()
+            email_date = datetime.now(timezone.utc)
 
         # Extract body text
         body_plain, body_html = _extract_body(msg)
