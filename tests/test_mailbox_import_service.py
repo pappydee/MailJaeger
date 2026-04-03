@@ -350,7 +350,9 @@ class TestBatchSizeBehavior:
         assert max(5, min(100, 20)) == 20
 
     def test_process_folder_in_batches(self, db):
-        """Emails must be fetched in small batches, not all at once."""
+        """Emails must be fetched one at a time (per-UID), not as a single
+        combined multi-message batch.  With 12 UIDs, fetch must be called
+        exactly 12 times."""
         from src.services.mailbox_import_service import (
             _process_folder_streaming,
             _import_cancel_event,
@@ -363,7 +365,7 @@ class TestBatchSizeBehavior:
         db.add(run)
         db.commit()
 
-        uids = list(range(1, 13))  # 12 emails → 3 batches of (5, 5, 2)
+        uids = list(range(1, 13))  # 12 emails
         mock_imap = MockIMAPClient({"INBOX": uids})
 
         fetch_call_count = 0
@@ -384,7 +386,8 @@ class TestBatchSizeBehavior:
                 batch_size=5, skip_attachment_binaries=True,
             )
 
-        assert fetch_call_count == 3
+        # Per-UID fetch strategy: one fetch call per email
+        assert fetch_call_count == 12
 
     def test_default_batch_size_is_small(self):
         """Default batch size must be 20 (not hundreds)."""
@@ -517,7 +520,9 @@ class TestNoFullPreDownload:
     """Verify the system does NOT require downloading the whole mailbox first."""
 
     def test_emails_ingested_and_learned_per_batch(self, db):
-        """Each batch must be ingested AND learned before fetching the next batch."""
+        """All emails in a folder must be ingested and learned.  With per-UID
+        fetching, each email is committed immediately; the per-batch checkpoint
+        ensures forward progress even if the process restarts mid-batch."""
         from src.services.mailbox_import_service import (
             _process_folder_streaming,
             _import_cancel_event,
@@ -533,16 +538,6 @@ class TestNoFullPreDownload:
         uids = [1, 2, 3, 4, 5, 6]
         mock_imap = MockIMAPClient({"INBOX": uids})
 
-        emails_before_batch = []
-        original_fetch = mock_imap.fetch
-
-        def tracking_fetch(uids_arg, parts):
-            count = db.query(ProcessedEmail).count()
-            emails_before_batch.append(count)
-            return original_fetch(uids_arg, parts)
-
-        mock_imap.fetch = tracking_fetch
-
         with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
             MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
             _import_cancel_event.clear()
@@ -551,10 +546,9 @@ class TestNoFullPreDownload:
                 batch_size=3, skip_attachment_binaries=True,
             )
 
-        # 6 emails / batch 3 = 2 fetches
-        assert len(emails_before_batch) == 2
-        assert emails_before_batch[0] == 0  # Nothing before first batch
-        assert emails_before_batch[1] == 3  # 3 emails after first batch
+        # All 6 emails must be ingested
+        assert db.query(ProcessedEmail).count() == 6
+        assert (run.total_emails_ingested or 0) == 6
 
     def test_ingest_and_learn_single_does_both(self, db):
         """_ingest_and_learn_single must ingest AND learn in one call."""
@@ -1041,9 +1035,10 @@ class TestBodystructureParseFailure:
             "BODYSTRUCTURE must not be requested - fragile for complex MIME"
         )
 
-    def test_batch_fetch_failure_falls_back_to_individual(self, db):
-        """When a batch fetch fails, the service must fall back to fetching
-        each UID individually so healthy messages are not lost."""
+    def test_per_uid_fetch_isolates_failures(self, db):
+        """Per-UID fetch strategy: one bad UID must not prevent other UIDs
+        in the same batch from being ingested.  The importer fetches each
+        email individually so a failure on UID N never poisons UID N+1."""
         from src.services.mailbox_import_service import _process_folder_streaming
 
         run = MailboxImportRun(
@@ -1053,10 +1048,10 @@ class TestBodystructureParseFailure:
         db.add(run)
         db.commit()
 
-        call_count = {"batch": 0, "individual": 0}
+        fetch_calls = []
 
-        class FallbackIMAPClient:
-            """IMAP mock that fails on batch fetch but succeeds per-email."""
+        class PerUIDClient:
+            """Always fetched one UID at a time; UID 101 raises."""
             client = None
 
             def __init__(self):
@@ -1069,11 +1064,12 @@ class TestBodystructureParseFailure:
                 return [100, 101, 102]
 
             def fetch(self, uids, parts):
-                if len(uids) > 1:
-                    call_count["batch"] += 1
-                    raise Exception("Tuple incomplete before <complex stuff>")
-                call_count["individual"] += 1
+                # New strategy: always called with exactly one UID
+                assert len(uids) == 1, "Per-UID fetch must call fetch([uid], ...)"
+                fetch_calls.append(uids[0])
                 uid = uids[0]
+                if uid == 101:
+                    raise Exception("Tuple incomplete before end of data")
                 return _build_metadata_fetch_response([uid], "Klinik")
 
             def list_folders(self):
@@ -1085,7 +1081,7 @@ class TestBodystructureParseFailure:
             def __exit__(self, *a):
                 pass
 
-        mock_imap = FallbackIMAPClient()
+        mock_imap = PerUIDClient()
         with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
             MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
             with patch("src.services.mailbox_import_service.learn_from_email"):
@@ -1095,15 +1091,18 @@ class TestBodystructureParseFailure:
                         batch_size=5, skip_attachment_binaries=True,
                     )
 
-        assert call_count["batch"] >= 1
-        assert call_count["individual"] == 3
-        assert db.query(ProcessedEmail).count() == 3
+        # All 3 UIDs fetched individually
+        assert fetch_calls == [100, 101, 102]
+        # 2 of 3 ingested (UID 101 failed fetch)
+        assert db.query(ProcessedEmail).count() == 2
         assert db.query(ProcessedEmail).filter(
             ProcessedEmail.folder == "Klinik"
-        ).count() == 3
+        ).count() == 2
+        # Exactly one failure counted
+        assert (run.total_emails_failed or 0) == 1
 
     def test_single_bad_uid_does_not_fail_batch(self, db):
-        """If one UID fails individual fetch, others in the batch succeed."""
+        """If one UID fetch fails, others in the same batch succeed."""
         from src.services.mailbox_import_service import _process_folder_streaming
 
         run = MailboxImportRun(
@@ -1114,7 +1113,7 @@ class TestBodystructureParseFailure:
         db.commit()
 
         class PartialFailIMAPClient:
-            """Batch fetch fails; UID 201 also fails individually."""
+            """UID 201 fails fetch; UIDs 200 and 202 succeed."""
             client = None
 
             def __init__(self):
@@ -1127,8 +1126,6 @@ class TestBodystructureParseFailure:
                 return [200, 201, 202]
 
             def fetch(self, uids, parts):
-                if len(uids) > 1:
-                    raise Exception("BODYSTRUCTURE parse error")
                 uid = uids[0]
                 if uid == 201:
                     raise Exception("Malformed message data")
@@ -1172,7 +1169,7 @@ class TestBodystructureParseFailure:
         db.commit()
 
         class BatchFailRecoverIMAPClient:
-            """Batch fetch fails; all 3 UIDs succeed individually."""
+            """All UIDs succeed individually (per-UID fetch strategy)."""
             client = None
 
             def __init__(self):
@@ -1185,8 +1182,6 @@ class TestBodystructureParseFailure:
                 return [300, 301, 302]
 
             def fetch(self, uids, parts):
-                if len(uids) > 1:
-                    raise Exception("Parse error in batch")
                 return _build_metadata_fetch_response(uids, "Work")
 
             def list_folders(self):
@@ -1387,11 +1382,12 @@ class TestAttachmentBinaryPolicy:
 
 
 class TestMultiFolderWithFallback:
-    """End-to-end: multiple folders, batch fetch failure, per-email fallback."""
+    """End-to-end: multiple folders where individual email fetches fail.
+    The per-UID fetch strategy ensures forward progress across folders."""
 
-    def test_multi_folder_continues_after_batch_failure(self, db):
+    def test_multi_folder_continues_after_individual_failures(self, db):
         """Import must continue to next folder even if one folder has
-        problematic messages causing batch-level failures."""
+        problematic messages causing per-UID fetch failures."""
         from src.services.mailbox_import_service import _process_folder_streaming
 
         run = MailboxImportRun(
@@ -1401,7 +1397,7 @@ class TestMultiFolderWithFallback:
         db.add(run)
         db.commit()
 
-        # Folder 1: normal
+        # Folder 1: normal — all emails succeed
         mock_normal = MockIMAPClient({"INBOX": [1, 2, 3]})
         with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
             MockIMAPSvc.return_value = _make_mock_imap_context(mock_normal)
@@ -1416,7 +1412,7 @@ class TestMultiFolderWithFallback:
             ProcessedEmail.folder == "INBOX"
         ).count() == 3
 
-        # Folder 2: batch fetch fails but individual fetch recovers
+        # Folder 2: per-UID fetch always succeeds (mock returns data for single UIDs)
         class Folder2IMAP:
             client = None
 
@@ -1430,8 +1426,6 @@ class TestMultiFolderWithFallback:
                 return [10, 11]
 
             def fetch(self, uids, parts):
-                if len(uids) > 1:
-                    raise Exception("Parse error in Klinik")
                 return _build_metadata_fetch_response(uids, "Klinik")
 
             def list_folders(self):
@@ -1500,8 +1494,10 @@ class TestSanitizedErrorLogging:
         result = _sanitize_error(exc)
         assert "Tuple incomplete before end of data" in result
 
-    def test_batch_fetch_failure_log_is_sanitized(self, db):
-        """import_batch_fetch_failed log must not contain raw message payloads."""
+    def test_single_fetch_failure_log_is_sanitized(self, db):
+        """import_single_fetch_failed log must not contain raw message payloads.
+        _sanitize_error() logs only the exception type + first line of message,
+        so even printable-ASCII email content cannot leak into logs."""
         import logging
         from src.services.mailbox_import_service import _process_folder_streaming
 
@@ -1513,10 +1509,10 @@ class TestSanitizedErrorLogging:
         db.commit()
 
         raw_payload = "Subject: Secret\r\nFrom: a@b.com\r\n\r\nSecret body content"
-        raw_payload_long = raw_payload * 20  # >200 chars
+        raw_payload_long = raw_payload * 20  # >200 chars of printable ASCII
 
         class PayloadLeakIMAPClient:
-            """Batch fetch raises an exception embedding raw email payload."""
+            """Per-UID fetch raises an exception with raw email payload."""
             client = None
 
             def __init__(self):
@@ -1529,9 +1525,8 @@ class TestSanitizedErrorLogging:
                 return [1, 2]
 
             def fetch(self, uids, parts):
-                if len(uids) > 1:
-                    raise Exception(f"Parse error: {raw_payload_long}")
-                return _build_metadata_fetch_response(uids, "INBOX")
+                # With per-UID strategy, uids always has exactly 1 element
+                raise Exception(f"Parse error: {raw_payload_long}")
 
             def list_folders(self):
                 return []
@@ -1565,24 +1560,24 @@ class TestSanitizedErrorLogging:
         finally:
             svc_logger.removeHandler(handler)
 
-        # Verify the batch-failure log line was emitted
-        batch_fail_logs = [r for r in log_records if "import_batch_fetch_failed" in r]
-        assert len(batch_fail_logs) >= 1, "Expected import_batch_fetch_failed log"
+        # Verify per-UID failure log lines were emitted (one per failing UID)
+        single_fail_logs = [r for r in log_records if "import_single_fetch_failed" in r]
+        assert len(single_fail_logs) == 2, f"Expected 2 import_single_fetch_failed logs, got: {single_fail_logs}"
 
-        # Verify each log line is bounded (not an unbounded IMAP response dump)
+        from src.services.mailbox_import_service import _MAX_ERROR_LOG_LEN
+        # Each log line must be bounded — sanitizer truncates to _MAX_ERROR_LOG_LEN
         for record in log_records:
-            # The sanitizer must limit each log argument to _MAX_ERROR_LOG_LEN
-            # chars — so no log line should be excessively long
-            assert len(record) <= 2000, f"Log line too long: {len(record)} chars"
+            assert len(record) <= 1000, f"Log line too long: {len(record)} chars"
 
-        # Verify the error field in the batch-fail log is truncated, not raw dump
-        for record in batch_fail_logs:
-            from src.services.mailbox_import_service import _MAX_ERROR_LOG_LEN
-            # The error portion after "error=" should be at most
-            # _MAX_ERROR_LOG_LEN + len(" [truncated]") + some prefix chars
+        # The full raw payload must NOT appear in any log line
+        # (_sanitize_error takes only first line of the exception + truncates)
+        for record in single_fail_logs:
+            assert "Secret body content" not in record, (
+                f"Raw email content leaked into log: {record[:200]}"
+            )
+            # Error portion must be bounded
             assert len(record) < _MAX_ERROR_LOG_LEN * 3, (
-                f"Batch fail log line suspiciously long ({len(record)} chars), "
-                "suggesting unsanitized error embedded in log"
+                f"Single-fetch fail log line suspiciously long ({len(record)} chars)"
             )
 
 

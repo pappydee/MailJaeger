@@ -62,23 +62,31 @@ logger = get_logger(__name__)
 
 # Maximum characters allowed from an exception message in a log line.
 # IMAP exceptions can embed raw server responses (including mail content).
-_MAX_ERROR_LOG_LEN = 200
+# Email bodies are printable ASCII, so we must be strict: only the first line
+# of the exception message is kept, and it is truncated hard.
+_MAX_ERROR_LOG_LEN = 120
 
 
 def _sanitize_error(exc: Exception) -> str:
     """Return a sanitized, truncated error string safe for log output.
 
-    Prevents raw IMAP response data (which can contain email headers,
-    body text, or attachment fragments) from appearing in production logs.
-    Only printable ASCII is kept; anything else is replaced with '?'.
-    The result is truncated to ``_MAX_ERROR_LOG_LEN`` characters.
+    Format: ``ExceptionType: first-line-of-message [truncated]``
+
+    IMAP exception messages frequently embed raw server responses that include
+    email headers, body text, or attachment fragments (all printable ASCII).
+    Passing printable ASCII through unchanged is therefore NOT safe.
+    Instead we log only the exception type name and the first line of the
+    message, capped at ``_MAX_ERROR_LOG_LEN`` characters total.
     """
-    raw = str(exc)
-    # Keep only printable ASCII (0x20–0x7E) to strip binary/MIME payload noise
-    safe = "".join(c if 0x20 <= ord(c) <= 0x7E else "?" for c in raw)
-    if len(safe) > _MAX_ERROR_LOG_LEN:
-        safe = safe[:_MAX_ERROR_LOG_LEN] + " [truncated]"
-    return safe
+    exc_type = type(exc).__name__
+    # Take only the first line of the message to avoid multi-line IMAP dumps
+    first_line = str(exc).split("\n")[0].split("\r")[0]
+    # Strip non-printable chars from that first line
+    safe_line = "".join(c if 0x20 <= ord(c) <= 0x7E else "?" for c in first_line)
+    summary = f"{exc_type}: {safe_line}"
+    if len(summary) > _MAX_ERROR_LOG_LEN:
+        summary = summary[:_MAX_ERROR_LOG_LEN] + " [truncated]"
+    return summary
 
 # ---------------------------------------------------------------------------
 # Module-level concurrency primitives
@@ -430,7 +438,13 @@ def _process_folder_streaming(
         if not all_uids:
             return folder_stats
 
-        # Process in small batches
+        # Process in small batches.  Each email is fetched INDIVIDUALLY —
+        # never as a combined multi-message IMAP fetch.  A combined fetch
+        # returns a complex response whose parser can choke on a single
+        # malformed message and lose the entire batch.  Per-email fetching
+        # isolates failures so one bad message never stalls the whole folder.
+        fetch_fields = _FETCH_HEADERS_AND_TEXT if skip_attachment_binaries else _FETCH_FULL
+
         for batch_start in range(0, len(all_uids), batch_size):
             if _import_cancel_event.is_set():
                 folder_stats["paused"] = True
@@ -440,27 +454,29 @@ def _process_folder_streaming(
             if not batch_uids:
                 break
 
-            # Fetch batch from IMAP
-            fetch_fields = _FETCH_HEADERS_AND_TEXT if skip_attachment_binaries else _FETCH_FULL
-            try:
-                fetch_data = imap.client.fetch(batch_uids, fetch_fields)
-            except Exception as e:
-                # Batch-level fetch failed (e.g. one message with malformed
-                # data can poison the whole IMAP response).  Fall back to
-                # fetching each UID individually so healthy messages in the
-                # batch are not lost.
-                logger.warning(
-                    "import_batch_fetch_failed folder=%s error=%s "
-                    "— falling back to per-email fetch",
-                    folder_name, _sanitize_error(e),
-                )
-                fetch_data = _fetch_uids_individually(
-                    imap, batch_uids, fetch_fields, folder_name,
-                    folder_stats,
-                )
+            # --- Fetch and ingest each UID individually ---
+            for uid in batch_uids:
+                # Step 1: fetch this single email from IMAP
+                try:
+                    single_data = imap.client.fetch([uid], fetch_fields)
+                except Exception as e:
+                    logger.warning(
+                        "import_single_fetch_failed uid=%s folder=%s error=%s",
+                        uid, folder_name, _sanitize_error(e),
+                    )
+                    folder_stats["failed"] += 1
+                    continue
 
-            # Ingest + learn each email in the batch
-            for uid, msg_data in fetch_data.items():
+                if uid not in single_data:
+                    logger.warning(
+                        "import_uid_missing_in_response uid=%s folder=%s",
+                        uid, folder_name,
+                    )
+                    folder_stats["failed"] += 1
+                    continue
+
+                # Step 2: ingest + learn this email
+                msg_data = single_data[uid]
                 try:
                     result = _ingest_and_learn_single(
                         db=db,
@@ -482,7 +498,8 @@ def _process_folder_streaming(
                     )
                     folder_stats["failed"] += 1
 
-            # Persist checkpoint after each batch
+            # Persist checkpoint after each batch — always advance past this
+            # batch regardless of how many individual emails failed.
             last_uid = max(int(u) for u in batch_uids)
             run.current_folder_uid_checkpoint = last_uid
             run.total_emails_ingested = (run.total_emails_ingested or 0) + folder_stats["ingested"]
@@ -507,42 +524,6 @@ def _process_folder_streaming(
     db.commit()
 
     return folder_stats
-
-
-# ---------------------------------------------------------------------------
-# Per-UID fallback fetch
-# ---------------------------------------------------------------------------
-
-
-def _fetch_uids_individually(
-    imap: Any,
-    uids: list,
-    fetch_fields: list,
-    folder_name: str,
-    folder_stats: Dict[str, Any],
-) -> Dict:
-    """Fetch UIDs one at a time — used as fallback when a batch fetch fails.
-
-    Returns a dict of ``{uid: msg_data}`` for each UID that was successfully
-    fetched.  UIDs that still fail individually are counted in
-    ``folder_stats["failed"]``.
-    """
-    result: Dict = {}
-    for uid in uids:
-        try:
-            single = imap.client.fetch([uid], fetch_fields)
-            if uid in single:
-                result[uid] = single[uid]
-            else:
-                # Server returned no data for this UID — skip it
-                folder_stats["failed"] += 1
-        except Exception as e:
-            logger.warning(
-                "import_single_fetch_failed uid=%s folder=%s error=%s",
-                uid, folder_name, _sanitize_error(e),
-            )
-            folder_stats["failed"] += 1
-    return result
 
 
 # ---------------------------------------------------------------------------
