@@ -911,3 +911,63 @@ class TestSenderProfileUniqueConstraint:
         assert len(profiles) == 1, (
             f"Expected 1 address profile, found {len(profiles)}"
         )
+
+    def test_start_learning_reuses_existing_sender_address_profile(
+        self, noflush_db, noflush_db_factory
+    ):
+        """Real service path: existing sender_address profile must be reused.
+
+        This reproduces production shape:
+          /api/learning/start -> historical_learning_service.start_learning
+          -> _run_learning_thread -> _learn_single_email -> learn_from_email.
+        """
+        from src.services.historical_learning_service import start_learning, get_status
+
+        existing = SenderProfile(
+            sender_address="existing@sender.com",
+            sender_domain="sender.com",
+            total_emails=7,
+            folder_distribution={"INBOX": 7},
+            typical_folder="INBOX",
+            first_seen=datetime.now(timezone.utc),
+            last_seen=datetime.now(timezone.utc),
+        )
+        noflush_db.add(existing)
+        noflush_db.commit()
+
+        for i in range(4):
+            email = ProcessedEmail(
+                message_id=f"existing-profile-{i}@example.com",
+                subject=f"Existing {i}",
+                sender="Existing <existing@sender.com>",
+                recipients="me@mymail.com",
+                folder="INBOX",
+                category="Allgemein",
+                analysis_state="pending",
+                is_spam=False,
+                is_processed=True,
+                is_flagged=False,
+                body_plain=f"body {i}",
+                date=datetime.now(timezone.utc),
+            )
+            noflush_db.add(email)
+        noflush_db.commit()
+
+        result = start_learning(noflush_db_factory, batch_size=50)
+        assert result["success"] is True
+        run = _wait_for_completion(noflush_db)
+        assert run is not None
+
+        status = get_status(noflush_db_factory)
+        assert status["processed_emails"] > 0
+        assert status["status"] in ("completed", "failed", "paused")
+        # Regression assertion: must not fail from duplicate sender insert.
+        assert "UNIQUE constraint failed: sender_profiles.sender_address" not in (
+            status.get("error_message") or ""
+        )
+
+        addr_profiles = noflush_db.query(SenderProfile).filter(
+            SenderProfile.sender_address == "existing@sender.com"
+        ).all()
+        assert len(addr_profiles) == 1
+        assert (addr_profiles[0].total_emails or 0) >= 8
