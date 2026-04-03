@@ -588,9 +588,20 @@ def _parse_email_for_import(
     try:
         if skip_attachment_binaries:
             # Reconstruct from header + text parts
+            # IMAP BODY[HEADER] includes the trailing blank line separator,
+            # so we concatenate directly without adding extra separators.
             header_bytes = msg_data.get(b"BODY[HEADER]", b"")
             text_bytes = msg_data.get(b"BODY[TEXT]", b"")
-            raw_email = header_bytes + b"\r\n" + text_bytes if header_bytes else text_bytes
+            if header_bytes:
+                # Ensure there's a proper blank line between header and body
+                # The header must end with \r\n\r\n or \n\n
+                if header_bytes.endswith(b"\r\n\r\n") or header_bytes.endswith(b"\n\n"):
+                    raw_email = header_bytes + text_bytes
+                else:
+                    # Add separator if missing
+                    raw_email = header_bytes + b"\r\n" + text_bytes
+            else:
+                raw_email = text_bytes
 
             # Also try to extract attachment metadata from BODYSTRUCTURE
             bodystructure = msg_data.get(b"BODYSTRUCTURE")
