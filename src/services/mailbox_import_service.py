@@ -88,6 +88,13 @@ def _sanitize_error(exc: Exception) -> str:
         summary = summary[:_MAX_ERROR_LOG_LEN] + " [truncated]"
     return summary
 
+
+# Maximum number of consecutive all-fail batches before a folder is abandoned.
+# Prevents the importer from grinding through thousands of UIDs that all return
+# empty IMAP responses (no exception, just missing data) when the server is
+# misbehaving for a specific folder.
+_MAX_CONSECUTIVE_BATCH_FAILURES = 3
+
 # ---------------------------------------------------------------------------
 # Module-level concurrency primitives
 # ---------------------------------------------------------------------------
@@ -342,7 +349,7 @@ def _run_import_thread(
                 )
                 # Folder-level error — we don't know how many emails would
                 # have been affected, so don't inflate failed counter.
-                run.error_message = f"Folder {folder_name}: {str(e)}"
+                run.error_message = _sanitize_error(e)
                 db.commit()
                 # Continue with next folder — don't fail the whole run
                 continue
@@ -382,7 +389,7 @@ def _run_import_thread(
             run = db.query(MailboxImportRun).filter(MailboxImportRun.id == run_id).first()
             if run:
                 run.status = "failed"
-                run.error_message = str(e)
+                run.error_message = _sanitize_error(e)
                 db.commit()
         except Exception:
             pass
@@ -445,6 +452,12 @@ def _process_folder_streaming(
         # isolates failures so one bad message never stalls the whole folder.
         fetch_fields = _FETCH_HEADERS_AND_TEXT if skip_attachment_binaries else _FETCH_FULL
 
+        # Guard against a folder where every UID returns empty/broken data
+        # without raising an exception.  If _MAX_CONSECUTIVE_BATCH_FAILURES
+        # consecutive batches all have a 100% failure rate, abandon the folder
+        # instead of grinding through all remaining UIDs.
+        consecutive_all_fail_batches = 0
+
         for batch_start in range(0, len(all_uids), batch_size):
             if _import_cancel_event.is_set():
                 folder_stats["paused"] = True
@@ -502,6 +515,11 @@ def _process_folder_streaming(
             # batch regardless of how many individual emails failed.
             last_uid = max(int(u) for u in batch_uids)
             run.current_folder_uid_checkpoint = last_uid
+
+            # Track consecutive all-fail batches BEFORE resetting counters.
+            batch_failed = folder_stats["failed"]
+            batch_total = len(batch_uids)
+
             run.total_emails_ingested = (run.total_emails_ingested or 0) + folder_stats["ingested"]
             run.total_emails_learned = (run.total_emails_learned or 0) + folder_stats["learned"]
             run.total_emails_skipped = (run.total_emails_skipped or 0) + folder_stats["skipped"]
@@ -513,6 +531,20 @@ def _process_folder_streaming(
             folder_stats["learned"] = 0
             folder_stats["skipped"] = 0
             folder_stats["failed"] = 0
+
+            # Update consecutive-failure counter.
+            if batch_failed > 0 and batch_failed == batch_total:
+                consecutive_all_fail_batches += 1
+            else:
+                consecutive_all_fail_batches = 0
+
+            if consecutive_all_fail_batches >= _MAX_CONSECUTIVE_BATCH_FAILURES:
+                logger.warning(
+                    "import_folder_skipped_excessive_failures "
+                    "folder=%s consecutive_all_fail_batches=%s",
+                    folder_name, consecutive_all_fail_batches,
+                )
+                return folder_stats
 
             logger.debug(
                 "import_batch_done folder=%s batch_end_uid=%s",
