@@ -636,7 +636,7 @@ def _parse_email_for_import(
 
     When ``skip_attachment_binaries`` is True, the email is reconstructed
     from ``BODY[HEADER]`` + ``BODY[TEXT]`` without binary attachments.
-    Attachment metadata is extracted from BODYSTRUCTURE.
+    Attachment filenames are extracted best-effort from parsed MIME headers.
     """
     try:
         if skip_attachment_binaries:
@@ -693,8 +693,13 @@ def _parse_email_for_import(
         ]
 
         # Extract attachment metadata (best-effort from MIME headers only —
-        # no BODYSTRUCTURE parsing, which is fragile for complex messages)
-        attachment_metadata = _extract_attachment_metadata(msg)
+        # no BODYSTRUCTURE parsing, which is fragile for complex messages).
+        # If extraction fails entirely, proceed without attachment metadata.
+        try:
+            attachment_metadata = _extract_attachment_metadata(msg)
+        except Exception as e:
+            logger.warning("attachment_metadata_extraction_failed uid=%s error=%s", uid, str(e))
+            attachment_metadata = []
 
         # Integrity hash
         integrity_hash = hashlib.sha256(raw_email).hexdigest()
