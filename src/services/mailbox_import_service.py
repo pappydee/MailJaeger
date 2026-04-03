@@ -21,9 +21,12 @@ Resumability / crash safety:
 Attachment strategy:
   - By default, attachment **binaries** are NOT fetched.
   - The service uses ``BODY.PEEK[HEADER]`` + ``BODY.PEEK[TEXT]`` to
-    retrieve headers and body text only.  Attachment metadata (filename,
-    content-type, size, disposition) is extracted from MIME structure
-    headers without downloading the binary content.
+    retrieve headers and body text only.  Attachment filenames are
+    extracted best-effort from parsed MIME headers — **not** from IMAP
+    BODYSTRUCTURE, which is fragile for complex multipart messages.
+  - Attachment binaries are never analyzed or downloaded during import.
+  - If attachment filename extraction fails for a message, the email is
+    still ingested without attachment metadata.
   - ``skip_attachment_binaries`` (default True) controls this behavior.
     When False, the service falls back to ``BODY.PEEK[]`` which fetches
     the complete RFC 5322 message including all attachments.
@@ -67,8 +70,12 @@ _current_import_thread: Optional[threading.Thread] = None
 # Default batch size — small to keep memory bounded on large mailboxes
 DEFAULT_IMPORT_BATCH_SIZE = 20
 
-# IMAP fetch keys for metadata-only ingestion (no attachment binaries)
-_FETCH_HEADERS_AND_TEXT = [b"BODY.PEEK[HEADER]", b"BODY.PEEK[TEXT]", b"FLAGS", b"BODYSTRUCTURE"]
+# IMAP fetch keys for metadata-only ingestion (no attachment binaries).
+# NOTE: BODYSTRUCTURE is intentionally NOT requested — imapclient's parser
+# can choke on complex multipart MIME structures (e.g. "Tuple incomplete
+# before …").  Attachment *filenames* are extracted best-effort from the
+# parsed MIME headers instead, which is far more robust.
+_FETCH_HEADERS_AND_TEXT = [b"BODY.PEEK[HEADER]", b"BODY.PEEK[TEXT]", b"FLAGS"]
 # Full fetch (includes attachment binaries)
 _FETCH_FULL = [b"BODY.PEEK[]", b"FLAGS"]
 
@@ -305,7 +312,9 @@ def _run_import_thread(
                     "import_folder_failed run_id=%s folder=%s error=%s",
                     run_id, folder_name, str(e),
                 )
-                run.total_emails_failed = (run.total_emails_failed or 0) + 1
+                # Folder-level error — we don't know how many emails would
+                # have been affected, so don't inflate failed counter.
+                run.error_message = f"Folder {folder_name}: {str(e)}"
                 db.commit()
                 # Continue with next folder — don't fail the whole run
                 continue
@@ -412,15 +421,23 @@ def _process_folder_streaming(
                 break
 
             # Fetch batch from IMAP
+            fetch_fields = _FETCH_HEADERS_AND_TEXT if skip_attachment_binaries else _FETCH_FULL
             try:
-                if skip_attachment_binaries:
-                    fetch_data = imap.client.fetch(batch_uids, _FETCH_HEADERS_AND_TEXT)
-                else:
-                    fetch_data = imap.client.fetch(batch_uids, _FETCH_FULL)
+                fetch_data = imap.client.fetch(batch_uids, fetch_fields)
             except Exception as e:
-                logger.error("import_batch_fetch_failed folder=%s error=%s", folder_name, str(e))
-                folder_stats["failed"] += len(batch_uids)
-                continue
+                # Batch-level fetch failed (e.g. one message with malformed
+                # data can poison the whole IMAP response).  Fall back to
+                # fetching each UID individually so healthy messages in the
+                # batch are not lost.
+                logger.warning(
+                    "import_batch_fetch_failed folder=%s error=%s "
+                    "— falling back to per-email fetch",
+                    folder_name, str(e),
+                )
+                fetch_data = _fetch_uids_individually(
+                    imap, batch_uids, fetch_fields, folder_name,
+                    folder_stats,
+                )
 
             # Ingest + learn each email in the batch
             for uid, msg_data in fetch_data.items():
@@ -470,6 +487,42 @@ def _process_folder_streaming(
     db.commit()
 
     return folder_stats
+
+
+# ---------------------------------------------------------------------------
+# Per-UID fallback fetch
+# ---------------------------------------------------------------------------
+
+
+def _fetch_uids_individually(
+    imap: Any,
+    uids: list,
+    fetch_fields: list,
+    folder_name: str,
+    folder_stats: Dict[str, Any],
+) -> Dict:
+    """Fetch UIDs one at a time — used as fallback when a batch fetch fails.
+
+    Returns a dict of ``{uid: msg_data}`` for each UID that was successfully
+    fetched.  UIDs that still fail individually are counted in
+    ``folder_stats["failed"]``.
+    """
+    result: Dict = {}
+    for uid in uids:
+        try:
+            single = imap.client.fetch([uid], fetch_fields)
+            if uid in single:
+                result[uid] = single[uid]
+            else:
+                # Server returned no data for this UID — skip it
+                folder_stats["failed"] += 1
+        except Exception as e:
+            logger.warning(
+                "import_single_fetch_failed uid=%s folder=%s error=%s",
+                uid, folder_name, str(e),
+            )
+            folder_stats["failed"] += 1
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -602,12 +655,8 @@ def _parse_email_for_import(
                     raw_email = header_bytes + b"\r\n" + text_bytes
             else:
                 raw_email = text_bytes
-
-            # Also try to extract attachment metadata from BODYSTRUCTURE
-            bodystructure = msg_data.get(b"BODYSTRUCTURE")
         else:
             raw_email = msg_data.get(b"BODY[]") or msg_data.get(b"RFC822", b"")
-            bodystructure = None
 
         if not raw_email:
             return None
@@ -643,8 +692,9 @@ def _parse_email_for_import(
             for f in (msg_data.get(b"FLAGS") or [])
         ]
 
-        # Extract attachment metadata (from BODYSTRUCTURE or MIME parts)
-        attachment_metadata = _extract_attachment_metadata(msg, bodystructure)
+        # Extract attachment metadata (best-effort from MIME headers only —
+        # no BODYSTRUCTURE parsing, which is fragile for complex messages)
+        attachment_metadata = _extract_attachment_metadata(msg)
 
         # Integrity hash
         integrity_hash = hashlib.sha256(raw_email).hexdigest()
@@ -710,47 +760,58 @@ def _extract_body(msg) -> tuple:
     return body_plain, body_html
 
 
-def _extract_attachment_metadata(msg, bodystructure=None) -> List[Dict[str, Any]]:
-    """Extract attachment metadata without downloading binary content.
+def _extract_attachment_metadata(msg) -> List[Dict[str, Any]]:
+    """Extract attachment metadata from parsed MIME headers (best-effort).
 
     Returns a list of dicts with: filename, content_type, size, disposition.
+
+    This intentionally does **not** use IMAP BODYSTRUCTURE parsing, because
+    imapclient's parser can choke on complex multipart MIME structures.
+    Attachment filenames are extracted from MIME headers of the parsed
+    message, which is far more robust.  If extraction fails for any reason,
+    the function returns an empty list — the email is still ingested.
     """
     attachments = []
 
-    if msg.is_multipart():
-        for part in msg.walk():
-            content_disposition = str(part.get("Content-Disposition", ""))
-            content_type = part.get_content_type()
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_disposition = str(part.get("Content-Disposition", ""))
+                content_type = part.get_content_type()
 
-            # Skip text parts that are the main body
-            if content_type in ("text/plain", "text/html") and "attachment" not in content_disposition:
-                continue
+                # Skip text parts that are the main body
+                if content_type in ("text/plain", "text/html") and "attachment" not in content_disposition:
+                    continue
 
-            # Only include actual attachments
-            if "attachment" in content_disposition or (
-                content_type not in ("text/plain", "text/html", "multipart/mixed",
-                                     "multipart/alternative", "multipart/related")
-            ):
-                filename = part.get_filename()
-                if filename:
-                    filename = _decode_header(filename)
+                # Only include actual attachments
+                if "attachment" in content_disposition or (
+                    content_type not in ("text/plain", "text/html", "multipart/mixed",
+                                         "multipart/alternative", "multipart/related")
+                ):
+                    filename = part.get_filename()
+                    if filename:
+                        filename = _decode_header(filename)
 
-                # Estimate size from Content-Length or payload length
-                size = None
-                content_length = part.get("Content-Length")
-                if content_length:
-                    try:
-                        size = int(content_length)
-                    except (ValueError, TypeError):
-                        pass
+                    # Estimate size from Content-Length or payload length
+                    size = None
+                    content_length = part.get("Content-Length")
+                    if content_length:
+                        try:
+                            size = int(content_length)
+                        except (ValueError, TypeError):
+                            pass
 
-                if filename or content_type not in ("text/plain", "text/html"):
-                    attachments.append({
-                        "filename": filename or "(unnamed)",
-                        "content_type": content_type,
-                        "size": size,
-                        "disposition": content_disposition[:100] if content_disposition else None,
-                    })
+                    if filename or content_type not in ("text/plain", "text/html"):
+                        attachments.append({
+                            "filename": filename or "(unnamed)",
+                            "content_type": content_type,
+                            "size": size,
+                            "disposition": content_disposition[:100] if content_disposition else None,
+                        })
+    except Exception as e:
+        # Attachment metadata extraction is best-effort.
+        # If it fails, we still ingest the email — just without attachment info.
+        logger.warning("attachment_metadata_extraction_failed error=%s", str(e))
 
     return attachments
 

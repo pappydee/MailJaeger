@@ -612,13 +612,20 @@ class TestAttachmentBehavior:
         assert len(metadata) == 0
 
     def test_metadata_only_fetch_keys(self):
-        """When skip_attachment_binaries=True, fetch must use HEADER+TEXT, not full BODY[]."""
+        """When skip_attachment_binaries=True, fetch must use HEADER+TEXT, not full BODY[].
+
+        BODYSTRUCTURE is intentionally NOT included — imapclient's parser
+        chokes on complex multipart MIME (e.g. "Tuple incomplete before …").
+        Attachment filenames are extracted from parsed MIME headers instead.
+        """
         from src.services.mailbox_import_service import _FETCH_HEADERS_AND_TEXT, _FETCH_FULL
 
         header_keys = [k.decode() for k in _FETCH_HEADERS_AND_TEXT]
         assert "BODY.PEEK[HEADER]" in header_keys
         assert "BODY.PEEK[TEXT]" in header_keys
-        assert "BODYSTRUCTURE" in header_keys
+        assert "BODYSTRUCTURE" not in header_keys, (
+            "BODYSTRUCTURE must not be requested — fragile for complex MIME"
+        )
         assert "BODY.PEEK[]" not in header_keys
 
         full_keys = [k.decode() for k in _FETCH_FULL]
