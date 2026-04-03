@@ -60,6 +60,26 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Maximum characters allowed from an exception message in a log line.
+# IMAP exceptions can embed raw server responses (including mail content).
+_MAX_ERROR_LOG_LEN = 200
+
+
+def _sanitize_error(exc: Exception) -> str:
+    """Return a sanitized, truncated error string safe for log output.
+
+    Prevents raw IMAP response data (which can contain email headers,
+    body text, or attachment fragments) from appearing in production logs.
+    Only printable ASCII is kept; anything else is replaced with '?'.
+    The result is truncated to ``_MAX_ERROR_LOG_LEN`` characters.
+    """
+    raw = str(exc)
+    # Keep only printable ASCII (0x20–0x7E) to strip binary/MIME payload noise
+    safe = "".join(c if 0x20 <= ord(c) <= 0x7E else "?" for c in raw)
+    if len(safe) > _MAX_ERROR_LOG_LEN:
+        safe = safe[:_MAX_ERROR_LOG_LEN] + " [truncated]"
+    return safe
+
 # ---------------------------------------------------------------------------
 # Module-level concurrency primitives
 # ---------------------------------------------------------------------------
@@ -310,7 +330,7 @@ def _run_import_thread(
             except Exception as e:
                 logger.error(
                     "import_folder_failed run_id=%s folder=%s error=%s",
-                    run_id, folder_name, str(e),
+                    run_id, folder_name, _sanitize_error(e),
                 )
                 # Folder-level error — we don't know how many emails would
                 # have been affected, so don't inflate failed counter.
@@ -349,7 +369,7 @@ def _run_import_thread(
         )
 
     except Exception as e:
-        logger.error("import_thread_failed run_id=%s error=%s", run_id, str(e))
+        logger.error("import_thread_failed run_id=%s error=%s", run_id, _sanitize_error(e))
         try:
             run = db.query(MailboxImportRun).filter(MailboxImportRun.id == run_id).first()
             if run:
@@ -432,7 +452,7 @@ def _process_folder_streaming(
                 logger.warning(
                     "import_batch_fetch_failed folder=%s error=%s "
                     "— falling back to per-email fetch",
-                    folder_name, str(e),
+                    folder_name, _sanitize_error(e),
                 )
                 fetch_data = _fetch_uids_individually(
                     imap, batch_uids, fetch_fields, folder_name,
@@ -458,7 +478,7 @@ def _process_folder_streaming(
                 except Exception as e:
                     logger.warning(
                         "import_email_failed uid=%s folder=%s error=%s",
-                        uid, folder_name, str(e),
+                        uid, folder_name, _sanitize_error(e),
                     )
                     folder_stats["failed"] += 1
 
@@ -519,7 +539,7 @@ def _fetch_uids_individually(
         except Exception as e:
             logger.warning(
                 "import_single_fetch_failed uid=%s folder=%s error=%s",
-                uid, folder_name, str(e),
+                uid, folder_name, _sanitize_error(e),
             )
             folder_stats["failed"] += 1
     return result
@@ -602,7 +622,7 @@ def _ingest_and_learn_single(
             learn_from_email(db, email_record, source="mailbox-import")
             _update_sender_interaction(db, email_record)
     except Exception as e:
-        logger.warning("import_learn_failed email_id=%s error=%s", email_record.id, str(e))
+        logger.warning("import_learn_failed email_id=%s error=%s", email_record.id, _sanitize_error(e))
 
     db.commit()
     return "new"
@@ -698,7 +718,7 @@ def _parse_email_for_import(
         try:
             attachment_metadata = _extract_attachment_metadata(msg)
         except Exception as e:
-            logger.warning("attachment_metadata_extraction_failed uid=%s error=%s", uid, str(e))
+            logger.warning("attachment_metadata_extraction_failed uid=%s error=%s", uid, _sanitize_error(e))
             attachment_metadata = []
 
         # Integrity hash
@@ -721,7 +741,7 @@ def _parse_email_for_import(
         }
 
     except Exception as e:
-        logger.error("import_parse_failed uid=%s error=%s", uid, str(e))
+        logger.error("import_parse_failed uid=%s error=%s", uid, _sanitize_error(e))
         return None
 
 
@@ -816,7 +836,7 @@ def _extract_attachment_metadata(msg) -> List[Dict[str, Any]]:
     except Exception as e:
         # Attachment metadata extraction is best-effort.
         # If it fails, we still ingest the email — just without attachment info.
-        logger.warning("attachment_metadata_extraction_failed error=%s", str(e))
+        logger.warning("attachment_metadata_extraction_failed error=%s", _sanitize_error(e))
 
     return attachments
 

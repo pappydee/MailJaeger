@@ -1458,3 +1458,252 @@ class TestMultiFolderWithFallback:
         ).count() == 2
         # Total: 3 + 2 = 5 emails across two folders
         assert db.query(ProcessedEmail).count() == 5
+
+
+# ---------------------------------------------------------------------------
+# 13. Regression: sanitized error logging
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizedErrorLogging:
+    """Error logs must not contain raw email content (headers, body, MIME data).
+
+    imapclient exceptions can embed raw IMAP server responses which include
+    message content.  _sanitize_error() must strip/truncate that.
+    """
+
+    def test_sanitize_error_truncates_long_strings(self):
+        """_sanitize_error must truncate strings longer than _MAX_ERROR_LOG_LEN."""
+        from src.services.mailbox_import_service import _sanitize_error, _MAX_ERROR_LOG_LEN
+
+        long_exc = Exception("x" * (_MAX_ERROR_LOG_LEN + 500))
+        result = _sanitize_error(long_exc)
+        assert len(result) <= _MAX_ERROR_LOG_LEN + len(" [truncated]")
+        assert "[truncated]" in result
+
+    def test_sanitize_error_strips_non_ascii(self):
+        """_sanitize_error must replace non-ASCII characters."""
+        from src.services.mailbox_import_service import _sanitize_error
+
+        exc = Exception("error\x00\r\nbinary\xff\xfe data here")
+        result = _sanitize_error(exc)
+        assert "\x00" not in result
+        assert "\r" not in result
+        assert "\n" not in result
+        assert "\xff" not in result
+
+    def test_sanitize_error_keeps_printable_ascii(self):
+        """_sanitize_error must preserve printable ASCII content."""
+        from src.services.mailbox_import_service import _sanitize_error
+
+        exc = Exception("Tuple incomplete before end of data")
+        result = _sanitize_error(exc)
+        assert "Tuple incomplete before end of data" in result
+
+    def test_batch_fetch_failure_log_is_sanitized(self, db):
+        """import_batch_fetch_failed log must not contain raw message payloads."""
+        import logging
+        from src.services.mailbox_import_service import _process_folder_streaming
+
+        run = MailboxImportRun(
+            status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(run)
+        db.commit()
+
+        raw_payload = "Subject: Secret\r\nFrom: a@b.com\r\n\r\nSecret body content"
+        raw_payload_long = raw_payload * 20  # >200 chars
+
+        class PayloadLeakIMAPClient:
+            """Batch fetch raises an exception embedding raw email payload."""
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 2}
+
+            def search(self, criteria):
+                return [1, 2]
+
+            def fetch(self, uids, parts):
+                if len(uids) > 1:
+                    raise Exception(f"Parse error: {raw_payload_long}")
+                return _build_metadata_fetch_response(uids, "INBOX")
+
+            def list_folders(self):
+                return []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        log_records = []
+
+        class CaptureHandler(logging.Handler):
+            def emit(self, record):
+                log_records.append(record.getMessage())
+
+        handler = CaptureHandler()
+        import logging as _logging
+        svc_logger = _logging.getLogger("src.services.mailbox_import_service")
+        svc_logger.addHandler(handler)
+        try:
+            mock_imap = PayloadLeakIMAPClient()
+            with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+                MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+                with patch("src.services.mailbox_import_service.learn_from_email"):
+                    with patch("src.services.mailbox_import_service._update_sender_interaction"):
+                        _process_folder_streaming(
+                            db=db, run=run, folder_name="INBOX",
+                            batch_size=5, skip_attachment_binaries=True,
+                        )
+        finally:
+            svc_logger.removeHandler(handler)
+
+        # Verify the batch-failure log line was emitted
+        batch_fail_logs = [r for r in log_records if "import_batch_fetch_failed" in r]
+        assert len(batch_fail_logs) >= 1, "Expected import_batch_fetch_failed log"
+
+        # Verify each log line is bounded (not an unbounded IMAP response dump)
+        for record in log_records:
+            # The sanitizer must limit each log argument to _MAX_ERROR_LOG_LEN
+            # chars — so no log line should be excessively long
+            assert len(record) <= 2000, f"Log line too long: {len(record)} chars"
+
+        # Verify the error field in the batch-fail log is truncated, not raw dump
+        for record in batch_fail_logs:
+            from src.services.mailbox_import_service import _MAX_ERROR_LOG_LEN
+            # The error portion after "error=" should be at most
+            # _MAX_ERROR_LOG_LEN + len(" [truncated]") + some prefix chars
+            assert len(record) < _MAX_ERROR_LOG_LEN * 3, (
+                f"Batch fail log line suspiciously long ({len(record)} chars), "
+                "suggesting unsanitized error embedded in log"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 14. Regression: forward progress — checkpoint always advances
+# ---------------------------------------------------------------------------
+
+
+class TestForwardProgress:
+    """Verify the importer always makes forward progress and never loops
+    on the same failing batch."""
+
+    def test_checkpoint_advances_even_when_all_uids_fail(self, db):
+        """If every UID in a batch fails (batch + individual), the checkpoint
+        must still advance past those UIDs so they are never retried."""
+        from src.services.mailbox_import_service import _process_folder_streaming
+
+        run = MailboxImportRun(
+            status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+            current_folder_uid_checkpoint=None,
+        )
+        db.add(run)
+        db.commit()
+
+        class AllFailIMAPClient:
+            """Both batch and individual fetches always fail."""
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 3}
+
+            def search(self, criteria):
+                return [10, 11, 12]
+
+            def fetch(self, uids, parts):
+                raise Exception("IMAP connection dead")
+
+            def list_folders(self):
+                return []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = AllFailIMAPClient()
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            _process_folder_streaming(
+                db=db, run=run, folder_name="INBOX",
+                batch_size=5, skip_attachment_binaries=True,
+            )
+
+        db.refresh(run)
+        # current_folder_uid_checkpoint is reset to None after the folder
+        # completes (by design, so the next folder starts fresh).
+        # What matters is that all 3 unreachable UIDs were counted as failed,
+        # confirming the loop DID iterate all UIDs instead of stopping early.
+        assert (run.total_emails_failed or 0) == 3
+        # Function must complete without raising (no endless retry / crash)
+        assert db.query(ProcessedEmail).count() == 0  # nothing ingested (all failed)
+
+    def test_second_batch_processes_after_first_batch_fails(self, db):
+        """After a batch fails, the importer must continue to the next batch."""
+        from src.services.mailbox_import_service import _process_folder_streaming
+
+        run = MailboxImportRun(
+            status="running", batch_size=2,
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(run)
+        db.commit()
+
+        call_sequence = []
+
+        class TwoPhaseIMAPClient:
+            """First batch (UIDs 1,2) fails; second batch (UIDs 3,4) succeeds."""
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 4}
+
+            def search(self, criteria):
+                return [1, 2, 3, 4]
+
+            def fetch(self, uids, parts):
+                call_sequence.append(list(uids))
+                if uids == [1, 2] or (len(uids) == 1 and uids[0] in (1, 2)):
+                    raise Exception("Malformed message in first batch")
+                return _build_metadata_fetch_response(uids, "INBOX")
+
+            def list_folders(self):
+                return []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = TwoPhaseIMAPClient()
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            with patch("src.services.mailbox_import_service.learn_from_email"):
+                with patch("src.services.mailbox_import_service._update_sender_interaction"):
+                    _process_folder_streaming(
+                        db=db, run=run, folder_name="INBOX",
+                        batch_size=2, skip_attachment_binaries=True,
+                    )
+
+        # Second batch emails (3 and 4) must be ingested
+        assert db.query(ProcessedEmail).filter(
+            ProcessedEmail.folder == "INBOX"
+        ).count() == 2
+        # Fetches were attempted for both batches
+        assert len(call_sequence) >= 2
