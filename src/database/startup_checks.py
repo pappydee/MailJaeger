@@ -40,6 +40,9 @@ _PROCESSED_EMAILS_REQUIRED_COLUMNS = {
 _SENDER_PROFILES_REQUIRED_COLUMNS = {
     "spam_probability": "FLOAT DEFAULT 0.0",
     "interaction_count": "INTEGER DEFAULT 0",
+    "preferred_category": "VARCHAR(50)",
+    "preferred_folder": "VARCHAR(200)",
+    "user_classification_count": "INTEGER DEFAULT 0",
 }
 
 _DECISION_EVENTS_REQUIRED_COLUMNS = {

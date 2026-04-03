@@ -687,9 +687,6 @@ class TestLegacySQLiteUpgradeLearning:
                         archived_count INTEGER,
                         deleted_count INTEGER,
                         kept_in_inbox_count INTEGER,
-                        preferred_category VARCHAR(50),
-                        preferred_folder VARCHAR(200),
-                        user_classification_count INTEGER,
                         first_seen DATETIME,
                         last_seen DATETIME,
                         updated_at DATETIME
@@ -702,6 +699,9 @@ class TestLegacySQLiteUpgradeLearning:
         repaired_columns = {col["name"] for col in inspect(engine).get_columns("sender_profiles")}
         assert "spam_probability" in repaired_columns
         assert "interaction_count" in repaired_columns
+        assert "preferred_category" in repaired_columns
+        assert "preferred_folder" in repaired_columns
+        assert "user_classification_count" in repaired_columns
 
         SessionLocal = sessionmaker(bind=engine)
         db = SessionLocal()

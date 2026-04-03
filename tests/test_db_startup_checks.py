@@ -256,9 +256,6 @@ def _create_legacy_sender_profiles_database(db_file: Path):
                     archived_count INTEGER,
                     deleted_count INTEGER,
                     kept_in_inbox_count INTEGER,
-                    preferred_category VARCHAR(50),
-                    preferred_folder VARCHAR(200),
-                    user_classification_count INTEGER,
                     first_seen DATETIME,
                     last_seen DATETIME,
                     updated_at DATETIME
@@ -446,6 +443,9 @@ class TestActionQueueSchemaRepair:
         columns = {column["name"] for column in inspector.get_columns("sender_profiles")}
         assert "spam_probability" in columns
         assert "interaction_count" in columns
+        assert "preferred_category" in columns
+        assert "preferred_folder" in columns
+        assert "user_classification_count" in columns
 
     def test_init_db_repairs_missing_decision_event_columns(self, tmp_path):
         from src.database.startup_checks import ensure_historical_learning_schema_compatibility
