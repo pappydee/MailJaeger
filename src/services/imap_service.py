@@ -409,11 +409,7 @@ class IMAPService:
                     "message": "Failed to connect to IMAP server",
                 }
         except Exception as e:
-            error_type = type(e).__name__
-            if self.settings.debug:
-                error_msg = str(e)
-            else:
-                error_msg = error_type
+            error_msg = sanitize_error(e, debug=self.settings.debug)
             return {
                 "status": "unhealthy",
                 "connected": False,

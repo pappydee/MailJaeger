@@ -5,18 +5,28 @@ Error handling utilities for MailJaeger
 import re
 from typing import Optional
 
+# Maximum characters in a sanitized error message.  IMAP exceptions frequently
+# embed the raw server response (which includes email headers, body text, MIME
+# boundaries, and HTML — all printable ASCII).  Allowing the full ``str(e)``
+# through, even with credential redaction, leaks email content into logs and
+# API responses.  A hard cap prevents that.
+_MAX_SANITIZED_LEN = 200
+
 
 def sanitize_error(e: Exception, debug: bool = False) -> str:
     """
-    Sanitize error messages to prevent credential leakage.
+    Sanitize error messages to prevent credential and content leakage.
 
-    In production (debug=False), only returns the exception type name.
-    In debug mode, returns the error message with secrets redacted.
+    Output format: ``ExceptionType: first-line-of-message``
 
-    Secrets are ALWAYS redacted, even in debug mode:
-    - IMAP passwords and usernames
-    - API keys
-    - Common credential patterns (password=, passwd=, Authorization: Bearer)
+    In all modes the output is capped to ``_MAX_SANITIZED_LEN`` characters.
+    In production (debug=False) only the exception type name is returned.
+    In debug mode the first line of the message is appended (still capped)
+    with secrets redacted.
+
+    IMAP exceptions can embed raw server responses containing full email
+    headers and body text.  The hard length cap ensures that even in debug
+    mode no significant email content leaks into logs.
 
     Args:
         e: The exception to sanitize
@@ -25,14 +35,19 @@ def sanitize_error(e: Exception, debug: bool = False) -> str:
     Returns:
         Sanitized error message safe for storage/API responses
     """
-    if debug:
-        # In debug mode, return message but redact secrets
-        error_msg = str(e)
-        return _redact_secrets(error_msg)
-    else:
+    error_type = type(e).__name__ or "UnknownError"
+
+    if not debug:
         # In production, return only the exception type, no details
-        error_type = type(e).__name__
-        return error_type if error_type else "UnknownError"
+        return error_type
+
+    # In debug mode, include the first line of the message (secrets redacted)
+    first_line = str(e).split("\n")[0].split("\r")[0]
+    first_line = _redact_secrets(first_line)
+    summary = f"{error_type}: {first_line}"
+    if len(summary) > _MAX_SANITIZED_LEN:
+        summary = summary[:_MAX_SANITIZED_LEN] + " [truncated]"
+    return summary
 
 
 def _redact_secrets(text: str) -> str:

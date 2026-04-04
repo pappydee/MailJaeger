@@ -347,8 +347,9 @@ def _run_import_thread(
                     "import_folder_failed run_id=%s folder=%s error=%s",
                     run_id, folder_name, _sanitize_error(e),
                 )
-                # Folder-level error — we don't know how many emails would
-                # have been affected, so don't inflate failed counter.
+                # Increment failed counter so status is never silently all-zero
+                # when folders error out before the UID loop is reached.
+                run.total_emails_failed = (run.total_emails_failed or 0) + 1
                 run.error_message = _sanitize_error(e)
                 db.commit()
                 # Continue with next folder — don't fail the whole run

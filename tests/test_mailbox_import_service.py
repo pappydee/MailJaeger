@@ -1925,3 +1925,518 @@ class TestConsecutiveBatchFailureFairsafe:
                 f"Raw content in error_message: {finished_run.error_message!r}"
             )
         final_session.close()
+
+
+# ---------------------------------------------------------------------------
+# Import stall prevention & log leak fixes
+# ---------------------------------------------------------------------------
+
+
+class TestImportStallPrevention:
+    """Verify that the importer always advances and never stalls at 0 progress."""
+
+    def test_folder_level_error_increments_failed_counter(self, db):
+        """When _process_folder_streaming raises (e.g., select_folder fails),
+        the run's total_emails_failed MUST increase so status is never silently
+        all-zero when folders error out."""
+        from src.services.mailbox_import_service import _run_import_thread
+
+        run = MailboxImportRun(
+            status="pending", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+        class SelectFailIMAPClient:
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                raise RuntimeError("Mailbox unavailable")
+
+            def search(self, criteria):
+                return [1, 2]
+
+            def fetch(self, uids, parts):
+                return _build_metadata_fetch_response(uids, "Coburg")
+
+            def list_folders(self):
+                return [("", "/", "Coburg"), ("", "/", "Berlin")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = SelectFailIMAPClient()
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        from src.models.database import Base
+        Base.metadata.create_all(engine)
+        TestSession = sessionmaker(bind=engine)
+
+        thread_db = TestSession()
+        seed_run = MailboxImportRun(
+            id=run_id, status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+            folders_discovered=["Coburg", "Berlin"],
+            folders_completed=[],
+            total_folders_discovered=2,
+        )
+        thread_db.add(seed_run)
+        thread_db.commit()
+        thread_db.close()
+
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            with patch("src.services.mailbox_import_service.is_learnable_folder",
+                       return_value=True):
+                _run_import_thread(TestSession, run_id, 5, True)
+
+        final_session = TestSession()
+        finished_run = final_session.query(MailboxImportRun).filter(
+            MailboxImportRun.id == run_id
+        ).first()
+
+        assert finished_run is not None
+        # Both folders failed at select_folder, so failed counter must be >= 2
+        assert (finished_run.total_emails_failed or 0) >= 2, (
+            f"Expected failed >= 2 but got {finished_run.total_emails_failed}"
+        )
+        # Status should be completed (not stuck running forever)
+        assert finished_run.status == "completed", (
+            f"Expected 'completed' but got {finished_run.status!r}"
+        )
+        final_session.close()
+
+    def test_zero_progress_impossible_with_repeated_failures(self, db):
+        """If every UID in every batch fails, the failed counter MUST reflect
+        the actual number of failed messages — never stay at 0."""
+        from src.services.mailbox_import_service import _run_import_thread
+
+        run = MailboxImportRun(
+            status="pending", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+        class AllFetchFailIMAPClient:
+            """Every fetch raises, simulating corrupt server responses."""
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 10}
+
+            def search(self, criteria):
+                return list(range(1, 11))
+
+            def fetch(self, uids, parts):
+                raise Exception("Bad IMAP response\r\nBODY[HEADER] raw data")
+
+            def list_folders(self):
+                return [("", "/", "INBOX")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = AllFetchFailIMAPClient()
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        from src.models.database import Base
+        Base.metadata.create_all(engine)
+        TestSession = sessionmaker(bind=engine)
+
+        thread_db = TestSession()
+        seed_run = MailboxImportRun(
+            id=run_id, status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+            folders_discovered=["INBOX"],
+            folders_completed=[],
+            total_folders_discovered=1,
+        )
+        thread_db.add(seed_run)
+        thread_db.commit()
+        thread_db.close()
+
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            with patch("src.services.mailbox_import_service.is_learnable_folder",
+                       return_value=True):
+                _run_import_thread(TestSession, run_id, 5, True)
+
+        final_session = TestSession()
+        finished_run = final_session.query(MailboxImportRun).filter(
+            MailboxImportRun.id == run_id
+        ).first()
+
+        assert finished_run is not None
+        # All 10 UIDs failed — counter must be > 0
+        assert (finished_run.total_emails_failed or 0) >= 10, (
+            f"Expected failed >= 10 but got {finished_run.total_emails_failed}"
+        )
+        # Should not remain running
+        assert finished_run.status in ("completed", "failed"), (
+            f"Expected terminal status but got {finished_run.status!r}"
+        )
+        final_session.close()
+
+    def test_import_completes_after_all_folders_error(self, db):
+        """Even if every folder errors at the connection/select level, the
+        import run must reach a terminal status — never hang as 'running'."""
+        from src.services.mailbox_import_service import _run_import_thread
+
+        run = MailboxImportRun(
+            status="pending", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+        class ConnectionFailIMAPClient:
+            client = None
+
+            def select_folder(self, folder, readonly=False):
+                raise ConnectionError("Connection reset by peer")
+
+            def search(self, criteria):
+                return []
+
+            def fetch(self, uids, parts):
+                return {}
+
+            def list_folders(self):
+                return [("", "/", "A"), ("", "/", "B"), ("", "/", "C")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = ConnectionFailIMAPClient()
+        mock_imap.client = mock_imap  # Set client to non-None so connect check passes
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        from src.models.database import Base
+        Base.metadata.create_all(engine)
+        TestSession = sessionmaker(bind=engine)
+
+        thread_db = TestSession()
+        seed_run = MailboxImportRun(
+            id=run_id, status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+            folders_discovered=["A", "B", "C"],
+            folders_completed=[],
+            total_folders_discovered=3,
+        )
+        thread_db.add(seed_run)
+        thread_db.commit()
+        thread_db.close()
+
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            with patch("src.services.mailbox_import_service.is_learnable_folder",
+                       return_value=True):
+                _run_import_thread(TestSession, run_id, 5, True)
+
+        final_session = TestSession()
+        finished_run = final_session.query(MailboxImportRun).filter(
+            MailboxImportRun.id == run_id
+        ).first()
+
+        assert finished_run is not None
+        # Must reach terminal status
+        assert finished_run.status == "completed", (
+            f"Expected 'completed' but got {finished_run.status!r}"
+        )
+        # Failed counter must be non-zero (3 folders failed)
+        assert (finished_run.total_emails_failed or 0) >= 3
+        final_session.close()
+
+
+class TestLogLeakPrevention:
+    """Verify that no raw IMAP/email payload leaks into logs."""
+
+    def test_sanitize_error_caps_length_in_debug_mode(self):
+        """sanitize_error must cap output length even in debug mode."""
+        from src.utils.error_handling import sanitize_error
+
+        # Simulate an IMAP exception with a huge raw payload
+        raw_payload = "Subject: Secret\r\n" + "X" * 5000
+        exc = Exception(raw_payload)
+
+        result = sanitize_error(exc, debug=True)
+        # Must be capped — well under the raw length
+        assert len(result) <= 250, f"sanitize_error output too long: {len(result)}"
+        # Must NOT contain the full raw payload
+        assert "X" * 200 not in result
+
+    def test_sanitize_error_no_multiline_in_debug_mode(self):
+        """sanitize_error must only include the first line even in debug mode."""
+        from src.utils.error_handling import sanitize_error
+
+        # IMAP exceptions often embed multi-line server responses
+        multi_line = "Error on line 1\r\nBODY[HEADER] raw content\r\nMore raw"
+        exc = Exception(multi_line)
+
+        result = sanitize_error(exc, debug=True)
+        assert "BODY[HEADER]" not in result, (
+            f"Raw IMAP content leaked: {result!r}"
+        )
+        assert "More raw" not in result
+
+    def test_sanitize_error_production_mode_type_only(self):
+        """In non-debug mode, sanitize_error returns only the type name."""
+        from src.utils.error_handling import sanitize_error
+
+        exc = RuntimeError("Content-Type: text/html; boundary=something\r\n<html>...")
+        result = sanitize_error(exc, debug=False)
+        assert result == "RuntimeError"
+        assert "html" not in result.lower()
+
+    def test_import_sanitize_error_strips_imap_payload(self):
+        """The import service's _sanitize_error must strip raw IMAP content."""
+        from src.services.mailbox_import_service import _sanitize_error
+
+        exc = Exception(
+            "IMAP error: b'* 1 FETCH (BODY[HEADER] {1234}\\r\\n"
+            "Subject: Private\\r\\nFrom: secret@example.com\\r\\n\\r\\n"
+            "This is private body text"
+        )
+        result = _sanitize_error(exc)
+        assert len(result) <= 150  # 120 + [truncated] suffix
+        assert "private body" not in result.lower()
+
+    def test_per_uid_fetch_error_uses_sanitized_log(self, db):
+        """When a single UID fetch fails, the log message must use
+        _sanitize_error — no raw IMAP payload in log output."""
+        import logging
+        from src.services.mailbox_import_service import _process_folder_streaming
+
+        run = MailboxImportRun(
+            status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+            current_folder="TestFolder",
+        )
+        db.add(run)
+        db.commit()
+
+        class FetchFailIMAPClient:
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 2}
+
+            def search(self, criteria):
+                return [1, 2]
+
+            def fetch(self, uids, parts):
+                # Simulate IMAP error with raw payload in exception
+                raise Exception(
+                    "FETCH failed\r\nSubject: Secret Document\r\n"
+                    "From: ceo@company.com\r\n\r\n"
+                    "Confidential body text here"
+                )
+
+            def list_folders(self):
+                return [("", "/", "TestFolder")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = FetchFailIMAPClient()
+
+        log_records = []
+        handler = logging.Handler()
+        handler.emit = lambda record: log_records.append(record)
+        import src.services.mailbox_import_service as svc
+        svc.logger.addHandler(handler)
+
+        try:
+            with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+                MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+                result = _process_folder_streaming(db, run, "TestFolder", 5, True)
+        finally:
+            svc.logger.removeHandler(handler)
+
+        # Check all log records for raw content leak
+        for record in log_records:
+            msg = record.getMessage()
+            assert "Confidential body" not in msg, (
+                f"Raw payload leaked in log: {msg!r}"
+            )
+            assert "Secret Document" not in msg, (
+                f"Email subject leaked in log: {msg!r}"
+            )
+            assert "ceo@company.com" not in msg, (
+                f"Email sender leaked in log: {msg!r}"
+            )
+
+        # Failed counter must show the 2 failed UIDs
+        assert result["failed"] == 0  # reset after batch commit
+        assert (run.total_emails_failed or 0) >= 2
+
+    def test_malformed_imap_response_no_stall(self, db):
+        """Emails with malformed/missing BODY[HEADER] must fail gracefully
+        without stalling the importer."""
+        from src.services.mailbox_import_service import _process_folder_streaming
+
+        run = MailboxImportRun(
+            status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+            current_folder="TestFolder",
+        )
+        db.add(run)
+        db.commit()
+
+        class MalformedResponseIMAPClient:
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 3}
+
+            def search(self, criteria):
+                return [1, 2, 3]
+
+            def fetch(self, uids, parts):
+                # Return response with missing/empty BODY[HEADER] and BODY[TEXT]
+                uid = uids[0]
+                return {uid: {
+                    b"BODY[HEADER]": b"",
+                    b"BODY[TEXT]": b"",
+                    b"FLAGS": [b"\\Seen"],
+                }}
+
+            def list_folders(self):
+                return [("", "/", "TestFolder")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = MalformedResponseIMAPClient()
+
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            result = _process_folder_streaming(db, run, "TestFolder", 5, True)
+
+        # All 3 UIDs should have failed (empty response → parse returns None)
+        assert (run.total_emails_failed or 0) >= 3, (
+            f"Expected >= 3 failed but got {run.total_emails_failed}"
+        )
+        # Checkpoint must have advanced past all UIDs
+        assert run.current_folder_uid_checkpoint is None or run.current_folder_uid_checkpoint >= 3
+
+    def test_corrupted_mime_continues_import(self, db):
+        """Emails with corrupted MIME content must fail individually without
+        blocking subsequent emails."""
+        from src.services.mailbox_import_service import _process_folder_streaming
+
+        run = MailboxImportRun(
+            status="running", batch_size=10,
+            started_at=datetime.now(timezone.utc),
+            current_folder="TestFolder",
+        )
+        db.add(run)
+        db.commit()
+
+        good_email_raw = _build_raw_email(2, subject="Good email")
+        good_header, good_text = _split_raw_email(good_email_raw)
+
+        class MixedResponseIMAPClient:
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 3}
+
+            def search(self, criteria):
+                return [1, 2, 3]
+
+            def fetch(self, uids, parts):
+                uid = uids[0]
+                if uid == 1 or uid == 3:
+                    # Corrupted: completely empty response → parse returns None
+                    return {uid: {
+                        b"BODY[HEADER]": b"",
+                        b"BODY[TEXT]": b"",
+                        b"FLAGS": [b"\\Seen"],
+                    }}
+                else:
+                    # Good email for UID 2
+                    return {uid: {
+                        b"BODY[HEADER]": good_header,
+                        b"BODY[TEXT]": good_text,
+                        b"FLAGS": [b"\\Seen"],
+                    }}
+
+            def list_folders(self):
+                return [("", "/", "TestFolder")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = MixedResponseIMAPClient()
+
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            with patch("src.services.mailbox_import_service.learn_from_email"):
+                with patch("src.services.mailbox_import_service._update_sender_interaction"):
+                    result = _process_folder_streaming(db, run, "TestFolder", 10, True)
+
+        # UID 2 should have succeeded, UIDs 1 and 3 should have failed
+        total_ingested = run.total_emails_ingested or 0
+        total_failed = run.total_emails_failed or 0
+        assert total_ingested >= 1, f"Expected >= 1 ingested but got {total_ingested}"
+        assert total_failed >= 2, f"Expected >= 2 failed but got {total_failed}"
