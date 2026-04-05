@@ -221,21 +221,18 @@ class TestDateFiltering:
             assert email_date >= cutoff, f"Email {email.id} date {email_date} is before cutoff {cutoff}"
 
     def test_email_exactly_at_boundary(self, db, db_factory):
-        """Email exactly at 365-day boundary should be included."""
+        """Emails well within 365 days should be included; those well outside excluded."""
         from src.services.historical_analysis_service import _count_eligible_emails
 
-        # Exactly 365 days ago (should be included because >= cutoff)
-        boundary_date = datetime.now(timezone.utc) - timedelta(days=365)
-        _make_email(db, 1, date=boundary_date)
+        # 360 days ago (safely inside window)
+        _make_email(db, 1, date=datetime.now(timezone.utc) - timedelta(days=360))
 
-        # 366 days ago (should be excluded)
-        _make_email(db, 2, date=datetime.now(timezone.utc) - timedelta(days=366))
+        # 370 days ago (safely outside window)
+        _make_email(db, 2, date=datetime.now(timezone.utc) - timedelta(days=370))
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=365)
         count = _count_eligible_emails(db, cutoff)
-        # The boundary email might be included depending on exact timing
-        assert count <= 2  # Either 1 or 2 (depending on sub-second timing)
-        assert count >= 0
+        assert count == 1, "Only the 360-day-old email should be eligible"
 
     def test_custom_max_age_days(self, db, db_factory):
         """Custom max_age_days should be respected."""
@@ -280,8 +277,10 @@ class TestDateFiltering:
 
         # Verify only recent emails were processed
         db.expire_all()
-        assert recent1.analysis_state == "completed" or db.query(ProcessedEmail).get(recent1.id).analysis_state == "completed"
-        assert recent2.analysis_state == "completed" or db.query(ProcessedEmail).get(recent2.id).analysis_state == "completed"
+        recent1_refreshed = db.query(ProcessedEmail).get(recent1.id)
+        recent2_refreshed = db.query(ProcessedEmail).get(recent2.id)
+        assert recent1_refreshed.analysis_state == "completed"
+        assert recent2_refreshed.analysis_state == "completed"
 
         old1_refreshed = db.query(ProcessedEmail).get(old1.id)
         old2_refreshed = db.query(ProcessedEmail).get(old2.id)
