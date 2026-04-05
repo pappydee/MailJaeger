@@ -67,8 +67,8 @@ def _strip_imap_payload(text: str) -> str:
             text = text[:idx]
     # Remove byte-literal fragments like b'...' or b"..."
     text = re.sub(r"b['\"].*?['\"]", "[data]", text)
-    # Remove long hex/base64 sequences
-    text = re.sub(r"[A-Za-z0-9+/=]{40,}", "[data]", text)
+    # Remove long mixed-case hex/base64 sequences (must contain both upper+lower or digits)
+    text = re.sub(r"(?=[A-Za-z0-9+/=]{40,})(?=.*[A-Z])(?=.*[a-z0-9+/=])[A-Za-z0-9+/=]{40,}", "[data]", text)
     return text.strip()
 
 
