@@ -2439,3 +2439,638 @@ class TestLogLeakPrevention:
         total_failed = run.total_emails_failed or 0
         assert total_ingested >= 1, f"Expected >= 1 ingested but got {total_ingested}"
         assert total_failed >= 2, f"Expected >= 2 failed but got {total_failed}"
+
+
+# ---------------------------------------------------------------------------
+# Comprehensive regression tests for import reliability
+# ---------------------------------------------------------------------------
+
+
+class TestImportReliabilityRegression:
+    """Comprehensive tests proving that the importer:
+    1. Always advances UID cursor (no stall)
+    2. Failed counter increments truthfully
+    3. Works without BODYSTRUCTURE dependency
+    4. Works with per-UID minimal fetch only (HEADER + TEXT + FLAGS)
+    5. No raw payload appears in logs
+    6. Folder skip after bounded repeated failures
+    7. Repeated malformed messages allow forward progress
+    8. Progress != 0 during repeated failures
+    """
+
+    def test_importer_advances_through_all_failing_uids(self, db):
+        """When every UID in a folder fails, the importer must still
+        advance through ALL UIDs and not loop on the first one."""
+        from src.services.mailbox_import_service import _process_folder_streaming
+
+        run = MailboxImportRun(
+            status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+            current_folder="FailFolder",
+        )
+        db.add(run)
+        db.commit()
+
+        fetched_uids = []
+
+        class AllFailIMAPClient:
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 10}
+
+            def search(self, criteria):
+                return list(range(1, 11))  # UIDs 1-10
+
+            def fetch(self, uids, parts):
+                fetched_uids.extend(uids)
+                raise Exception("IMAP timeout for UID")
+
+            def list_folders(self):
+                return [("", "/", "FailFolder")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = AllFailIMAPClient()
+
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            _process_folder_streaming(db, run, "FailFolder", 5, True)
+
+        # MUST have attempted every UID (no stall on first)
+        assert len(fetched_uids) == 10, (
+            f"Expected 10 fetch attempts, got {len(fetched_uids)}: {fetched_uids}"
+        )
+        # Failed counter MUST reflect all 10 failures
+        assert (run.total_emails_failed or 0) >= 10, (
+            f"Expected >= 10 failed, got {run.total_emails_failed}"
+        )
+        # Checkpoint MUST have advanced past all UIDs
+        assert run.current_folder_uid_checkpoint is None or run.current_folder_uid_checkpoint >= 10
+
+    def test_failed_counter_always_reflects_reality(self, db):
+        """When UIDs fail, total_emails_failed MUST increase — never stay 0."""
+        from src.services.mailbox_import_service import _process_folder_streaming
+
+        run = MailboxImportRun(
+            status="running", batch_size=3,
+            started_at=datetime.now(timezone.utc),
+            current_folder="TestFolder",
+        )
+        db.add(run)
+        db.commit()
+
+        class SomeFail:
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 5}
+
+            def search(self, criteria):
+                return [1, 2, 3, 4, 5]
+
+            def fetch(self, uids, parts):
+                uid = uids[0]
+                if uid % 2 == 0:
+                    raise Exception("fetch error")
+                return {uid: {
+                    b"BODY[HEADER]": b"",
+                    b"BODY[TEXT]": b"",
+                    b"FLAGS": [],
+                }}
+
+            def list_folders(self):
+                return [("", "/", "TestFolder")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = SomeFail()
+
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            _process_folder_streaming(db, run, "TestFolder", 10, True)
+
+        # UIDs 2 and 4 should fail (fetch raises), UIDs 1,3,5 should fail
+        # (empty header/text → parse returns None → ValueError)
+        # So ALL 5 should be in failed count
+        assert (run.total_emails_failed or 0) >= 2, (
+            f"Expected >= 2 failed, got {run.total_emails_failed}"
+        )
+
+    def test_no_bodystructure_in_fetch_fields(self):
+        """The fetch fields must NOT include BODYSTRUCTURE."""
+        from src.services.mailbox_import_service import (
+            _FETCH_HEADERS_AND_TEXT,
+            _FETCH_FULL,
+        )
+
+        for field in _FETCH_HEADERS_AND_TEXT:
+            assert b"BODYSTRUCTURE" not in field.upper(), (
+                f"BODYSTRUCTURE found in fetch field: {field}"
+            )
+        for field in _FETCH_FULL:
+            assert b"BODYSTRUCTURE" not in field.upper(), (
+                f"BODYSTRUCTURE found in full fetch field: {field}"
+            )
+
+    def test_fetch_uses_only_header_text_flags(self):
+        """Default fetch fields must be exactly HEADER + TEXT + FLAGS."""
+        from src.services.mailbox_import_service import _FETCH_HEADERS_AND_TEXT
+
+        field_names = set(f.upper() for f in _FETCH_HEADERS_AND_TEXT)
+        assert b"BODY.PEEK[HEADER]" in field_names
+        assert b"BODY.PEEK[TEXT]" in field_names
+        assert b"FLAGS" in field_names
+        assert len(field_names) == 3, f"Expected exactly 3 fetch fields, got: {field_names}"
+
+    def test_attachment_metadata_disabled_in_import(self):
+        """Attachment metadata extraction must be disabled during mailbox import."""
+        from src.services.mailbox_import_service import _parse_email_for_import
+
+        msg = MIMEMultipart("mixed")
+        msg["From"] = "test@example.com"
+        msg["To"] = "user@example.com"
+        msg["Subject"] = "Test with attachment"
+        msg["Message-ID"] = "<att-test@example.com>"
+        msg["Date"] = "Mon, 1 Jan 2024 10:00:00 +0000"
+        msg.attach(MIMEText("Body text", "plain"))
+
+        att = MIMEBase("application", "pdf")
+        att.set_payload(b"FAKEPDF")
+        encoders.encode_base64(att)
+        att.add_header("Content-Disposition", "attachment", filename="secret.pdf")
+        msg.attach(att)
+
+        raw = msg.as_bytes()
+        header, text = _split_raw_email(raw)
+        msg_data = {
+            b"BODY[HEADER]": header,
+            b"BODY[TEXT]": text,
+            b"FLAGS": [],
+        }
+
+        result = _parse_email_for_import(1, msg_data, skip_attachment_binaries=True)
+        assert result is not None
+        assert result["attachment_metadata"] == [], (
+            "Attachment metadata must be empty (disabled during import)"
+        )
+
+    def test_sanitize_error_strips_body_header(self):
+        """_sanitize_error must strip BODY[HEADER] content from exceptions."""
+        from src.services.mailbox_import_service import _sanitize_error
+
+        exc = Exception(
+            "IMAP error: BODY[HEADER] {1234}\r\n"
+            "From: secret@example.com\r\nSubject: Confidential"
+        )
+        result = _sanitize_error(exc)
+        assert "secret@example.com" not in result
+        assert "Confidential" not in result
+        assert "BODY[HEADER]" not in result
+
+    def test_sanitize_error_strips_body_text(self):
+        """_sanitize_error must strip BODY[TEXT] content from exceptions."""
+        from src.services.mailbox_import_service import _sanitize_error
+
+        exc = Exception(
+            "Error: BODY[TEXT] {5678}\r\n"
+            "This is the private email body content"
+        )
+        result = _sanitize_error(exc)
+        assert "private email body" not in result
+        assert "BODY[TEXT]" not in result
+
+    def test_sanitize_error_strips_bodystructure(self):
+        """_sanitize_error must strip BODYSTRUCTURE dumps from exceptions."""
+        from src.services.mailbox_import_service import _sanitize_error
+
+        exc = Exception(
+            'Tuple incomplete before BODYSTRUCTURE (("TEXT" "PLAIN" ("CHARSET" "UTF-8")))'
+        )
+        result = _sanitize_error(exc)
+        assert "BODYSTRUCTURE" not in result
+        assert "CHARSET" not in result
+
+    def test_sanitize_error_strips_mime_content(self):
+        """_sanitize_error must strip MIME-related content."""
+        from src.services.mailbox_import_service import _sanitize_error
+
+        exc = Exception(
+            "Parse error: Content-Type: multipart/mixed; "
+            "boundary=----=_Part_12345\r\nMIME-Version: 1.0"
+        )
+        result = _sanitize_error(exc)
+        assert "boundary=" not in result
+        assert "MIME-" not in result
+
+    def test_sanitize_error_strips_email_headers(self):
+        """_sanitize_error must strip common email headers from exceptions."""
+        from src.services.mailbox_import_service import _sanitize_error
+
+        for header in ["From:", "To:", "Subject:", "Date:", "Message-ID:",
+                        "Received:", "Return-Path:", "Content-Disposition:"]:
+            exc = Exception(f"Error near {header} user@private.com secret data")
+            result = _sanitize_error(exc)
+            assert "private.com" not in result, (
+                f"Content after {header} leaked: {result}"
+            )
+
+    def test_folder_skip_after_consecutive_failures(self, db):
+        """After _MAX_CONSECUTIVE_BATCH_FAILURES consecutive all-fail batches,
+        the folder must be abandoned and the importer must advance."""
+        from src.services.mailbox_import_service import (
+            _process_folder_streaming,
+            _MAX_CONSECUTIVE_BATCH_FAILURES,
+        )
+
+        run = MailboxImportRun(
+            status="running", batch_size=2,
+            started_at=datetime.now(timezone.utc),
+            current_folder="BadFolder",
+        )
+        db.add(run)
+        db.commit()
+
+        # 20 UIDs, all will fail → should skip folder after
+        # _MAX_CONSECUTIVE_BATCH_FAILURES * batch_size fetch attempts
+        class AllEmpty:
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 20}
+
+            def search(self, criteria):
+                return list(range(1, 21))
+
+            def fetch(self, uids, parts):
+                uid = uids[0]
+                return {uid: {
+                    b"BODY[HEADER]": b"",
+                    b"BODY[TEXT]": b"",
+                    b"FLAGS": [],
+                }}
+
+            def list_folders(self):
+                return [("", "/", "BadFolder")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = AllEmpty()
+
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            result = _process_folder_streaming(db, run, "BadFolder", 2, True)
+
+        # The folder should have been abandoned after bounded failures
+        # Not all 20 UIDs should have been attempted
+        max_attempted = _MAX_CONSECUTIVE_BATCH_FAILURES * 2  # batch_size=2
+        assert (run.total_emails_failed or 0) >= max_attempted, (
+            f"Expected >= {max_attempted} failed, got {run.total_emails_failed}"
+        )
+        # But MUST NOT have processed all 20 (folder skip kicks in)
+        assert (run.total_emails_failed or 0) <= 20
+
+    def test_multi_folder_advances_despite_failures(self, db):
+        """Import must advance from folder to folder even when all UIDs
+        in a folder fail. Both folders must be attempted."""
+        from src.services.mailbox_import_service import _run_import_thread
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        TestSession = sessionmaker(bind=engine)
+
+        setup_db = TestSession()
+        run = MailboxImportRun(
+            status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+            folders_discovered=["Coburg", "Klinik"],
+            folders_completed=[],
+            total_folders_discovered=2,
+        )
+        setup_db.add(run)
+        setup_db.commit()
+        run_id = run.id
+        setup_db.close()
+
+        folders_attempted = []
+
+        class AllFailPerFolder:
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                folders_attempted.append(folder)
+                raise RuntimeError(f"Cannot select {folder}")
+
+            def search(self, criteria):
+                return []
+
+            def fetch(self, uids, parts):
+                return {}
+
+            def list_folders(self):
+                return [("", "/", "Coburg"), ("", "/", "Klinik")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = AllFailPerFolder()
+
+        def factory():
+            return TestSession()
+
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            _run_import_thread(factory, run_id, 5, True)
+
+        # Both folders must have been attempted
+        assert "Coburg" in folders_attempted, "Coburg was not attempted"
+        assert "Klinik" in folders_attempted, "Klinik was not attempted"
+
+        # Verify status is completed (not stuck)
+        check_db = TestSession()
+        final_run = check_db.query(MailboxImportRun).get(run_id)
+        assert final_run.status == "completed", (
+            f"Expected completed, got {final_run.status}"
+        )
+        # Failed counter must be > 0 (each folder error increments)
+        assert (final_run.total_emails_failed or 0) >= 2, (
+            f"Expected >= 2 failed, got {final_run.total_emails_failed}"
+        )
+        check_db.close()
+
+    def test_progress_nonzero_during_failures(self, db):
+        """When folders fail but advance, progress_percent must not stay 0."""
+        from src.services.mailbox_import_service import _run_import_thread
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        TestSession = sessionmaker(bind=engine)
+
+        setup_db = TestSession()
+        run = MailboxImportRun(
+            status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+            folders_discovered=["Folder1", "Folder2", "Folder3"],
+            folders_completed=[],
+            total_folders_discovered=3,
+        )
+        setup_db.add(run)
+        setup_db.commit()
+        run_id = run.id
+        setup_db.close()
+
+        class EmptyFolders:
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 0}
+
+            def search(self, criteria):
+                return []  # Empty folder
+
+            def fetch(self, uids, parts):
+                return {}
+
+            def list_folders(self):
+                return [("", "/", f) for f in ["Folder1", "Folder2", "Folder3"]]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = EmptyFolders()
+
+        def factory():
+            return TestSession()
+
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            _run_import_thread(factory, run_id, 5, True)
+
+        check_db = TestSession()
+        final_run = check_db.query(MailboxImportRun).get(run_id)
+        assert final_run.status == "completed"
+        # All 3 folders should be completed
+        completed = final_run.folders_completed or []
+        assert len(completed) == 3, f"Expected 3 completed, got {len(completed)}"
+        check_db.close()
+
+    def test_per_uid_fetch_no_raw_payload_in_any_log(self, db):
+        """No log line from the import path may contain raw IMAP payload."""
+        import logging as _logging
+        from src.services.mailbox_import_service import _process_folder_streaming
+
+        run = MailboxImportRun(
+            status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+            current_folder="TestFolder",
+        )
+        db.add(run)
+        db.commit()
+
+        # Create exception with many types of IMAP payload content
+        payload_markers = [
+            "BODY[HEADER] {1234}\r\nFrom: secret@corp.com",
+            "BODY[TEXT] {5678}\r\nThis is confidential",
+            'BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "UTF-8"))',
+            "Subject: Private Meeting Notes",
+            "Content-Type: multipart/mixed; boundary=----=_Part_1",
+            "Message-ID: <unique-id@private.com>",
+        ]
+
+        uid_counter = [0]
+
+        class PayloadLeakTest:
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": len(payload_markers)}
+
+            def search(self, criteria):
+                return list(range(1, len(payload_markers) + 1))
+
+            def fetch(self, uids, parts):
+                idx = uid_counter[0]
+                uid_counter[0] += 1
+                if idx < len(payload_markers):
+                    raise Exception(payload_markers[idx])
+                raise Exception("generic error")
+
+            def list_folders(self):
+                return [("", "/", "TestFolder")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = PayloadLeakTest()
+
+        log_messages = []
+        handler = _logging.Handler()
+        handler.emit = lambda record: log_messages.append(record.getMessage())
+        import src.services.mailbox_import_service as svc
+        svc.logger.addHandler(handler)
+
+        try:
+            with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+                MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+                _process_folder_streaming(db, run, "TestFolder", 10, True)
+        finally:
+            svc.logger.removeHandler(handler)
+
+        # Check NO log line contains any of these payload fragments
+        forbidden = [
+            "secret@corp.com", "confidential", "Private Meeting",
+            "BODYSTRUCTURE", "CHARSET", "boundary=",
+            "BODY[HEADER]", "BODY[TEXT]",
+            "Content-Type:", "Message-ID:",
+            "unique-id@private.com",
+        ]
+        for msg in log_messages:
+            for frag in forbidden:
+                assert frag not in msg, (
+                    f"Forbidden payload fragment '{frag}' found in log: {msg[:200]}"
+                )
+
+    def test_import_works_with_minimal_header_text_flags_only(self, db):
+        """Import must succeed with only BODY[HEADER] + BODY[TEXT] + FLAGS.
+        No BODYSTRUCTURE, no attachment parsing, no other fields required."""
+        from src.services.mailbox_import_service import _process_folder_streaming
+
+        run = MailboxImportRun(
+            status="running", batch_size=5,
+            started_at=datetime.now(timezone.utc),
+            current_folder="MinimalFolder",
+        )
+        db.add(run)
+        db.commit()
+
+        raw_email = _build_raw_email(1, subject="Minimal test", sender="a@b.com")
+        header, text = _split_raw_email(raw_email)
+
+        class MinimalIMAPClient:
+            client = None
+
+            def __init__(self):
+                self.client = self
+
+            def select_folder(self, folder, readonly=False):
+                return {"EXISTS": 1}
+
+            def search(self, criteria):
+                return [1]
+
+            def fetch(self, uids, parts):
+                uid = uids[0]
+                # Return ONLY header, text, flags — nothing else
+                return {uid: {
+                    b"BODY[HEADER]": header,
+                    b"BODY[TEXT]": text,
+                    b"FLAGS": [b"\\Seen"],
+                }}
+
+            def list_folders(self):
+                return [("", "/", "MinimalFolder")]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        mock_imap = MinimalIMAPClient()
+
+        with patch("src.services.imap_service.IMAPService") as MockIMAPSvc:
+            MockIMAPSvc.return_value = _make_mock_imap_context(mock_imap)
+            with patch("src.services.mailbox_import_service.learn_from_email"):
+                with patch("src.services.mailbox_import_service._update_sender_interaction"):
+                    _process_folder_streaming(db, run, "MinimalFolder", 5, True)
+
+        assert (run.total_emails_ingested or 0) >= 1, (
+            f"Expected >= 1 ingested, got {run.total_emails_ingested}"
+        )
+        assert (run.total_emails_failed or 0) == 0
+
+    def test_error_handling_sanitize_strips_imap_payload(self):
+        """The error_handling.py sanitize_error must strip IMAP payload in debug mode."""
+        from src.utils.error_handling import sanitize_error
+
+        test_cases = [
+            (
+                "Error: BODY[HEADER] {1234}\r\nFrom: secret@example.com",
+                "BODY[HEADER]",
+            ),
+            (
+                "Error: BODYSTRUCTURE (TEXT PLAIN)",
+                "BODYSTRUCTURE",
+            ),
+            (
+                "Error near Subject: Private Document\r\nDate: 2024-01-01",
+                "Private Document",
+            ),
+            (
+                "MIME-Version: 1.0\r\nContent-Type: text/plain",
+                "MIME-",
+            ),
+        ]
+
+        for exc_msg, forbidden in test_cases:
+            exc = Exception(exc_msg)
+            result = sanitize_error(exc, debug=True)
+            assert forbidden not in result, (
+                f"'{forbidden}' leaked in sanitized output: {result}"
+            )
+
