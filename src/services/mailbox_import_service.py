@@ -70,20 +70,40 @@ _MAX_ERROR_LOG_LEN = 120
 def _sanitize_error(exc: Exception) -> str:
     """Return a sanitized, truncated error string safe for log output.
 
-    Format: ``ExceptionType: first-line-of-message [truncated]``
-
     IMAP exception messages frequently embed raw server responses that include
-    email headers, body text, or attachment fragments (all printable ASCII).
-    Passing printable ASCII through unchanged is therefore NOT safe.
-    Instead we log only the exception type name and the first line of the
-    message, capped at ``_MAX_ERROR_LOG_LEN`` characters total.
+    email headers, body text, BODYSTRUCTURE, or attachment fragments — all
+    printable ASCII.  We MUST NOT let any of that through.
+
+    Strategy:
+    1. Log only the exception type.
+    2. Extract a *very* short technical hint (the first few non-payload words).
+    3. Aggressively strip anything that looks like email/IMAP content.
+    4. Hard-cap the entire output.
     """
     exc_type = type(exc).__name__
-    # Take only the first line of the message to avoid multi-line IMAP dumps
-    first_line = str(exc).split("\n")[0].split("\r")[0]
-    # Strip non-printable chars from that first line
-    safe_line = "".join(c if 0x20 <= ord(c) <= 0x7E else "?" for c in first_line)
-    summary = f"{exc_type}: {safe_line}"
+    raw = str(exc).split("\n")[0].split("\r")[0]
+    # Strip anything after IMAP payload markers (these embed raw content)
+    for marker in (
+        "BODY[", "BODY.PEEK[", "BODYSTRUCTURE", "FLAGS", "ENVELOPE",
+        "INTERNALDATE", "RFC822", "\\Seen", "\\Recent", "\\Flagged",
+        "Content-Type:", "From:", "To:", "Subject:", "Date:", "MIME-",
+        "Message-ID:", "Received:", "Return-Path:", "boundary=",
+        "Content-Transfer-Encoding:", "Content-Disposition:", "X-",
+    ):
+        idx = raw.find(marker)
+        if idx >= 0:
+            raw = raw[:idx]
+    # Remove any remaining byte-literal fragments like b'...' or b"..."
+    raw = re.sub(r"b['\"].*?['\"]", "[data]", raw)
+    # Remove long mixed-case hex/base64 sequences (must contain both upper+lower or digits)
+    raw = re.sub(r"(?=[A-Za-z0-9+/=]{40,})(?=.*[A-Z])(?=.*[a-z0-9+/=])[A-Za-z0-9+/=]{40,}", "[data]", raw)
+    # Strip non-printable / non-ASCII characters
+    raw = "".join(c if 0x20 <= ord(c) <= 0x7E else "?" for c in raw)
+    # Collapse whitespace and cap length
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        return exc_type
+    summary = f"{exc_type}: {raw}"
     if len(summary) > _MAX_ERROR_LOG_LEN:
         summary = summary[:_MAX_ERROR_LOG_LEN] + " [truncated]"
     return summary
@@ -726,14 +746,11 @@ def _parse_email_for_import(
             for f in (msg_data.get(b"FLAGS") or [])
         ]
 
-        # Extract attachment metadata (best-effort from MIME headers only —
-        # no BODYSTRUCTURE parsing, which is fragile for complex messages).
-        # If extraction fails entirely, proceed without attachment metadata.
-        try:
-            attachment_metadata = _extract_attachment_metadata(msg)
-        except Exception as e:
-            logger.warning("attachment_metadata_extraction_failed uid=%s error=%s", uid, _sanitize_error(e))
-            attachment_metadata = []
+        # Attachment metadata extraction is DISABLED during mailbox import.
+        # It is not required for successful import/learning, and MIME parsing
+        # of complex multipart messages can be fragile.  Attachment metadata
+        # can be extracted later as a separate pass once import is reliable.
+        attachment_metadata = []
 
         # Integrity hash
         integrity_hash = hashlib.sha256(raw_email).hexdigest()

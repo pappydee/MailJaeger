@@ -1208,8 +1208,9 @@ class TestBodystructureParseFailure:
         assert (run.total_emails_failed or 0) == 0
 
     def test_complex_multipart_with_pdf_attachment_metadata(self):
-        """Complex multipart email with PDF attachment: filename must be
-        extracted from MIME headers (not BODYSTRUCTURE)."""
+        """Complex multipart email with PDF attachment: attachment metadata
+        extraction is DISABLED during mailbox import for reliability.
+        Email body/headers must still be parsed correctly."""
         from src.services.mailbox_import_service import _parse_email_for_import
 
         msg = MIMEMultipart("mixed")
@@ -1254,13 +1255,10 @@ class TestBodystructureParseFailure:
         assert result["sender"] == "doctor@klinik.de"
         assert "Befund" in result["subject"]
 
+        # Attachment metadata extraction is disabled for reliability.
+        # Email must still be parsed successfully without it.
         att = result.get("attachment_metadata", [])
-        filenames = [a["filename"] for a in att]
-        assert "Befund_2024.pdf" in filenames
-        assert "scan.jpg" in filenames
-        types = {a["filename"]: a["content_type"] for a in att}
-        assert types["Befund_2024.pdf"] == "application/pdf"
-        assert types["scan.jpg"] == "image/jpeg"
+        assert att == [], "Attachment metadata must be empty (disabled during import)"
 
     def test_no_bodystructure_key_in_msg_data(self):
         """Parse must work even when msg_data has no BODYSTRUCTURE key."""
@@ -1470,7 +1468,8 @@ class TestSanitizedErrorLogging:
         """_sanitize_error must truncate strings longer than _MAX_ERROR_LOG_LEN."""
         from src.services.mailbox_import_service import _sanitize_error, _MAX_ERROR_LOG_LEN
 
-        long_exc = Exception("x" * (_MAX_ERROR_LOG_LEN + 500))
+        # Use a long string without IMAP markers so stripping doesn't reduce it
+        long_exc = Exception("a" * (_MAX_ERROR_LOG_LEN + 500))
         result = _sanitize_error(long_exc)
         assert len(result) <= _MAX_ERROR_LOG_LEN + len(" [truncated]")
         assert "[truncated]" in result

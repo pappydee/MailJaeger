@@ -17,23 +17,15 @@ def sanitize_error(e: Exception, debug: bool = False) -> str:
     """
     Sanitize error messages to prevent credential and content leakage.
 
-    Output format: ``ExceptionType: first-line-of-message``
-
     In all modes the output is capped to ``_MAX_SANITIZED_LEN`` characters.
     In production (debug=False) only the exception type name is returned.
     In debug mode the first line of the message is appended (still capped)
-    with secrets redacted.
+    with secrets AND IMAP payload content stripped.
 
     IMAP exceptions can embed raw server responses containing full email
-    headers and body text.  The hard length cap ensures that even in debug
-    mode no significant email content leaks into logs.
-
-    Args:
-        e: The exception to sanitize
-        debug: Whether to return error details (default: False)
-
-    Returns:
-        Sanitized error message safe for storage/API responses
+    headers, body text, BODYSTRUCTURE, and MIME content — all printable
+    ASCII.  The hard length cap combined with payload stripping ensures
+    that even in debug mode no email content leaks into logs.
     """
     error_type = type(e).__name__ or "UnknownError"
 
@@ -41,13 +33,43 @@ def sanitize_error(e: Exception, debug: bool = False) -> str:
         # In production, return only the exception type, no details
         return error_type
 
-    # In debug mode, include the first line of the message (secrets redacted)
+    # In debug mode, include the first line of the message (stripped of secrets
+    # and IMAP payload fragments)
     first_line = str(e).split("\n")[0].split("\r")[0]
     first_line = _redact_secrets(first_line)
+    first_line = _strip_imap_payload(first_line)
     summary = f"{error_type}: {first_line}"
     if len(summary) > _MAX_SANITIZED_LEN:
         summary = summary[:_MAX_SANITIZED_LEN] + " [truncated]"
     return summary
+
+
+def _strip_imap_payload(text: str) -> str:
+    """Remove IMAP/email payload fragments from error text.
+
+    IMAP exceptions frequently embed raw server responses that contain
+    email headers (From:, To:, Subject:, etc.), body content, BODYSTRUCTURE
+    dumps, and MIME boundary fragments.  All of this is printable ASCII and
+    would pass through a naive length cap.  This function aggressively
+    strips any content that follows known IMAP payload markers.
+    """
+    if not text:
+        return text
+    for marker in (
+        "BODY[", "BODY.PEEK[", "BODYSTRUCTURE", "FLAGS (", "ENVELOPE",
+        "INTERNALDATE", "RFC822", "\\Seen", "\\Recent", "\\Flagged",
+        "Content-Type:", "From:", "To:", "Subject:", "Date:", "MIME-",
+        "Message-ID:", "Received:", "Return-Path:", "boundary=",
+        "Content-Transfer-Encoding:", "Content-Disposition:", "X-Mailer:",
+    ):
+        idx = text.find(marker)
+        if idx >= 0:
+            text = text[:idx]
+    # Remove byte-literal fragments like b'...' or b"..."
+    text = re.sub(r"b['\"].*?['\"]", "[data]", text)
+    # Remove long hex/base64 sequences
+    text = re.sub(r"[A-Za-z0-9+/=]{40,}", "[data]", text)
+    return text.strip()
 
 
 def _redact_secrets(text: str) -> str:
