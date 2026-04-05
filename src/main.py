@@ -1679,6 +1679,91 @@ async def reset_learning_job(request: Request, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# Historical AI Analysis Endpoints (second-stage LLM analysis of stored emails)
+# ---------------------------------------------------------------------------
+
+_analysis_cancel_event_api = threading.Event()
+
+
+def _analysis_db_factory():
+    """Create a new DB session for the background analysis thread."""
+    from src.database.connection import get_session_factory
+    return get_session_factory()()
+
+
+@app.post("/api/analysis/start", dependencies=[Depends(require_authentication)])
+@limiter.limit("5/minute")
+async def start_analysis_job(request: Request, db: Session = Depends(get_db)):
+    """Start (or resume) the historical AI analysis job.
+
+    The job runs in a background thread, so this endpoint returns immediately.
+    Use GET /api/analysis/status to poll progress.
+
+    Query parameters:
+      batch_size (int, default 20): Emails per batch (clamped to 5–100)
+      max_age_days (int, default 365): Only analyze emails from the last N days
+    """
+    try:
+        batch_size = int(request.query_params.get("batch_size", "20"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="batch_size must be an integer")
+
+    try:
+        max_age_days = int(request.query_params.get("max_age_days", "365"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="max_age_days must be an integer")
+
+    from src.services.historical_analysis_service import start_analysis
+
+    result = start_analysis(
+        _analysis_db_factory,
+        batch_size=batch_size,
+        max_age_days=max_age_days,
+    )
+    return result
+
+
+@app.post("/api/analysis/stop", dependencies=[Depends(require_authentication)])
+@limiter.limit("10/minute")
+async def stop_analysis_job(request: Request, db: Session = Depends(get_db)):
+    """Request the running historical AI analysis job to stop.
+
+    Sets the cancel signal so the job pauses at the next batch boundary.
+    Progress is persisted and a future start call resumes from the checkpoint.
+    """
+    from src.services.historical_analysis_service import stop_analysis
+
+    return stop_analysis(_analysis_db_factory)
+
+
+@app.get("/api/analysis/status", dependencies=[Depends(require_authentication)])
+async def analysis_job_status(db: Session = Depends(get_db)):
+    """Return the current historical AI analysis job status.
+
+    Returns a structured object with progress, phase, and timing information.
+    Status includes: total eligible emails (last 1 year), processed count,
+    failed count, progress %, current phase, job state.
+    """
+    from src.services.historical_analysis_service import get_analysis_status
+
+    return get_analysis_status(_analysis_db_factory)
+
+
+@app.post("/api/analysis/reset", dependencies=[Depends(require_authentication)])
+@limiter.limit("3/minute")
+async def reset_analysis_job(request: Request, db: Session = Depends(get_db)):
+    """Reset all historical AI analysis run/progress data.
+
+    Stops any running job and deletes all HistoricalAnalysisRun and
+    HistoricalAnalysisProgress records. Does NOT revert AI results
+    already written to email records.
+    """
+    from src.services.historical_analysis_service import reset_analysis
+
+    return reset_analysis(_analysis_db_factory)
+
+
+# ---------------------------------------------------------------------------
 # Mailbox-Wide Import Endpoints (v1.2.0 — streaming batch import + learn)
 # ---------------------------------------------------------------------------
 

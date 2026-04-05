@@ -969,3 +969,76 @@ class MailboxImportRun(Base):
 
     # Error
     error_message = Column(Text, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Historical AI Analysis System models
+# ---------------------------------------------------------------------------
+
+
+class HistoricalAnalysisRun(Base):
+    """Track a historical AI analysis job.
+
+    Each row represents one analysis job invocation.  The system supports
+    pause/resume semantics: when paused, last_processed_email_id and
+    processed_count are persisted so the next start call can pick up
+    where it left off.
+
+    Only emails from the last ``max_age_days`` (default 365) with
+    ``analysis_state='pending'`` are eligible.
+    """
+
+    __tablename__ = "historical_analysis_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Status: running | paused | completed | failed
+    status = Column(String(20), default="running", nullable=False, index=True)
+
+    # Phase: scanning | analyzing | finalizing
+    current_phase = Column(String(30), default="scanning")
+
+    # Progress tracking
+    total_eligible = Column(Integer, default=0)
+    processed_count = Column(Integer, default=0)
+    failed_count = Column(Integer, default=0)
+    last_processed_email_id = Column(Integer, nullable=True)
+    progress_percent = Column(Float, default=0.0)
+
+    # Configuration snapshot
+    batch_size = Column(Integer, default=20)
+    max_age_days = Column(Integer, default=365)
+
+    # Timestamps
+    started_at = Column(DateTime, default=datetime.utcnow, index=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    # Error
+    error_message = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("idx_har_status", "status"),
+    )
+
+
+class HistoricalAnalysisProgress(Base):
+    """Per-email tracking for the historical AI analysis system.
+
+    Each row records that a specific email has been analyzed by the
+    historical AI analysis job.
+    """
+
+    __tablename__ = "historical_analysis_progress"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    email_id = Column(
+        Integer, ForeignKey("processed_emails.id"), nullable=False, index=True
+    )
+    processed_at = Column(DateTime, default=datetime.utcnow)
+    analysis_result = Column(JSON, nullable=True)  # Snapshot of AI analysis output
+    success = Column(Boolean, default=True)
+
+    __table_args__ = (
+        Index("idx_hap_email_id", "email_id", unique=True),
+    )
