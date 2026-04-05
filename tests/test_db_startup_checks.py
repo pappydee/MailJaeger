@@ -230,6 +230,83 @@ def _create_legacy_processed_emails_database(db_file: Path):
     return engine
 
 
+def _create_legacy_sender_profiles_database(db_file: Path):
+    engine = create_engine(f"sqlite:///{db_file}")
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE sender_profiles"))
+        connection.execute(
+            text(
+                """
+                CREATE TABLE sender_profiles (
+                    id INTEGER PRIMARY KEY,
+                    sender_address VARCHAR(200),
+                    sender_domain VARCHAR(200),
+                    total_emails INTEGER,
+                    typical_folder VARCHAR(200),
+                    folder_distribution JSON,
+                    total_replies INTEGER,
+                    reply_rate FLOAT,
+                    avg_reply_delay_seconds FLOAT,
+                    median_reply_delay_seconds FLOAT,
+                    importance_tendency FLOAT,
+                    spam_tendency FLOAT,
+                    marked_important_count INTEGER,
+                    marked_spam_count INTEGER,
+                    archived_count INTEGER,
+                    deleted_count INTEGER,
+                    kept_in_inbox_count INTEGER,
+                    first_seen DATETIME,
+                    last_seen DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+    return engine
+
+
+def _create_legacy_decision_events_database(db_file: Path):
+    engine = create_engine(f"sqlite:///{db_file}")
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE decision_events"))
+        connection.execute(
+            text(
+                """
+                CREATE TABLE decision_events (
+                    id INTEGER PRIMARY KEY,
+                    email_id INTEGER NOT NULL,
+                    thread_id VARCHAR(200),
+                    event_type VARCHAR(50) NOT NULL,
+                    source VARCHAR(50),
+                    old_value VARCHAR(200),
+                    new_value VARCHAR(200),
+                    sender VARCHAR(200),
+                    subject_snippet VARCHAR(200),
+                    chosen_category VARCHAR(50),
+                    chosen_folder VARCHAR(200),
+                    confidence FLOAT,
+                    model_version VARCHAR(50),
+                    rule_id INTEGER,
+                    user_confirmed BOOLEAN,
+                    created_at DATETIME
+                )
+                """
+            )
+        )
+    return engine
+
+
+def _create_legacy_without_learning_tables_database(db_file: Path):
+    engine = create_engine(f"sqlite:///{db_file}")
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS learning_progress"))
+        connection.execute(text("DROP TABLE IF EXISTS learning_runs"))
+    return engine
+
+
 class TestActionQueueSchemaRepair:
     def test_init_db_repairs_missing_action_queue_columns_and_preserves_rows(
         self, tmp_path, monkeypatch
@@ -354,6 +431,45 @@ class TestActionQueueSchemaRepair:
         assert "thread_state" in columns
         assert "thread_priority" in columns
         assert "thread_importance_score" in columns
+
+    def test_init_db_repairs_missing_sender_profile_columns(self, tmp_path):
+        from src.database.startup_checks import ensure_historical_learning_schema_compatibility
+
+        db_file = tmp_path / "legacy_sender_profiles.sqlite"
+        engine = _create_legacy_sender_profiles_database(db_file)
+        ensure_historical_learning_schema_compatibility(engine, debug=False)
+
+        inspector = inspect(engine)
+        columns = {column["name"] for column in inspector.get_columns("sender_profiles")}
+        assert "spam_probability" in columns
+        assert "interaction_count" in columns
+        assert "preferred_category" in columns
+        assert "preferred_folder" in columns
+        assert "user_classification_count" in columns
+
+    def test_init_db_repairs_missing_decision_event_columns(self, tmp_path):
+        from src.database.startup_checks import ensure_historical_learning_schema_compatibility
+
+        db_file = tmp_path / "legacy_decision_events.sqlite"
+        engine = _create_legacy_decision_events_database(db_file)
+        ensure_historical_learning_schema_compatibility(engine, debug=False)
+
+        inspector = inspect(engine)
+        columns = {column["name"] for column in inspector.get_columns("decision_events")}
+        assert "action_type" in columns
+        assert "target_folder" in columns
+
+    def test_init_db_creates_learning_tables_on_existing_db(self, tmp_path):
+        from src.database.startup_checks import ensure_historical_learning_schema_compatibility
+
+        db_file = tmp_path / "legacy_no_learning_tables.sqlite"
+        engine = _create_legacy_without_learning_tables_database(db_file)
+        ensure_historical_learning_schema_compatibility(engine, debug=False)
+
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        assert "learning_runs" in tables
+        assert "learning_progress" in tables
 
 
 if __name__ == "__main__":

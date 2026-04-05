@@ -173,10 +173,11 @@ class TestStartupSanitization:
         # Create exception with details
         exc = ValueError("Test error with details")
 
-        # In debug mode, should return full message
+        # In debug mode, should return type + first line of message (capped)
         sanitized = sanitize_error(exc, debug=True)
 
-        assert sanitized == "Test error with details"
+        assert "ValueError" in sanitized
+        assert "Test error with details" in sanitized
 
     def test_startup_validation_error_sanitized_in_stderr(self):
         """Test that startup validation errors are sanitized in stderr output"""

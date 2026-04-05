@@ -17,6 +17,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from src.models.database import (
     ProcessedEmail,
@@ -272,8 +273,41 @@ def _get_or_create_sender_profile(
     Exactly one of domain/address should be provided.
     - When domain is set (address is None): returns the domain-level profile.
     - When address is set: returns the address-level profile.
+
+    Calls ``db.flush()`` after inserting a new row so that subsequent
+    queries within the same transaction see it even when the session
+    has ``autoflush=False``.
     """
     now = datetime.now(timezone.utc)
+    def _insert_profile_or_reuse(profile: SenderProfile) -> SenderProfile:
+        """Insert a new profile row or reuse an existing row if raced."""
+        nested = db.begin_nested()
+        try:
+            db.add(profile)
+            db.flush()
+            nested.commit()
+            return profile
+        except IntegrityError:
+            nested.rollback()
+            if profile.sender_address:
+                existing = (
+                    db.query(SenderProfile)
+                    .filter(SenderProfile.sender_address == profile.sender_address)
+                    .first()
+                )
+            else:
+                existing = (
+                    db.query(SenderProfile)
+                    .filter(
+                        SenderProfile.sender_domain == profile.sender_domain,
+                        SenderProfile.sender_address.is_(None),
+                    )
+                    .first()
+                )
+            if existing:
+                return existing
+            raise
+
     if address:
         profile = (
             db.query(SenderProfile)
@@ -289,7 +323,7 @@ def _get_or_create_sender_profile(
                 first_seen=now,
                 last_seen=now,
             )
-            db.add(profile)
+            profile = _insert_profile_or_reuse(profile)
     else:
         profile = (
             db.query(SenderProfile)
@@ -307,7 +341,7 @@ def _get_or_create_sender_profile(
                 first_seen=now,
                 last_seen=now,
             )
-            db.add(profile)
+            profile = _insert_profile_or_reuse(profile)
     return profile
 
 

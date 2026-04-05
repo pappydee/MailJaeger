@@ -37,6 +37,19 @@ _PROCESSED_EMAILS_REQUIRED_COLUMNS = {
     "thread_importance_score": "FLOAT DEFAULT 0.0",
 }
 
+_SENDER_PROFILES_REQUIRED_COLUMNS = {
+    "spam_probability": "FLOAT DEFAULT 0.0",
+    "interaction_count": "INTEGER DEFAULT 0",
+    "preferred_category": "VARCHAR(50)",
+    "preferred_folder": "VARCHAR(200)",
+    "user_classification_count": "INTEGER DEFAULT 0",
+}
+
+_DECISION_EVENTS_REQUIRED_COLUMNS = {
+    "action_type": "VARCHAR(50)",
+    "target_folder": "VARCHAR(200)",
+}
+
 _SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -163,6 +176,115 @@ def ensure_processed_emails_thread_state_schema(engine, debug: bool = False):
         error_msg = f"Failed to repair SQLite processed_emails schema: {sanitized}"
         logger.error(error_msg)
         raise RuntimeError(error_msg) from e
+
+
+def _ensure_sqlite_table_columns(
+    engine,
+    *,
+    table_name: str,
+    required_columns: dict,
+    debug: bool = False,
+):
+    """Repair a legacy SQLite table by adding missing required columns."""
+    if engine.dialect.name != "sqlite":
+        return {"columns_added": []}
+    try:
+        inspector = inspect(engine)
+        if table_name not in inspector.get_table_names():
+            return {"columns_added": []}
+        existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
+        columns_added = []
+        with engine.begin() as connection:
+            for column_name, column_type in required_columns.items():
+                if column_name in existing_columns:
+                    continue
+                safe_table_name = _safe_sql_identifier(table_name)
+                safe_column_name = _safe_sql_identifier(column_name)
+                connection.execute(
+                    text(
+                        f"ALTER TABLE {safe_table_name} ADD COLUMN "
+                        f"{safe_column_name} {column_type}"
+                    )
+                )
+                columns_added.append(column_name)
+                logger.warning(
+                    "SQLite schema repair: added missing %s column '%s'",
+                    table_name,
+                    column_name,
+                )
+        if columns_added:
+            logger.info(
+                "SQLite %s schema repair applied: columns=%s",
+                table_name,
+                columns_added,
+            )
+        else:
+            logger.debug("SQLite %s schema already compatible", table_name)
+        return {"columns_added": columns_added}
+    except Exception as e:
+        sanitized = sanitize_error(e, debug=debug)
+        error_msg = f"Failed to repair SQLite {table_name} schema: {sanitized}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg) from e
+
+
+def ensure_historical_learning_schema_compatibility(engine, debug: bool = False):
+    """Repair historical-learning SQLite schema for legacy databases."""
+    if engine.dialect.name != "sqlite":
+        return {
+            "sender_profiles_columns_added": [],
+            "decision_events_columns_added": [],
+            "tables_created": [],
+        }
+
+    sender_result = _ensure_sqlite_table_columns(
+        engine,
+        table_name="sender_profiles",
+        required_columns=_SENDER_PROFILES_REQUIRED_COLUMNS,
+        debug=debug,
+    )
+    decision_result = _ensure_sqlite_table_columns(
+        engine,
+        table_name="decision_events",
+        required_columns=_DECISION_EVENTS_REQUIRED_COLUMNS,
+        debug=debug,
+    )
+
+    from src.models.database import LearningRun, LearningProgress, MailboxImportRun
+
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    tables_created = []
+    with engine.begin() as connection:
+        if "learning_runs" not in existing_tables:
+            LearningRun.__table__.create(bind=connection, checkfirst=True)
+            tables_created.append("learning_runs")
+            logger.warning("SQLite schema repair: created missing table 'learning_runs'")
+        if "learning_progress" not in existing_tables:
+            LearningProgress.__table__.create(bind=connection, checkfirst=True)
+            tables_created.append("learning_progress")
+            logger.warning("SQLite schema repair: created missing table 'learning_progress'")
+        if "mailbox_import_runs" not in existing_tables:
+            MailboxImportRun.__table__.create(bind=connection, checkfirst=True)
+            tables_created.append("mailbox_import_runs")
+            logger.warning("SQLite schema repair: created missing table 'mailbox_import_runs'")
+
+    if sender_result["columns_added"] or decision_result["columns_added"] or tables_created:
+        logger.info(
+            "SQLite historical learning schema repair applied: "
+            "sender_profiles_columns=%s decision_events_columns=%s tables_created=%s",
+            sender_result["columns_added"],
+            decision_result["columns_added"],
+            tables_created,
+        )
+    else:
+        logger.debug("SQLite historical learning schema already compatible")
+
+    return {
+        "sender_profiles_columns_added": sender_result["columns_added"],
+        "decision_events_columns_added": decision_result["columns_added"],
+        "tables_created": tables_created,
+    }
 
 
 def verify_pending_actions_table(engine, debug: bool = False):

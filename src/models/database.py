@@ -380,6 +380,14 @@ class DecisionEvent(Base):
         Integer, nullable=True
     )  # FK to ClassificationOverride if rule-based
 
+    # Explicit action fields (for learning system queries)
+    action_type = Column(
+        String(50), nullable=True, index=True
+    )  # move, archive, delete, mark_spam, mark_important
+    target_folder = Column(
+        String(200), nullable=True
+    )  # destination folder (when action_type is 'move')
+
     # User confirmation state
     user_confirmed = Column(Boolean, default=False, index=True)
 
@@ -637,6 +645,12 @@ class SenderProfile(Base):
     spam_tendency = Column(
         Float, default=0.0
     )  # 0.0 = not spam, 1.0 = always spam
+    spam_probability = Column(
+        Float, default=0.0
+    )  # computed spam probability (0.0–1.0)
+    interaction_count = Column(
+        Integer, default=0
+    )  # total user interactions (opens, replies, moves, etc.)
     marked_important_count = Column(Integer, default=0)
     marked_spam_count = Column(Integer, default=0)
 
@@ -841,3 +855,117 @@ class ReplyLink(Base):
     __table_args__ = (
         Index("idx_rl_sent_original", "sent_email_id", "original_email_id", unique=True),
     )
+
+
+# ---------------------------------------------------------------------------
+# Historical Learning System v1.2.0 models
+# ---------------------------------------------------------------------------
+
+
+class LearningRun(Base):
+    """Persistent learning run tracking for the historical learning system.
+
+    Each row represents one learning job invocation.  The system supports
+    pause/resume semantics: when paused, last_email_uid and processed_emails
+    are persisted so the next start call can pick up where it left off.
+    """
+
+    __tablename__ = "learning_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Status: running | paused | completed | failed
+    status = Column(String(20), default="running", nullable=False, index=True)
+
+    # Phase: scanning | analyzing | learning
+    current_phase = Column(String(30), default="scanning")
+
+    # Progress tracking
+    total_emails = Column(Integer, default=0)
+    processed_emails = Column(Integer, default=0)
+    last_email_uid = Column(Integer, nullable=True)
+    progress_percent = Column(Float, default=0.0)
+
+    # Timestamps
+    started_at = Column(DateTime, default=datetime.utcnow, index=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("idx_lr_status", "status"),
+    )
+
+
+class LearningProgress(Base):
+    """Per-email tracking for the historical learning system.
+
+    Each row records that a specific email has been processed by a
+    learning run, with a result_hash for change detection / deduplication.
+    """
+
+    __tablename__ = "learning_progress"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    email_id = Column(Integer, ForeignKey("processed_emails.id"), nullable=False, index=True)
+    processed_at = Column(DateTime, default=datetime.utcnow)
+    result_hash = Column(String(64), nullable=True)  # SHA-256 hex digest of learning outcome
+
+    __table_args__ = (
+        Index("idx_lp_email_id", "email_id", unique=True),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mailbox-Wide Import System v1.2.0 models
+# ---------------------------------------------------------------------------
+
+
+class MailboxImportRun(Base):
+    """Track a mailbox-wide streaming import + learn job.
+
+    Each run enumerates IMAP folders and processes them in small
+    streaming batches (fetch → ingest → learn → checkpoint).
+
+    Resume semantics:
+      - ``current_folder`` / ``current_folder_uid_checkpoint`` remember
+        exactly where the job paused inside a folder.
+      - ``folders_completed`` (JSON list) records fully finished folders
+        so they are not re-scanned unless incremental new mail arrives.
+    """
+
+    __tablename__ = "mailbox_import_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Status: running | paused | completed | failed
+    status = Column(String(20), default="running", nullable=False, index=True)
+
+    # Configuration snapshot
+    batch_size = Column(Integer, default=20)
+    skip_attachment_binaries = Column(Boolean, default=True)
+
+    # Overall progress
+    total_folders_discovered = Column(Integer, default=0)
+    folders_completed_count = Column(Integer, default=0)
+    total_emails_ingested = Column(Integer, default=0)
+    total_emails_learned = Column(Integer, default=0)
+    total_emails_skipped = Column(Integer, default=0)
+    total_emails_failed = Column(Integer, default=0)
+
+    # Per-folder checkpoint for resume
+    current_folder = Column(String(200), nullable=True)
+    current_folder_uid_checkpoint = Column(Integer, nullable=True)
+
+    # Completed folders (JSON list of folder names)
+    folders_completed = Column(JSON, default=list)
+
+    # All discovered folders (JSON list of folder names)
+    folders_discovered = Column(JSON, default=list)
+
+    # Timestamps
+    started_at = Column(DateTime, default=datetime.utcnow, index=True)
+    paused_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    # Error
+    error_message = Column(Text, nullable=True)
