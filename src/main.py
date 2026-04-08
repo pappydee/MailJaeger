@@ -1702,16 +1702,27 @@ async def start_analysis_job(request: Request, db: Session = Depends(get_db)):
     Query parameters:
       batch_size (int, default 20): Emails per batch (clamped to 5–100)
       max_age_days (int, default 365): Only analyze emails from the last N days
+      max_emails_per_run (int, default 5000): Stop after this many emails
+      sleep_between_batches (float, default 0.5): Seconds to sleep between batches
+      max_runtime_seconds (int, default 7200): Max runtime before auto-pause
     """
-    try:
-        batch_size = int(request.query_params.get("batch_size", "20"))
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="batch_size must be an integer")
+    def _parse_int(name, default):
+        try:
+            return int(request.query_params.get(name, str(default)))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail=f"{name} must be an integer")
 
-    try:
-        max_age_days = int(request.query_params.get("max_age_days", "365"))
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="max_age_days must be an integer")
+    def _parse_float(name, default):
+        try:
+            return float(request.query_params.get(name, str(default)))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail=f"{name} must be a number")
+
+    batch_size = _parse_int("batch_size", 20)
+    max_age_days = _parse_int("max_age_days", 365)
+    max_emails_per_run = _parse_int("max_emails_per_run", 5000)
+    sleep_between_batches = _parse_float("sleep_between_batches", 0.5)
+    max_runtime_seconds = _parse_int("max_runtime_seconds", 7200)
 
     from src.services.historical_analysis_service import start_analysis
 
@@ -1719,6 +1730,9 @@ async def start_analysis_job(request: Request, db: Session = Depends(get_db)):
         _analysis_db_factory,
         batch_size=batch_size,
         max_age_days=max_age_days,
+        max_emails_per_run=max_emails_per_run,
+        sleep_between_batches=sleep_between_batches,
+        max_runtime_seconds=max_runtime_seconds,
     )
     return result
 

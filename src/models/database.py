@@ -1008,6 +1008,11 @@ class HistoricalAnalysisRun(Base):
     # Configuration snapshot
     batch_size = Column(Integer, default=20)
     max_age_days = Column(Integer, default=365)
+    max_emails_per_run = Column(Integer, nullable=True)  # None = unlimited
+
+    # LLM observability counters
+    total_llm_calls = Column(Integer, default=0)
+    total_llm_time_seconds = Column(Float, default=0.0)
 
     # Timestamps
     started_at = Column(DateTime, default=datetime.utcnow, index=True)
